@@ -1,0 +1,12 @@
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9000
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9001
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9002
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9003
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9004
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9005
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9006
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9007
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9008
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9009
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9010
+http://flPTsmlzE4227391:wifi;;;;@proxy.froxy.com:9011

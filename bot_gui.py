@@ -33,7 +33,7 @@ import random
 import secrets
 import re
 import hashlib
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote
 
 
 # Playwright imports with error handling
@@ -138,20 +138,7 @@ class WebookBot:
         #    'Content-Type': 'application/json',
         #})
     
-    def _setup_proxy(self, session_or_context, proxy_str):
-        """Setup proxy for requests session or playwright context"""
-        if not proxy_str:
-            return
-        
-        if isinstance(session_or_context, requests.Session):
-            # Format: http://user:pass@host:port or http://host:port
-            session_or_context.proxies = {
-                'http': proxy_str,
-                'https': proxy_str
-            }
-        else:
-            # Playwright context
-            return {'server': proxy_str}
+
     def extract_seatsio_chart_data(self,log_callback=None):
         """
         Fetch SeatsIO chart.js and extract chartToken and commitHash
@@ -445,6 +432,25 @@ class WebookBot:
         ).hexdigest()
         
         return signature
+    # In _assign_proxies method
+    def _assign_proxies(self):
+        if not self.proxies or not self.users:
+            return
+        
+        # Shuffle proxies for better distribution
+        import random
+        random.shuffle(self.proxies)
+        
+        for i, user in enumerate(self.users):
+            user['proxy'] = self.proxies[i % len(self.proxies)]
+    def test_proxy(self, proxy_url):
+        try:
+            test_session = requests.Session()
+            test_session.proxies = {'http': proxy_url, 'https': proxy_url}
+            response = test_session.get('http://httpbin.org/ip', timeout=10)
+            return response.status_code == 200
+        except:
+            return False
     def login_with_browser(self, event_url="", log_callback=None):
         """Login using browser automation and capture tokens"""
         if not PLAYWRIGHT_AVAILABLE:
@@ -455,161 +461,222 @@ class WebookBot:
                 log_callback(msg)
             print(msg)
         
-        log(f"Starting browser login for {self.email}")
+        log(f"🔐 Starting browser session for {self.email}")
         
         # Check if we already have valid tokens
         existing_token = self.token_manager.get_valid_token(self.email)
         if existing_token:
-            log(f"Using existing valid token for {self.email}")
+            log(f"✓ Using existing valid token for {self.email}")
             return existing_token
-        
-        proxy_config = None
-        if self.proxy:
-            proxy_config = self._setup_proxy(None, self.proxy)
         
         log("Opening playwright browser")
         with sync_playwright() as p:
+            # Configure browser launch options
+            browser_args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor',
+                '--disable-blink-features=AutomationControlled'
+            ]
+            
+            # Parse proxy configuration
+            proxy_config = None
+            if self.proxy:
+                try:
+                    #from urllib.parse import urlparse
+                    parsed_proxy = urlparse(self.proxy)
+                    
+                    # Build proxy configuration for context
+                    proxy_config = {
+                        'server': f'{parsed_proxy.scheme}://{parsed_proxy.hostname}:{parsed_proxy.port}'
+                    }
+                    
+                    # Add authentication if present
+                    if parsed_proxy.username and parsed_proxy.password:
+                        proxy_config['username'] = parsed_proxy.username
+                        proxy_config['password'] = parsed_proxy.password
+                    
+                    log(f"🌐 Using proxy: {parsed_proxy.hostname}:{parsed_proxy.port}")
+                    log(f"🔑 Proxy auth user: {parsed_proxy.username}")
+                    
+                except Exception as e:
+                    log(f"Warning: Failed to parse proxy: {e}")
+                    proxy_config = None
+            
+            # Launch browser WITHOUT proxy args (proxy will be set at context level)
             browser = p.chromium.launch(
                 headless=self.headless,
-                args=['--no-sandbox', '--disable-dev-shm-usage']
+                args=browser_args
             )
-            
-            context = browser.new_context(
-                proxy=proxy_config,
-                viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            )
-            
-            page = context.new_page()
-            
-            # Intercept API responses to capture tokens
-            captured_tokens = {}
-            
-            def handle_response(response):
-                try:
-                    if 'api.webook.com/api/v2/login' in response.url and response.status == 200:
-                        data = response.json()
-                        if data.get('status') == 'success' and 'data' in data:
-                            captured_tokens.update(data['data'])
-                            log("✓ Login tokens captured from API response")
-                except Exception as e:
-                    log(f"Error parsing response: {e}")
-            def handle_request(request):
-                try:
-                    if 'api.webook.com/api/v2/login' in request.url:
-                        headers = request.headers
-                        token = headers.get('token')
-                        captured_tokens['token'] = token
-                        log("✓ Login tokens captured from API request")
-                except Exception as e:
-                    log(f"Error parsing response: {e}")
-            
-            page.on('response', handle_response)
-            page.on('request', handle_request)
             
             try:
-                # Navigate to login page with redirect to event URL if provided
-                if event_url:
-                    # Extract the path from event URL for redirect
-                    from urllib.parse import urlparse
-                    parsed_url = urlparse(event_url)
-                    redirect_path = parsed_url.path
-                    login_url = f"https://webook.com/en/login?redirect=%2Fen"
-                else:
-                    login_url = "https://webook.com/en/login?redirect=%2Fen"
+                # Create context WITH proxy configuration
+                context_options = {
+                    'viewport': {'width': 1820, 'height': 980},
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                    'ignore_https_errors': True,  # Important for some proxies
+                    'bypass_csp': True  # Bypass Content Security Policy
+                }
                 
-                log(f"Navigating to {login_url}")
-                page.goto(login_url, timeout=CONFIG['navigation_timeout'])
+                # Add proxy to context if available
+                if proxy_config:
+                    context_options['proxy'] = proxy_config
+                    log("✅ Proxy configured at context level")
                 
-                # Handle cookie consent banner
-                log("Handling cookie consent")
-                self._handle_cookie_consent(page, log)
+                context = browser.new_context(**context_options)
                 
-                # Wait for login form to be visible
-                log("Waiting for login form")
-                page.wait_for_selector('form[name="email-login-form"]', timeout=10000)
-                log("Login form found")
+                # Add extra headers
+                context.set_extra_http_headers({
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8'
+                })
                 
-                # Fill login credentials using the specific selectors
-                log("Filling login credentials")
-                email_input = page.locator('input[data-testid="auth_login_email_input"]')
-                password_input = page.locator('input[data-testid="auth_login_password_input"]')
-                login_button = page.locator('button[data-testid="auth_login_submit_button"]')
+                # Create page
+                page = context.new_page()
                 
-                # Clear and fill email
-                email_input.fill("")
-                email_input.fill(self.email)
-                
-                # Clear and fill password
-                password_input.fill("")
-                password_input.fill(self.password)
-                
-                log("Credentials filled, submitting form")
-                
-                # Submit login form and wait for API response
-                with page.expect_response(
-                    lambda r: 'api.webook.com/api/v2/login' in r.url, 
-                    timeout=CONFIG['login_timeout']
-                ) as response_info:
-                    login_button.click()
-                    log("Login button clicked, waiting for response...")
-                
-                response = response_info.value
-                log(f"Received response with status: {response.status}")
-                
-                if response.status == 200:
-                    response_data = response.json()
-                    log(f"Response data status: {response_data.get('status')}")
+                # Remove automation indicators
+                page.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
                     
-                    if response_data.get('status') == 'success':
-                        log("✓ Login successful")
-                    else:
-                        error_msg = response_data.get('message', 'Unknown login error')
-                        raise Exception(f"Login failed: {error_msg}")
-                else:
-                    raise Exception(f"Login failed with status {response.status}")
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                """)
                 
-                # Wait a moment for tokens to be captured
-                page.wait_for_timeout(2000)
+                # Set up response handlers
+                captured_tokens = {}
                 
-                '''if not captured_tokens.get('access_token'):
-                    # Try to extract tokens from local storage or cookies as fallback
-                    log("No tokens in API response, checking browser storage...")
+                def handle_response(response):
                     try:
-                        # Check localStorage
-                        local_storage = page.evaluate("() => Object.assign({}, localStorage)")
-                        log(f"LocalStorage contents: {list(local_storage.keys())}")
+                        #if 'api.webook.com' in response.url:
+                        #    log(f"📡 API Response: {response.url.split('?')[0]} - Status: {response.status}")
                         
-                        # Look for token-related keys
-                        for key, value in local_storage.items():
-                            if 'token' in key.lower() or 'auth' in key.lower():
+                        if 'api/v2/login' in response.url and response.request.method == 'POST':
+                            log(f"🔐 Login response - Status: {response.status}")
+                            
+                            if response.status == 200:
                                 try:
-                                    token_data = json.loads(value)
-                                    if isinstance(token_data, dict) and 'access_token' in token_data:
-                                        captured_tokens.update(token_data)
-                                        log("✓ Tokens found in localStorage")
-                                        break
-                                except:
-                                    continue
+                                    data = response.json()
+                                    if data.get('status') == 'success' and 'data' in data:
+                                        captured_tokens.update(data['data'])
+                                        log("✅ Login successful - tokens captured")
+                                except Exception as e:
+                                    log(f"Failed to parse response: {e}")
+                            
+                            elif response.status == 204:
+                                log("✅ Login successful (204 response)")
+                                
                     except Exception as e:
-                        log(f"Error checking browser storage: {e}")
+                        log(f"Error handling response: {e}")
                 
-                if not captured_tokens.get('access_token'):
-                    raise Exception("No access token found in response or browser storage")'''
-                #print(captured_tokens)
-                # Store tokens
-                self.token_manager.store_token(self.email, captured_tokens)
-                log(f"✓ Tokens stored for {self.email}")
+                def handle_request(request):
+                    try:
+                        if 'api/v2/login' in request.url:
+                            print(request)
+                            try:
+                                #header = json.loads(request['headers'])
+                                print(f'header',request.headers)
+                                print(f'header token', request.headers.get('token'))
+                                #print(request['headers']['token'])
+                                captured_tokens['token'] = request.headers.get('token')
+                                #log(f"🔑 Login attempt for: {header.get('token', 'unknown')}")
+                            except:
+                                pass
+                    except Exception as e:
+                        log(f"Error handling request: {e}")
                 
-                return self.token_manager.get_valid_token(self.email)
+                page.on('response', handle_response)
+                page.on('request', handle_request)
                 
-            except PlaywrightTimeoutError as e:
-                raise Exception(f"Login timeout - page took too long to respond: {str(e)}")
-            except Exception as e:
-                log(f"Login error: {str(e)}")
-                raise
+                # Navigation and login
+                try:
+                    login_url = "https://webook.com/en/login"
+                    if event_url:
+                        login_url = f"https://webook.com/en/login?redirect=%2Fen"
+                    
+                    log(f"📍 Navigating to {login_url}")
+                    
+                    # Navigate with longer timeout for proxy
+                    page.goto(login_url, timeout=60000, wait_until='domcontentloaded')
+                    log("✅ Page loaded successfully")
+                    
+                    # Wait for page to stabilize
+                    page.wait_for_timeout(2000)
+                    
+                    # Handle cookie consent
+                    try:
+                        cookie_button = page.locator('button:has-text("Accept all")')
+                        if cookie_button.is_visible(timeout=3000):
+                            cookie_button.click()
+                            log("🍪 Cookie consent accepted")
+                            page.wait_for_timeout(1000)
+                    except:
+                        pass
+                    
+                    # Wait for login form
+                    log("⏳ Waiting for login form")
+                    page.wait_for_selector('input[data-testid="auth_login_email_input"]', timeout=15000)
+                    log("✅ Login form found")
+                    
+                    # Fill credentials
+                    log("📝 Filling login credentials")
+                    
+                    email_input = page.locator('input[data-testid="auth_login_email_input"]')
+                    email_input.click()
+                    page.wait_for_timeout(300)
+                    email_input.fill(self.email)
+                    
+                    page.wait_for_timeout(500)
+                    password_input = page.locator('input[data-testid="auth_login_password_input"]')
+                    password_input.click()
+                    page.wait_for_timeout(300)
+                    password_input.fill(self.password)
+                    
+                    page.wait_for_timeout(500)
+                    login_button = page.locator('button[data-testid="auth_login_submit_button"]')
+                    
+                    log("🚀 Submitting login form")
+                    
+                    # Click login and wait for response
+                    with page.expect_response(
+                        lambda r: 'api/v2/login' in r.url and r.request.method == 'POST',
+                        timeout=30000
+                    ) as response_info:
+                        login_button.click()
+                    
+                    response = response_info.value
+                    
+                    # Wait for navigation/redirect
+                    page.wait_for_timeout(3000)
+                    
+                    current_url = page.url
+                    log(f"📍 Current URL after login: {current_url}")
+                    
+                                            # Store tokens
+                    self.token_manager.store_token(self.email, captured_tokens)
+                    log(f"💾 Tokens stored for {self.email}")
+                        
+                    return self.token_manager.get_valid_token(self.email)
+                        
+                except PlaywrightTimeoutError as e:
+                    log(f"⏱️ Navigation timeout - this often indicates proxy issues")
+                    raise Exception(f"Login timeout (check proxy): {str(e)}")
+                except Exception as e:
+                    log(f"❌ Login error: {str(e)}")
+                    raise
+                    
             finally:
                 browser.close()
+                log("🔒 Browser closed")
     
     def _handle_cookie_consent(self, page, log):
         """Handle cookie consent popup with the specific structure"""
@@ -685,7 +752,6 @@ class WebookBot:
         
         try:
             # Setup proxy for requests
-            self._setup_proxy(self.session, self.proxy)
             
             # Make booking request (placeholder URL - replace with actual booking endpoint)
             response = self.session.post(
