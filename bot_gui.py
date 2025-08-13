@@ -34,6 +34,7 @@ import secrets
 import re
 import hashlib
 from urllib.parse import urljoin, urlparse, quote
+import uuid
 
 
 # Playwright imports with error handling
@@ -127,8 +128,12 @@ class WebookBot:
         self.chartToken = None
         self.chart_key = None
         self.event_key = None
+        self.event_id = None
+        self.channelKeyCommon = None
         self.browser_id = None
         self.channels = None
+        self.webook_hold_token = None  # Placeholder for Webook hold token
+        self.expireTime = 600
         
         # Setup session defaults
         #self.session.headers.update({
@@ -166,7 +171,14 @@ class WebookBot:
         
         try:
             log("Fetching SeatsIO chart.js...")
-            response = requests.get(url, headers=headers, timeout=30)
+            session = requests.Session()
+            if self.proxy:
+                session.proxies = {
+                    'http': self.proxy,
+                    'https': self.proxy
+                }
+            
+            response = session.get(url, headers=headers, timeout=30)
             response.raise_for_status()
             
             content = response.text
@@ -275,9 +287,13 @@ class WebookBot:
                 log("✓ Response received successfully")
                 #print(response_data)
                 self.chart_key = response_data['data']['seats_io']['chart_key']
-                self.event_key =response_data['data']['seats_io']['event_key']
+                self.event_key = response_data['data']['seats_io']['event_key']
+                self.channelKeyCommon = response_data['data']['channel_keys']['common']
+                self.event_id = response_data['data']['_id']
                 print(self.chart_key)
                 print(self.event_key)
+                print(self.channelKeyCommon)
+                print(self.event_id)
             except json.JSONDecodeError:
                 return {
                     'status_code': response.status_code,
@@ -368,8 +384,14 @@ class WebookBot:
         
         try:
             log(f"Using browser ID: {self.browser_id}")
+            session = requests.Session()
+            if self.proxy:
+                session.proxies = {
+                    'http': self.proxy,
+                    'https': self.proxy
+                }
             
-            response = requests.get(url, headers=headers, params=params, timeout=30)
+            response = session.get(url, headers=headers, params=params, timeout=30)
             response.raise_for_status()
             
             data = response.json()
@@ -421,15 +443,14 @@ class WebookBot:
         if not isinstance(request_body, str):
             request_body = str(request_body) if request_body else ""
         
-        # Generate signature using HMAC-SHA256 with chartToken as key
-        import hmac
+        # Reverse the chartToken
+        reversed_token = self.chartToken[::-1]
         
-        # The signature appears to be HMAC-SHA256(chartToken, request_body)
-        signature = hmac.new(
-            self.chartToken.encode('utf-8'),
-            request_body.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
+        # Concatenate reversed token with request body
+        data_to_hash = reversed_token + request_body
+        
+        # Generate SHA256 hash (not HMAC)
+        signature = hashlib.sha256(data_to_hash.encode('utf-8')).hexdigest()
         
         return signature
     # In _assign_proxies method
@@ -518,7 +539,7 @@ class WebookBot:
             try:
                 # Create context WITH proxy configuration
                 context_options = {
-                    'viewport': {'width': 1820, 'height': 980},
+                    'viewport': {'width': 1520, 'height': 580},
                     'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
                     'ignore_https_errors': True,  # Important for some proxies
                     'bypass_csp': True  # Bypass Content Security Policy
@@ -633,13 +654,13 @@ class WebookBot:
                     email_input = page.locator('input[data-testid="auth_login_email_input"]')
                     email_input.click()
                     page.wait_for_timeout(300)
-                    email_input.fill(self.email)
+                    email_input.type(self.email, delay=10)
                     
                     page.wait_for_timeout(500)
                     password_input = page.locator('input[data-testid="auth_login_password_input"]')
                     password_input.click()
-                    page.wait_for_timeout(300)
-                    password_input.fill(self.password)
+                    page.wait_for_timeout(300,)
+                    password_input.type(self.password, delay=10)
                     
                     page.wait_for_timeout(500)
                     login_button = page.locator('button[data-testid="auth_login_submit_button"]')
@@ -649,7 +670,7 @@ class WebookBot:
                     # Click login and wait for response
                     with page.expect_response(
                         lambda r: 'api/v2/login' in r.url and r.request.method == 'POST',
-                        timeout=30000
+                        timeout=60000
                     ) as response_info:
                         login_button.click()
                     
@@ -717,73 +738,529 @@ class WebookBot:
                 
         except Exception as e:
             log(f"Cookie consent handling error: {e}")
-    
-    def book_seat(self, email, event_url, seats_count=1, log_callback=None):
-        """Book seats for an event"""
+    def getWebookHoldToken(self, lang='en', log_callback=None):
+        """
+        Get hold token from Webook API for seat booking
+        
+        Args:
+            event_id: Webook event ID (e.g., '684ffd1f165ecfe8710e6d71')
+            lang: Language code (default: 'en')
+            log_callback: Optional callback for logging
+        
+        Returns:
+            dict: Response containing hold token and details
+        """
         def log(msg):
             if log_callback:
                 log_callback(msg)
             print(msg)
         
-        # Get valid token
-        token_data = self.token_manager.get_valid_token(email)
+        # Get tokens from token manager
+        token_data = self.token_manager.get_valid_token(self.email)
         if not token_data:
-            raise Exception(f"No valid token for {email}. Login required.")
+            raise ValueError(f"No valid token for {self.email}. Login required.")
         
-        access_token = token_data['access_token']
+        access_token = token_data.get('access_token')
+        token = token_data.get('token')
         
-        # Setup request headers
-        headers = {
-            'Authorization': f'Bearer {access_token}',
-            'Content-Type': 'application/json',
-            'Referer': event_url,
-            'Origin': 'https://webook.com'
+        if not access_token or not token:
+            raise ValueError("Missing required tokens (access_token or token)")
+        
+        # Build URL with query parameter
+        url = f"https://api.webook.com/api/v2/seats/hold-token?lang={lang}"
+        
+        # Prepare request body
+        request_body = {
+            "event_id": self.event_id,
+            "lang": lang
         }
         
-        # Extract event ID from URL (placeholder - adjust based on actual URL format)
-        event_id = self._extract_event_id(event_url)
-        
-        # Prepare booking payload (this is a placeholder - adjust based on actual API)
-        payload = {
-            'event_id': event_id,
-            'seats_count': seats_count,
-            'payment_method': 'card'  # Adjust as needed
+        # Prepare headers
+        headers = {
+            'accept': 'application/json',
+            'accept-language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
+            'authorization': f'Bearer {access_token}',
+            'content-type': 'application/json',
+            'origin': 'https://webook.com',
+            'priority': 'u=1, i',
+            'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Linux"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-site',
+            'token': token,
+            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
         }
         
         try:
-            # Setup proxy for requests
-            
-            # Make booking request (placeholder URL - replace with actual booking endpoint)
-            response = self.session.post(
-                'https://api.webook.com/api/v2/bookings',
-                json=payload,
+            log(f"Requesting Webook hold token for event: {self.event_id}")
+            session = requests.Session()
+            if self.proxy:
+                session.proxies = {
+                    'http': self.proxy,
+                    'https': self.proxy
+                }
+            # Make the POST request
+            response = session.post(
+                url,
                 headers=headers,
-                timeout=CONFIG['api_timeout']
+                json=request_body,
+                timeout=30
             )
             
+            log(f"Response status: {response.status_code}")
+            
             if response.status_code == 200:
-                result = response.json()
-                log(f"✓ Booking successful for {email}: {result}")
-                return {'status': 'success', 'data': result}
+                response_data = response.json()
+                log("✓ Webook hold token received successfully")
+                #print(response_data)
+                log(response_data.get('data').get('token'))
+                
+                # Store the Webook hold token
+                self.webook_hold_token = response_data.get('data').get('token')
+                log(f'Webook hold token: {self.webook_hold_token}')
+                
             else:
-                error_msg = f"Booking failed for {email}: {response.status_code}"
+                error_msg = f"Failed to get Webook hold token: HTTP {response.status_code}"
                 try:
                     error_data = response.json()
-                    error_msg += f" - {error_data.get('message', 'Unknown error')}"
+                    error_msg += f" - {error_data.get('message', error_data)}"
                 except:
-                    pass
-                log(error_msg)
-                return {'status': 'failed', 'error': error_msg}
+                    error_msg += f" - {response.text[:200]}"
+                
+                log(f"✗ {error_msg}")
                 
         except requests.exceptions.Timeout:
-            error_msg = f"Booking timeout for {email}"
-            log(error_msg)
-            return {'status': 'timeout', 'error': error_msg}
+            error_msg = "Request timeout while getting Webook hold token"
+            log(f"✗ {error_msg}")
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Network error while getting Webook hold token: {str(e)}"
+            log(f"✗ {error_msg}")
         except Exception as e:
-            error_msg = f"Booking error for {email}: {str(e)}"
-            log(error_msg)
-            return {'status': 'error', 'error': error_msg}
-    
+            error_msg = f"Unexpected error while getting Webook hold token: {str(e)}"
+            log(f"✗ {error_msg}")
+    def getExpireTime(self, log_callback=None):
+        """
+        Get information about a SeatsIO hold token
+        
+        Args:
+            hold_token: The SeatsIO hold token (e.g., 'e803c179-d9ee-4037-83fd-b6ad83eb1e28')
+            log_callback: Optional callback for logging
+        
+        Returns:
+            dict: Response containing hold token information
+        """
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+            print(msg)
+        
+        # Validate prerequisites
+        if not self.chartToken:
+            raise ValueError("chartToken not available. Run extract_seatsio_chart_data() first")
+        
+        # Generate browser ID if not exists
+        if not self.browser_id:
+            self.generate_browser_id()
+            log(f"Generated browser ID: {self.browser_id}")
+        
+        # Generate signature for empty body (GET request)
+        signature = self.generate_signature("")
+        
+        # Build URL
+        workspace_key = "3d443a0c-83b8-4a11-8c57-3db9d116ef76"
+        url = f"https://cdn-eu.seatsio.net/system/public/{workspace_key}/hold-tokens/{self.webook_hold_token}"
+        
+        # Prepare headers
+        headers = {
+            'accept': '*/*',
+            'accept-language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
+            'priority': 'u=1, i',
+            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.commitHash}',
+            'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Linux"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-storage-access': 'active',
+            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+            'x-browser-id': self.browser_id,
+            'x-client-tool': 'Renderer',
+            'x-signature': signature
+        }
+        
+        try:
+            log(f"Getting info for expire time of hold token: {self.webook_hold_token}")
+            session = requests.Session()
+            if self.proxy:
+                session.proxies = {
+                    'http': self.proxy,
+                    'https': self.proxy
+                }
+            # Make the GET request
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=30
+            )
+            
+            log(f"Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                try:
+                    response_data = response.json()
+                    log("✓ Expire time of hold token info retrieved successfully")
+                    log(response_data.get('expiresInSeconds', 600))
+                    self.expireTime = response_data.get('expiresInSeconds', 600)  # Default to 600 seconds if not found
+                except json.JSONDecodeError:
+                    log("✓ Expire time of hold token info retrieved (non-JSON response)")
+            else:
+                error_msg = f"Failed to get expire time hold token info: HTTP {response.status_code}"
+                try:
+                    error_data = response.json()
+                    error_msg += f" - {error_data}"
+                except:
+                    error_msg += f" - {response.text[:200]}"
+                
+                log(f"✗ {error_msg}")
+                
+        except requests.exceptions.Timeout:
+            error_msg = "Request timeout while getting Expire time of hold token info"
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Network error while getting Expire time of hold token info: {str(e)}"
+            log(f"✗ {error_msg}")
+        except Exception as e:
+            error_msg = f"Unexpected error while getting expire time of hold token info: {str(e)}"
+            log(f"✗ {error_msg}")
+    def takeSeat(self, seat_objects, event_keys=None, channel_keys=None, log_callback=None):
+        """
+        Hold/Reserve seats on SeatsIO
+        
+        Args:
+            seat_objects: List of seat IDs to hold (e.g., ['j-9-14', 'j-9-15'])
+            event_keys: List of event keys (defaults to self.event_key if not provided)
+            channel_keys: List of channel keys (defaults to ['NO_CHANNEL'])
+            log_callback: Optional callback for logging
+        
+        Returns:
+            dict: Response containing hold status and details
+        """
+        
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+            print(msg)
+        
+        # Validate prerequisites
+        if not self.chartToken:
+            raise ValueError("chartToken not available. Run extract_seatsio_chart_data() first")
+        if not self.event_key and not event_keys:
+            raise ValueError("event_key not available. Run send_event_detail_request() first")
+        
+        # Generate browser ID if not exists
+        if not self.browser_id:
+            self.generate_browser_id()
+            log(f"Generated browser ID: {self.browser_id}")
+        
+        # Use provided event_keys or default to self.event_key
+        if not event_keys:
+            event_keys = [self.event_key]
+        
+        # Use provided channel_keys or default
+        if not channel_keys:
+            channel_keys = ["NO_CHANNEL", *self.channelKeyCommon]  # Include common channel if available
+        
+        # Generate a unique hold token (UUID v4)
+        hold_token = self.webook_hold_token
+        log(f"Generated hold token: {hold_token}")
+        
+        # Prepare the request body
+        request_body = {
+            "events": event_keys,
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat_objects}],
+            "channelKeys": channel_keys,
+            "validateEventsLinkedToSameChart": True
+        }
+        
+        # Convert to JSON string for signature
+        request_body_str = json.dumps(request_body, separators=(',', ':'))
+        
+        # Generate signature for this specific request
+        signature = self.generate_signature(request_body_str)
+        log(f"Generated signature: {signature[:20]}...")
+        
+        # Build the URL (using workspace key from rendering info URL)
+        workspace_key = "3d443a0c-83b8-4a11-8c57-3db9d116ef76"  # This should match your workspace
+        url = f"https://cdn-eu.seatsio.net/system/public/{workspace_key}/events/groups/actions/hold-objects"
+        
+        # Prepare headers
+        headers = {
+            'accept': '*/*',
+            'accept-language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
+            'content-type': 'application/json',
+            'origin': 'https://cdn-eu.seatsio.net',
+            'priority': 'u=1, i',
+            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.commitHash}',
+            'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Linux"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-storage-access': 'active',
+            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+            'x-browser-id': self.browser_id,
+            'x-client-tool': 'Renderer',
+            'x-signature': signature
+        }
+        
+        try:
+            log(f"Attempting to hold {seat_objects}")
+            log(f"For event(s): {', '.join(event_keys)}")
+            print(f'url', url)
+            print(f'headers', headers)
+            print(f'request_body_str', request_body_str)
+            session = requests.Session()
+            if self.proxy:
+                session.proxies = {
+                    'http': self.proxy,
+                    'https': self.proxy
+                }
+            # Make the POST request
+            response = session.post(
+                url,
+                headers=headers,
+                data=request_body_str,  # Send as string, not dict
+                timeout=30
+            )
+            
+            log(f"Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                try:
+                    response_data = response.json()
+                    log("✓ Seats successfully held")
+                    
+                    # Store hold token for later use (booking/release)
+                    self.current_hold_token = hold_token
+                    
+                    return {
+                        'success': True,
+                        'status_code': response.status_code,
+                        'data': response_data,
+                        'hold_token': hold_token,
+                        'seats_held': seat_objects
+                    }
+                except json.JSONDecodeError:
+                    log("✓ Seats held (non-JSON response)")
+                    return {
+                        'success': True,
+                        'status_code': response.status_code,
+                        'data': response.text,
+                        'hold_token': hold_token,
+                        'seats_held': seat_objects
+                    }
+            else:
+                error_msg = f"Failed to hold seats: HTTP {response.status_code}"
+                try:
+                    error_data = response.json()
+                    error_msg += f" - {error_data}"
+                except:
+                    error_msg += f" - {response.text[:200]}"
+                
+                log(f"✗ {error_msg}")
+                return {
+                    'success': False,
+                    'status_code': response.status_code,
+                    'error': error_msg,
+                    'hold_token': hold_token
+                }
+                
+        except requests.exceptions.Timeout:
+            error_msg = "Request timeout while holding seats"
+            log(f"✗ {error_msg}")
+            return {
+                'success': False,
+                'status_code': 0,
+                'error': error_msg,
+                'hold_token': hold_token
+            }
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Network error while holding seats: {str(e)}"
+            log(f"✗ {error_msg}")
+            return {
+                'success': False,
+                'status_code': 0,
+                'error': error_msg,
+                'hold_token': hold_token
+            }
+        except Exception as e:
+            error_msg = f"Unexpected error while holding seats: {str(e)}"
+            log(f"✗ {error_msg}")
+            return {
+                'success': False,
+                'status_code': 0,
+                'error': error_msg,
+                'hold_token': hold_token
+            }
+    def releaseSeat(self, seat_objects, hold_token, event_keys=None, log_callback=None):
+        """
+        Release previously held seats on SeatsIO
+        
+        Args:
+            seat_objects: List of seat IDs to release (e.g., ['j-9-14', 'j-9-15'])
+            hold_token: The hold token from takeSeat
+            event_keys: List of event keys (defaults to self.event_key if not provided)
+            log_callback: Optional callback for logging
+        
+        Returns:
+            dict: Response containing release status and details
+        """
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+            print(msg)
+        
+        # Validate prerequisites
+        if not self.chartToken:
+            raise ValueError("chartToken not available. Run extract_seatsio_chart_data() first")
+        if not self.event_key and not event_keys:
+            raise ValueError("event_key not available. Run send_event_detail_request() first")
+        
+        # Generate browser ID if not exists
+        if not self.browser_id:
+            self.generate_browser_id()
+            log(f"Generated browser ID: {self.browser_id}")
+        
+        # Use provided event_keys or default to self.event_key
+        if not event_keys:
+            event_keys = [self.event_key]
+        
+        # Prepare the request body (same structure as hold)
+        request_body = {
+            "events": event_keys,
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat_objects}],
+            "validateEventsLinkedToSameChart": True
+        }
+        
+        # Convert to JSON string for signature
+        request_body_str = json.dumps(request_body, separators=(',', ':'))
+        
+        # Generate signature for this specific request
+        signature = self.generate_signature(request_body_str)
+        log(f"Generated signature for release: {signature[:20]}...")
+        
+        # Build the URL
+        workspace_key = "3d443a0c-83b8-4a11-8c57-3db9d116ef76"
+        url = f"https://cdn-eu.seatsio.net/system/public/{workspace_key}/events/groups/actions/release-held-objects"
+        
+        # Prepare headers (same as takeSeat)
+        headers = {
+            'accept': '*/*',
+            'accept-language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
+            'content-type': 'application/json',
+            'origin': 'https://cdn-eu.seatsio.net',
+            'priority': 'u=1, i',
+            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.commitHash}',
+            'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Linux"',
+            'sec-fetch-dest': 'empty',
+            'sec-fetch-mode': 'cors',
+            'sec-fetch-site': 'same-origin',
+            'sec-fetch-storage-access': 'active',
+            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+            'x-browser-id': self.browser_id,
+            'x-client-tool': 'Renderer',
+            'x-signature': signature
+        }
+        
+        try:
+            log(f"Attempting to release {seat_objects}")
+            log(f"Using hold token: {hold_token}")
+            log(f"For event(s): {', '.join(event_keys)}")
+            session = requests.Session()
+            if self.proxy:
+                session.proxies = {
+                    'http': self.proxy,
+                    'https': self.proxy
+                }
+            # Make the POST request
+            response = session.post(
+                url,
+                headers=headers,
+                data=request_body_str,  # Send as string, not dict
+                timeout=30
+            )
+            
+            log(f"Response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                try:
+                    response_data = response.json()
+                    log("✓ Seats successfully released")
+                    
+                    # Clear the stored hold token if it matches
+                    if hasattr(self, 'current_hold_token') and self.current_hold_token == hold_token:
+                        self.current_hold_token = None
+                    
+                    return {
+                        'success': True,
+                        'status_code': response.status_code,
+                        'data': response_data,
+                        'seats_released': seat_objects
+                    }
+                except json.JSONDecodeError:
+                    log("✓ Seats released (non-JSON response)")
+                    return {
+                        'success': True,
+                        'status_code': response.status_code,
+                        'data': response.text,
+                        'seats_released': seat_objects
+                    }
+            else:
+                error_msg = f"Failed to release seats: HTTP {response.status_code}"
+                try:
+                    error_data = response.json()
+                    error_msg += f" - {error_data}"
+                except:
+                    error_msg += f" - {response.text[:200]}"
+                
+                log(f"✗ {error_msg}")
+                return {
+                    'success': False,
+                    'status_code': response.status_code,
+                    'error': error_msg
+                }
+                
+        except requests.exceptions.Timeout:
+            error_msg = "Request timeout while releasing seats"
+            log(f"✗ {error_msg}")
+            return {
+                'success': False,
+                'status_code': 0,
+                'error': error_msg
+            }
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Network error while releasing seats: {str(e)}"
+            log(f"✗ {error_msg}")
+            return {
+                'success': False,
+                'status_code': 0,
+                'error': error_msg
+            }
+        except Exception as e:
+            error_msg = f"Unexpected error while releasing seats: {str(e)}"
+            log(f"✗ {error_msg}")
+            return {
+                'success': False,
+                'status_code': 0,
+                'error': error_msg
+            }
     def _extract_event_id(self, event_url):
         """Extract event ID from URL - adjust based on actual URL format"""
         # For URL like: https://webook.com/en/events/semi-final-fiba-2-2025-fhiejsuhf98e/book
@@ -803,7 +1280,7 @@ class BotGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Webook Bot - Browser Automation")
-        self.root.geometry("1200x700")
+        self.root.geometry("1300x700")
         
         # Data storage
         self.users = []
@@ -813,7 +1290,9 @@ class BotGUI:
         self.displayChannels = False
         self.stop_event = threading.Event()
         self.browser_semaphore = threading.Semaphore(1)  # Only 1 browser at a time
-
+        self.countdown_timer = None
+        self.init_barrier = None 
+        self.start_countdown_timer()
         
         # UI queue for thread-safe updates
         self.ui_queue = queue.Queue()
@@ -855,7 +1334,8 @@ class BotGUI:
         
         self.stop_btn = ttk.Button(top_frame, text="Stop Bot", command=self.stop_bot, state='disabled')
         self.stop_btn.grid(row=0, column=8, padx=5)
-
+        self.fill_seats_btn = ttk.Button(top_frame, text="Fill Seats", command=self.fill_seats, state='disabled')
+        self.fill_seats_btn.grid(row=0, column=9, padx=5)
         self.checkbox_frame = ttk.Frame(self.root)  # Create empty frame
         self.checkbox_frame.pack(fill='x', padx=10, pady=5)
 
@@ -866,6 +1346,46 @@ class BotGUI:
         self.status_var = tk.StringVar(value="Ready - Load users and proxies to begin")
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief='sunken')
         status_bar.pack(side='bottom', fill='x', padx=10, pady=5)
+    def start_countdown_timer(self):
+        """Countdown timer for expire times"""
+        def update_countdowns():
+            for i, user in enumerate(self.users):
+                if user.get('expireTime', 0) > 0:
+                    user['expireTime'] -= 1
+                    self.ui_queue.put(('update_user', i, 'expireTime', user['expireTime']))
+                    
+                    # When reaches 0, regenerate hold token
+                    if user['expireTime'] == 0 and user.get('bot_instance'):
+                        threading.Thread(
+                            target=self.regenerate_hold_token,
+                            args=(i, user),
+                            daemon=True
+                        ).start()
+            
+            self.countdown_timer = self.root.after(1000, update_countdowns)
+        
+        update_countdowns()
+
+    def regenerate_hold_token(self, user_index, user):
+        """Regenerate hold token when expired"""
+        bot = user.get('bot_instance')
+        if not bot:
+            return
+        
+        def log(msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            log_entry = f"[{timestamp}] {msg}"
+            user['logs'].append(log_entry)
+        
+        try:
+            log("⏰ Hold token expired, regenerating...")
+            bot.getWebookHoldToken(log_callback=log)
+            bot.getExpireTime(log_callback=log)
+            user['expireTime'] = bot.expireTime
+            self.ui_queue.put(('update_user', user_index, 'expireTime', bot.expireTime))
+            log(f"✓ New hold token generated, expires in {bot.expireTime} seconds")
+        except Exception as e:
+            log(f"✗ Failed to regenerate hold token: {str(e)}")
     def _create_checkBox(self): 
         """Create checkboxes for channel selection in one line"""
         if not hasattr(self, 'channels') or not self.channels:
@@ -901,7 +1421,7 @@ class BotGUI:
         table_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         # Treeview for users
-        columns = ('Email', 'Type', 'Proxy', 'Status', 'Seats Booked', 'Last Update')
+        columns = ('Email', 'Type', 'Proxy', 'Status', 'Expire Time', 'Seats Booked', 'Last Update')
         self.tree = ttk.Treeview(table_frame, columns=columns, show='headings', selectmode='browse')
         
         # Configure columns
@@ -913,6 +1433,8 @@ class BotGUI:
                 self.tree.column(col, width=200)
             elif col == 'Status':
                 self.tree.column(col, width=150)
+            elif col == 'Expire Time':
+                self.tree.column(col, width=100, anchor='center')
             elif col in ['Seats Booked', 'Type']:
                 self.tree.column(col, width=100, anchor='center')
             else:
@@ -970,6 +1492,7 @@ class BotGUI:
                     'type': row.get('type', '').strip(),
                     'proxy': None,
                     'status': 'Ready',
+                    'expireTime': 0,
                     'seats_booked': 0,
                     'last_update': datetime.now().strftime('%H:%M:%S'),
                     'logs': []
@@ -1032,6 +1555,7 @@ class BotGUI:
                 user['type'],
                 user.get('proxy', 'None'),
                 user['status'],
+                str(user.get('expireTime', 0)),
                 str(user['seats_booked']),
                 user['last_update']
             )
@@ -1070,6 +1594,7 @@ class BotGUI:
         
         # Start worker threads
         self.workers = []
+        self.init_barrier = threading.Barrier(len(self.users))  # Add this line
         for i, user in enumerate(self.users):
             worker = threading.Thread(
                 target=self._worker_thread,
@@ -1085,6 +1610,7 @@ class BotGUI:
         """Stop the bot operations"""
         self.stop_event.set()
         self.start_btn.config(state='normal')
+        self.fill_seats_btn.config(state='disabled')
         self.stop_btn.config(state='disabled')
         self.status_var.set("Stopping bot...")
     
@@ -1100,19 +1626,22 @@ class BotGUI:
         def update_status(status):
             user['status'] = status
             self.ui_queue.put(('update_user', user_index, 'status', status))
+        
         try:
-            # Wait for browser semaphore (queue for browser access)
-            update_status("Waiting in queue...")
-            log("Waiting for browser availability...")
-    
-            # BROWSER OPERATIONS - ONE AT A TIME
-            with self.browser_semaphore:  # Only one browser at a time
+            # BROWSER OPERATIONS - ONE AT A TIME (only for login)
+            with self.browser_semaphore:  # Only one browser at a time for login
+                update_status("Waiting in queue...")
+                log("Waiting for browser availability...")
+                
                 bot = WebookBot(
                     email=user['email'],
                     password=user['password'],
                     headless=self.headless_var.get(),
                     proxy=user.get('proxy')
                 )
+                
+                # Store bot instance in user dict
+                user['bot_instance'] = bot
                 
                 # Step 1: Login and get tokens
                 update_status("Logging in...")
@@ -1129,55 +1658,58 @@ class BotGUI:
                     
                     update_status("Login successful")
                     log("✓ Login completed successfully")
-                    bot.extract_seatsio_chart_data()
-                    path_parts = urlparse(event_url).path.strip("/").split("/")
-                    event_id = path_parts[2]
-                    bot.send_event_detail_request(event_id)
-                    self.channels = bot.get_rendering_info()
-                    if not self.displayChannels:
-                        self._create_checkBox()
                     
                 except Exception as e:
                     update_status("Login failed")
                     log(f"✗ Login failed: {str(e)}")
                     return
-    
-                # BOOKING OPERATIONS - ALL THREADS WORK SIMULTANEOUSLY (outside semaphore)
-                '''if not self.stop_event.is_set():
-                    update_status("Booking seats...")
-                    log(f"Starting seat booking process ({seats_count} seats)")
-                    
-                    try:
-                        result = bot.book_seat(
-                            user['email'],
-                            event_url,
-                            seats_count,
-                            log_callback=log
-                        )
-                        
-                        if result['status'] == 'success':
-                            user['seats_booked'] = seats_count
-                            update_status("Booking successful")
-                            log("✓ Seat booking completed successfully")
-                            self.ui_queue.put(('update_user', user_index, 'seats_booked', seats_count))
-                        else:
-                            update_status("Booking failed")
-                            log(f"✗ Seat booking failed: {result.get('error', 'Unknown error')}")
-                            
-                    except Exception as e:
-                        update_status("Booking error")
-                        log(f"✗ Booking error: {str(e)}")'''
-
+            
+            # AFTER LOGIN - ALL THREADS WORK IN PARALLEL
+            # No semaphore here - all threads can work simultaneously
+            update_status("Initializing seat system...")
+            
+            try:
+                bot.extract_seatsio_chart_data(log_callback=log)
+                path_parts = urlparse(event_url).path.strip("/").split("/")
+                event_id = path_parts[2]
+                bot.send_event_detail_request(event_id, log_callback=log)
+                self.channels = bot.get_rendering_info(log_callback=log)
+                
+                if not self.displayChannels and user_index == 0:
+                    self._create_checkBox()
+                
+                # Get hold token and expire time
+                bot.getWebookHoldToken(log_callback=log)
+                bot.getExpireTime(log_callback=log)
+                
+                # Update expire time in user dict and UI
+                user['expireTime'] = bot.expireTime
+                self.ui_queue.put(('update_user', user_index, 'expireTime', bot.expireTime))
+                
+                update_status("Ready for booking")
+                log(f"✓ System ready, hold token expires in {bot.expireTime} seconds")
+                # Enable fill seats button when first user is ready
+                if user_index == 0:
+                    self.fill_seats_btn.config(state='normal')
+                self.init_barrier.wait()
+                update_status("All users ready - starting operations")
+                log("All users initialized, starting synchronized operations")
+                # Now you can add seat booking logic here
+                # All threads will execute this part in parallel
+                
+            except Exception as e:
+                update_status("Initialization failed")
+                log(f"✗ Failed to initialize: {str(e)}")
+                
         except Exception as e:
             update_status("Error")
             log(f"✗ Worker error: {str(e)}")
             traceback.print_exc()
-
+        
         finally:
             if not self.stop_event.is_set():
                 update_status("Completed")
                 log("Worker thread completed")
-    
     def show_user_logs(self, event):
         """Show detailed logs for selected user"""
         selection = self.tree.selection()
@@ -1232,22 +1764,18 @@ class BotGUI:
                         
                         if command == 'update_user':
                             user_index, field, value = args
-                            if field in ['status', 'last_update']:
-                                # Update the tree view
-                                item_id = str(user_index)
-                                if self.tree.exists(item_id):
-                                    values = list(self.tree.item(item_id, 'values'))
-                                    if field == 'status':
-                                        values[3] = value
-                                    elif field == 'last_update':
-                                        values[5] = value
-                                    self.tree.item(item_id, values=values)
-                            elif field == 'seats_booked':
-                                item_id = str(user_index)
-                                if self.tree.exists(item_id):
-                                    values = list(self.tree.item(item_id, 'values'))
+                            item_id = str(user_index)
+                            if self.tree.exists(item_id):
+                                values = list(self.tree.item(item_id, 'values'))
+                                if field == 'status':
+                                    values[3] = value
+                                elif field == 'expireTime':
                                     values[4] = str(value)
-                                    self.tree.item(item_id, values=values)
+                                elif field == 'seats_booked':
+                                    values[5] = str(value)
+                                elif field == 'last_update':
+                                    values[6] = value
+                                self.tree.item(item_id, values=values)
                         
                     except queue.Empty:
                         break
@@ -1259,6 +1787,96 @@ class BotGUI:
         
         process_ui_queue()
 
+    def fill_seats(self):
+        """Distribute and take seats"""
+        print(f"Fill seats called - Channels: {len(self.channels)}")
+        print(f"Selected sections check...")
+
+        seats_per_user = int(self.seats_var.get())
+        
+        # Get selected sections from checkboxes
+        selected_sections = []
+        for channel in self.channels:
+            if isinstance(channel, str) and '-' in channel:
+                prefix = channel.split('-')[0]
+                if hasattr(self, f"{prefix}_var") and getattr(self, f"{prefix}_var").get():
+                    selected_sections.append(prefix)
+        
+        # Filter channels by selected sections
+        available_seats = [ch for ch in self.channels 
+                        if any(ch.startswith(prefix) for prefix in selected_sections)]
+        
+        # Group users by type
+        users_by_type = {}
+        for user in self.users:
+            user_type = user.get('type', 'standard')
+            if user_type not in users_by_type:
+                users_by_type[user_type] = []
+            users_by_type[user_type].append(user)
+        
+        # Distribute seats
+        seat_assignments = {}
+        seat_index = 0
+        
+        for user_type, type_users in users_by_type.items():
+            for user in type_users:
+                user_seats = []
+                for _ in range(min(seats_per_user, len(available_seats) - seat_index)):
+                    if seat_index < len(available_seats):
+                        user_seats.append(available_seats[seat_index])
+                        seat_index += 1
+                seat_assignments[user['email']] = user_seats
+        
+        # Start parallel seat taking
+        threading.Thread(target=self._execute_seat_taking, args=(seat_assignments,), daemon=True).start()
+
+    def _execute_seat_taking(self, seat_assignments):
+        """Execute parallel seat taking"""
+        threads = []
+        
+        for i, user in enumerate(self.users):
+            seats = seat_assignments.get(user['email'], [])
+            if seats and user.get('bot_instance'):
+                thread = threading.Thread(
+                    target=self._take_seats_for_user,
+                    args=(i, user, seats),
+                    daemon=True
+                )
+                threads.append(thread)
+                thread.start()
+        
+        # Wait for all to complete
+        for thread in threads:
+            thread.join()
+
+    def _take_seats_for_user(self, user_index, user, seats):
+        """Take seats for individual user"""
+        bot = user.get('bot_instance')
+        if not bot:
+            return
+        
+        def log(msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            log_entry = f"[{timestamp}] {msg}"
+            user['logs'].append(log_entry)
+        
+        self.ui_queue.put(('update_user', user_index, 'status', 'Taking seats...'))
+        
+        taken_count = 0
+        for seat in seats:
+            try:
+                result = bot.takeSeat(seat, log_callback=log)
+                if result.get('success'):
+                    taken_count += 1
+                    user['seats_booked'] = taken_count
+                    self.ui_queue.put(('update_user', user_index, 'seats_booked', taken_count))
+                    log(f"✓ Seat {seat} taken successfully")
+                else:
+                    log(f"✗ Failed to take seat {seat}")
+            except Exception as e:
+                log(f"✗ Error taking seat {seat}: {str(e)}")
+        
+        self.ui_queue.put(('update_user', user_index, 'status', f'Completed - {taken_count} seats'))
 def main():
     """Main application entry point"""
     root = tk.Tk()
