@@ -20,22 +20,21 @@ CSV Format (users.csv):
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+import concurrent.futures
 import queue
 import csv
-import time
 import json
 import os
 import requests
 from pathlib import Path
 from datetime import datetime, timedelta
 import traceback
-import random
 import secrets
 import re
 import hashlib
-from urllib.parse import urljoin, urlparse, quote
-import uuid
-
+from urllib.parse import urlparse
+import time
+import websocket
 
 # Playwright imports with error handling
 try:
@@ -130,8 +129,12 @@ class WebookBot:
         self.event_key = None
         self.event_id = None
         self.channelKeyCommon = None
+        self.channelKey = None
+        self.home_team = None
+        self.away_team = None
         self.browser_id = None
         self.channels = None
+        self.seasonStructure = None
         self.webook_hold_token = None  # Placeholder for Webook hold token
         self.expireTime = 600
         
@@ -213,7 +216,11 @@ class WebookBot:
         except requests.exceptions.RequestException as e:
             error_msg = f"Failed to fetch chart.js: {str(e)}"
             log(error_msg)
-            raise Exception(error_msg)
+            log(f"🔄 Retrying chart.js fetch...")
+            time.sleep(2)  # Wait before retry
+            
+                # Try without proxy on last attempt
+            return self.extract_seatsio_chart_data()
         except Exception as e:
             error_msg = f"Error extracting chart data: {str(e)}"
             log(error_msg)
@@ -289,11 +296,10 @@ class WebookBot:
                 self.chart_key = response_data['data']['seats_io']['chart_key']
                 self.event_key = response_data['data']['seats_io']['event_key']
                 self.channelKeyCommon = response_data['data']['channel_keys']['common']
+                self.channelKey = response_data['data']['channel_keys']
                 self.event_id = response_data['data']['_id']
-                print(self.chart_key)
-                print(self.event_key)
-                print(self.channelKeyCommon)
-                print(self.event_id)
+                self.home_team = response_data['data']['home_team']
+                self.away_team = response_data['data']['away_team']
             except json.JSONDecodeError:
                 return {
                     'status_code': response.status_code,
@@ -398,11 +404,13 @@ class WebookBot:
             log(f"✓ Successfully fetched rendering info")
             #print(data)
             all_objects = []
+            seasonStructure = data.get('seasonStructure', {}).get('topLevelSeasonKey', None)
+            print(f'seasonStructure: {seasonStructure}')
             for channel in data.get('channels', []):
                 if 'objects' in channel:
                     all_objects.extend(channel['objects'])
             self.channels = all_objects
-            return self.channels
+            return self.channels, seasonStructure
             
         except requests.exceptions.RequestException as e:
             error_msg = f"Failed to fetch rendering info: {str(e)}"
@@ -602,11 +610,11 @@ class WebookBot:
                 def handle_request(request):
                     try:
                         if 'api/v2/login' in request.url:
-                            print(request)
+                            #print(request)
                             try:
                                 #header = json.loads(request['headers'])
-                                print(f'header',request.headers)
-                                print(f'header token', request.headers.get('token'))
+                                #print(f'header',request.headers)
+                                #print(f'header token', request.headers.get('token'))
                                 #print(request['headers']['token'])
                                 captured_tokens['token'] = request.headers.get('token')
                                 #log(f"🔑 Login attempt for: {header.get('token', 'unknown')}")
@@ -970,11 +978,11 @@ class WebookBot:
         
         # Use provided channel_keys or default
         if not channel_keys:
-            channel_keys = ["NO_CHANNEL", *self.channelKeyCommon]  # Include common channel if available
+            channel_keys = ["NO_CHANNEL", *self.channelKeyCommon, *self.channelKey.get(self.home_team['_id'])]
         
         # Generate a unique hold token (UUID v4)
         hold_token = self.webook_hold_token
-        log(f"Generated hold token: {hold_token}")
+        log(f"hold token: {hold_token}")
         
         # Prepare the request body
         request_body = {
@@ -1020,9 +1028,9 @@ class WebookBot:
         try:
             log(f"Attempting to hold {seat_objects}")
             log(f"For event(s): {', '.join(event_keys)}")
-            print(f'url', url)
-            print(f'headers', headers)
-            print(f'request_body_str', request_body_str)
+            #print(f'url', url)
+            #print(f'headers', headers)
+            #print(f'request_body_str', request_body_str)
             session = requests.Session()
             if self.proxy:
                 session.proxies = {
@@ -1039,7 +1047,7 @@ class WebookBot:
             
             log(f"Response status: {response.status_code}")
             
-            if response.status_code == 200:
+            if response.status_code == 200 or response.status_code == 204:
                 try:
                     response_data = response.json()
                     log("✓ Seats successfully held")
@@ -1199,7 +1207,7 @@ class WebookBot:
             
             log(f"Response status: {response.status_code}")
             
-            if response.status_code == 200:
+            if response.status_code == 200 or response.status_code == 204:
                 try:
                     response_data = response.json()
                     log("✓ Seats successfully released")
@@ -1274,6 +1282,336 @@ class WebookBot:
             pass
         return "unknown-event-id"
 
+
+class SeatScanner:
+    """WebSocket-based seat scanning system for real-time seat monitoring"""
+    
+    def __init__(self, workspace_key="3d443a0c-83b8-4a11-8c57-3db9d116ef76", event_key=None,seasonStructure = None):
+        self.workspace_key = workspace_key
+        self.event_key = event_key
+        self.ws = None
+        self.is_connected = False
+        self.is_running = False
+        
+        # Seat tracking
+        self.reserved_seats_map = {}  # holdTokenHash -> list of seats
+        self.users_by_type = {}  # type -> list of users
+        self.log_callback = None
+        
+        # Channels
+        self.workspace_channel = workspace_key
+        self.event_channel = f"{workspace_key}-{event_key}" if event_key else None
+        self.event_channel2 = f"{workspace_key}-{seasonStructure}" if seasonStructure else None
+        
+    def set_event_key(self, event_key, seasonStructure):
+        """Set the event key and update event channel"""
+        self.event_key = event_key
+        self.event_channel = f"{self.workspace_key}-{event_key}"
+        self.event_channel2 = f"{self.workspace_key}-{seasonStructure}"
+        self.log(f"Event channel updated: {self.event_channel}")
+    
+    def set_users(self, users):
+        """Set users and group them by type"""
+        self.users_by_type = {}
+        for user in users:
+            user_type = user.get('type', '*')
+            if user_type not in self.users_by_type:
+                self.users_by_type[user_type] = []
+            self.users_by_type[user_type].append(user)
+        
+        # Log how many users of each type are available for scanning
+        for user_type, type_users in self.users_by_type.items():
+            self.log(f"📊 Type '{user_type}': {len(type_users)} users ready for scanning")
+    
+    def set_log_callback(self, callback):
+        """Set logging callback function"""
+        self.log_callback = callback
+    
+    def log(self, message):
+        """Log message with timestamp"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        log_msg = f"[{timestamp}] [SCANNER] {message}"
+        if self.log_callback:
+            self.log_callback(log_msg)
+        print(log_msg)
+    
+    def start_scanning(self):
+        """Start the WebSocket scanning system"""
+        if self.is_running:
+            self.log("Scanner already running")
+            return
+            
+        if not self.event_key:
+            self.log("❌ Cannot start scanner: event_key not set")
+            return
+        
+        self.is_running = True
+        self.log("Starting seat scanner...")
+        
+        # Start WebSocket connection in a separate thread
+        scanner_thread = threading.Thread(target=self._run_websocket, daemon=True)
+        scanner_thread.start()
+    
+    def stop_scanning(self):
+        """Stop the scanning system"""
+        self.is_running = False
+        if self.ws:
+            self.ws.close()
+        self.log("Scanner stopped")
+    
+    def _run_websocket(self):
+        """Run WebSocket connection with auto-reconnect"""
+        while self.is_running:
+            try:
+                self._connect_websocket()
+                time.sleep(5)  # Wait before reconnecting
+            except Exception as e:
+                self.log(f"WebSocket error: {str(e)}")
+                time.sleep(5)
+    
+    def _connect_websocket(self):
+        """Establish WebSocket connection"""
+        ws_url = "wss://messaging-eu.seatsio.net/ws"
+        
+        headers = {
+            'Origin': 'https://cdn-eu.seatsio.net',
+            'Cache-Control': 'no-cache',
+            'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
+            'Pragma': 'no-cache',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+            #'Sec-WebSocket-Extensions': 'permessage-deflate; client_max_window_bits'
+        }
+        
+        self.ws = websocket.WebSocketApp(
+            ws_url,
+            header=headers,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close
+        )
+        self.ws.compression = None
+        self.ws.run_forever()
+    
+    def _on_open(self, ws):
+        """Handle WebSocket connection opened"""
+        self.is_connected = True
+        self.log("✓ WebSocket connected")
+        
+        # Subscribe to channels
+        self._subscribe_to_channels()
+    
+    def _subscribe_to_channels(self):
+        """Subscribe to workspace and event channels"""
+        # Subscribe to workspace channel
+        workspace_sub = {
+            "type": "SUBSCRIBE",
+            "data": {"channel": self.workspace_channel}
+        }
+        self.ws.send(json.dumps(workspace_sub))
+        self.log(f"📡 Subscribed to workspace channel: {self.workspace_channel}")
+        
+        # Subscribe to event channel (if event_key is set)
+        if self.event_channel:
+            event_sub = {
+                "type": "SUBSCRIBE", 
+                "data": {"channel": self.event_channel}
+            }
+            self.ws.send(json.dumps(event_sub))
+            self.log(f"📡 Subscribed to event channel: {self.event_channel}")
+        elif self.event_channel2:
+            event_sub = {
+                "type": "SUBSCRIBE", 
+                "data": {"channel": self.event_channel2}
+            }
+            self.ws.send(json.dumps(event_sub))
+            self.log(f"📡 Subscribed to event channel: {self.event_channel2}")
+        else:
+            self.log("⚠️ Event channel not available - event_key not set")
+    
+    def _on_message(self, ws, message):
+        """Handle incoming WebSocket messages"""
+        try:
+            data = json.loads(message)
+            print(data)
+            
+            # Handle array of messages
+            if isinstance(data, list):
+                for msg in data:
+                    self._process_message(msg)
+            else:
+                self._process_message(data)
+                
+        except json.JSONDecodeError as e:
+            self.log(f"Failed to parse message: {str(e)}")
+        except Exception as e:
+            self.log(f"Error processing message: {str(e)}")
+    
+    def _process_message(self, msg):
+        """Process individual message"""
+        if msg.get('type') != 'MESSAGE_PUBLISHED':
+            return
+        
+        message = msg.get('message', {})
+        channel = message.get('channel')
+        body = message.get('body', {})
+        
+        # Handle workspace channel messages (hold token expiration)
+        if channel == self.workspace_channel:
+            self._handle_workspace_message(body)
+        
+        # Handle event channel messages (seat status changes)
+        elif channel == self.event_channel:
+            self._handle_event_message(body)
+    
+    def _handle_workspace_message(self, body):
+        """Handle workspace channel messages (hold token expiration)"""
+        message_type = body.get('messageType')
+        
+        if message_type == 'HOLD_TOKEN_EXPIRED':
+            hold_token = body.get('holdToken')
+            if hold_token:
+                self._handle_hold_token_expired(hold_token)
+    
+    def _handle_event_message(self, body):
+        """Handle event channel messages (seat status changes)"""
+        status = body.get('status')
+        seat_id = body.get('objectLabelOrUuid')
+        hold_token_hash = body.get('holdTokenHash')
+        
+        if not seat_id:
+            return
+        
+        if status == 'free':
+            self._handle_seat_free(seat_id)
+        elif status == 'reservedByToken' and hold_token_hash:
+            self._handle_seat_reserved(seat_id, hold_token_hash)
+    
+    def _handle_seat_free(self, seat_id):
+        """Handle when a seat becomes free - trigger * users to attempt booking"""
+        self.log(f"🟢 SEAT FREE: {seat_id}")
+        
+        # Get users with type '*'
+        star_users = self.users_by_type.get('*', [])
+        
+        if star_users:
+            # Try to book with all * users simultaneously
+            self._attempt_seat_booking(star_users, seat_id, "free_seat")
+    
+    def _handle_seat_reserved(self, seat_id, hold_token_hash):
+        """Handle when a seat is reserved - track the reservation"""
+        self.log(f"🟡 SEAT RESERVED: {seat_id} (token: {hold_token_hash[:12]}...)")
+        
+        # Add to reserved seats map
+        if hold_token_hash not in self.reserved_seats_map:
+            self.reserved_seats_map[hold_token_hash] = []
+        
+        if seat_id not in self.reserved_seats_map[hold_token_hash]:
+            self.reserved_seats_map[hold_token_hash].append(seat_id)
+            self.log(f"📝 Tracked seat {seat_id} for token {hold_token_hash[:12]}...")
+    
+    def _handle_hold_token_expired(self, hold_token):
+        """Handle hold token expiration - trigger ** users for tracked seats"""
+        # Generate SHA1 hash of the hold token
+        hold_token_hash = hashlib.sha1(hold_token.encode()).hexdigest()
+        
+        self.log(f"⏰ HOLD TOKEN EXPIRED: {hold_token[:12]}... (hash: {hold_token_hash[:12]}...)")
+        
+        # Check if we have tracked seats for this token
+        if hold_token_hash in self.reserved_seats_map:
+            expired_seats = self.reserved_seats_map[hold_token_hash]
+            self.log(f"🎯 Found {len(expired_seats)} seats to attempt: {expired_seats}")
+            
+            # Get users with type '**'
+            # Get users with type '*'
+            star_users = self.users_by_type.get('*', [])
+
+            if star_users and expired_seats:
+                # Try to book expired seats with * users
+                for seat_id in expired_seats:
+                    self._attempt_seat_booking(star_users, seat_id, "expired_token")
+            
+            # Remove from tracking map
+            del self.reserved_seats_map[hold_token_hash]
+            self.log(f"🗑️ Removed tracking for expired token {hold_token_hash[:12]}...")
+        else:
+            self.log(f"ℹ️ No tracked seats found for expired token {hold_token_hash[:12]}...")
+    
+    def _attempt_seat_booking(self, users, seat_id, trigger_type):
+        """Attempt to book a seat with multiple users"""
+        self.log(f"🚀 BOOKING ATTEMPT: {seat_id} with {len(users)} users (trigger: {trigger_type})")
+        
+        # Use ThreadPoolExecutor for concurrent booking attempts
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(users)) as executor:
+            futures = []
+            
+            for user in users:
+                bot = user.get('bot_instance')
+                if bot and hasattr(bot, 'takeSeat'):
+                    future = executor.submit(self._book_seat_for_user, user, bot, seat_id, trigger_type)
+                    futures.append(future)
+            
+            # Process results
+            for future in concurrent.futures.as_completed(futures, timeout=10):
+                try:
+                    future.result()
+                except Exception as e:
+                    self.log(f"Booking error: {str(e)}")
+    
+    def _book_seat_for_user(self, user, bot, seat_id, trigger_type):
+        """Book seat for a specific user"""
+        email = user.get('email', 'unknown')
+        
+        def user_log(msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            log_entry = f"[{timestamp}] [SCANNER-{trigger_type.upper()}] {msg}"
+            if 'logs' in user:
+                user['logs'].append(log_entry)
+            self.log(f"[{email}] {msg}")
+        
+        try:
+            user_log(f"→ Attempting to book {seat_id}")
+            
+            result = bot.takeSeat(seat_id, log_callback=user_log)
+            
+            if result and result.get('success'):
+                user_log(f"✅ SUCCESS: Booked {seat_id}")
+                
+                # Update user's seat count
+                user['seats_booked'] = user.get('seats_booked', 0) + 1
+                if 'assigned_seats' not in user:
+                    user['assigned_seats'] = []
+                user['assigned_seats'].append(seat_id)
+                
+                return True
+            else:
+                user_log(f"❌ FAILED: Could not book {seat_id}")
+                return False
+                
+        except Exception as e:
+            user_log(f"💥 ERROR: {str(e)}")
+            return False
+    
+    def _on_error(self, ws, error):
+        """Handle WebSocket errors"""
+        self.log(f"❌ WebSocket error: {str(error)}")
+        self.is_connected = False
+    
+    def _on_close(self, ws, close_status_code, close_msg):
+        """Handle WebSocket connection closed"""
+        self.log(f"🔌 WebSocket closed: {close_status_code} - {close_msg}")
+        self.is_connected = False
+    
+    def get_status(self):
+        """Get current scanner status"""
+        return {
+            'is_running': self.is_running,
+            'is_connected': self.is_connected,
+            'tracked_tokens': len(self.reserved_seats_map),
+            'tracked_seats': sum(len(seats) for seats in self.reserved_seats_map.values())
+        }
+
+
 class BotGUI:
     """Main GUI application"""
     
@@ -1287,12 +1625,16 @@ class BotGUI:
         self.proxies = []
         self.workers = []
         self.channels = []
+        self.seasonStructure = None
         self.displayChannels = False
         self.stop_event = threading.Event()
         self.browser_semaphore = threading.Semaphore(1)  # Only 1 browser at a time
         self.countdown_timer = None
         self.init_barrier = None 
         self.start_countdown_timer()
+        self.seat_scanner = SeatScanner()
+        #self.seat_scanner.set_log_callback()
+        self.scanner_started = False
         
         # UI queue for thread-safe updates
         self.ui_queue = queue.Queue()
@@ -1326,18 +1668,38 @@ class BotGUI:
         seats_entry.grid(row=0, column=5, padx=5)
         
         # Options
-        ttk.Checkbutton(top_frame, text="Headless Browser", variable=self.headless_var).grid(row=0, column=6, padx=10)
+        ttk.Label(top_frame, text="DSeats:").grid(row=0, column=6, padx=(10,5))
+        self.Dseats_var = tk.StringVar(value="1")
+        Dseats_entry = ttk.Entry(top_frame, textvariable=self.Dseats_var, width=5)
+        Dseats_entry.grid(row=0, column=7, padx=5)
         
         # Control buttons
         self.start_btn = ttk.Button(top_frame, text="Start Bot", command=self.start_bot)
-        self.start_btn.grid(row=0, column=7, padx=5)
+        self.start_btn.grid(row=0, column=8, padx=5)
         
         self.stop_btn = ttk.Button(top_frame, text="Stop Bot", command=self.stop_bot, state='disabled')
-        self.stop_btn.grid(row=0, column=8, padx=5)
+        self.stop_btn.grid(row=0, column=9, padx=5)
         self.fill_seats_btn = ttk.Button(top_frame, text="Fill Seats", command=self.fill_seats, state='disabled')
-        self.fill_seats_btn.grid(row=0, column=9, padx=5)
-        self.checkbox_frame = ttk.Frame(self.root)  # Create empty frame
-        self.checkbox_frame.pack(fill='x', padx=10, pady=5)
+        self.fill_seats_btn.grid(row=0, column=10, padx=5)
+
+        self.send_seat_btn = ttk.Button(top_frame, text="Send Seat", command=self.open_send_seat_dialog)
+        self.send_seat_btn.grid(row=0, column=11, padx=5)
+        # Create scrollable checkbox container
+        checkbox_container = ttk.Frame(self.root)
+        checkbox_container.pack(fill='x', padx=12, pady=5)
+
+        # Canvas for scrolling
+        self.checkbox_canvas = tk.Canvas(checkbox_container, height=40)
+        self.checkbox_scrollbar = ttk.Scrollbar(checkbox_container, orient='horizontal', command=self.checkbox_canvas.xview)
+        self.checkbox_canvas.configure(xscrollcommand=self.checkbox_scrollbar.set)
+
+        # Inner frame for checkboxes
+        self.checkbox_frame = ttk.Frame(self.checkbox_canvas)
+        self.checkbox_canvas_window = self.checkbox_canvas.create_window(0, 0, anchor='nw', window=self.checkbox_frame)
+
+        # Pack canvas and scrollbar
+        self.checkbox_canvas.pack(side='top', fill='x')
+        self.checkbox_scrollbar.pack(side='bottom', fill='x')
 
         # Users table
         self._create_users_table()
@@ -1346,6 +1708,176 @@ class BotGUI:
         self.status_var = tk.StringVar(value="Ready - Load users and proxies to begin")
         status_bar = ttk.Label(self.root, textvariable=self.status_var, relief='sunken')
         status_bar.pack(side='bottom', fill='x', padx=10, pady=5)
+    
+    def open_send_seat_dialog(self):
+        """Open dialog for transferring seats between accounts"""
+        # Create modal dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Transfer Seat")
+        dialog.geometry("400x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Get users with seats
+        star_users = [(i, user) for i, user in enumerate(self.users) 
+              if user.get('type') == '*']
+        plus_users = [(i, user) for i, user in enumerate(self.users) 
+              if user.get('type') == '+']
+        
+        # From account dropdown
+        ttk.Label(dialog, text="From Account:").grid(row=0, column=0, padx=10, pady=10, sticky='w')
+        from_var = tk.StringVar()
+        from_combo = ttk.Combobox(dialog, textvariable=from_var, width=30)
+        from_combo['values'] = [f"{user['email']} ({user['seats_booked']} seats)" 
+                        for i, user in star_users]
+        from_combo.grid(row=0, column=1, padx=10, pady=10)
+        
+        # To account dropdown
+        ttk.Label(dialog, text="To Account:").grid(row=1, column=0, padx=10, pady=10, sticky='w')
+        to_var = tk.StringVar()
+        to_combo = ttk.Combobox(dialog, textvariable=to_var, width=30)
+        to_combo['values'] = [user['email'] for i, user in plus_users]
+        to_combo.grid(row=1, column=1, padx=10, pady=10)
+        
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.grid(row=2, column=0, columnspan=2, pady=20)
+        
+        def transfer_seat():
+            from_email = from_var.get().split(' (')[0] if from_var.get() else None
+            to_email = to_var.get()
+            
+            if from_email and to_email and from_email != to_email:
+                # Find user indices
+                from_idx = next((i for i, u in enumerate(self.users) 
+                                if u['email'] == from_email), None)
+                to_idx = next((i for i, u in enumerate(self.users) 
+                            if u['email'] == to_email), None)
+                
+                if from_idx is not None and to_idx is not None:
+                    dialog.destroy()
+                    # Start transfer in background thread
+                    threading.Thread(
+                        target=self._transfer_seat,
+                        args=(from_idx, to_idx),
+                        daemon=True
+                    ).start()
+            else:
+                messagebox.showwarning("Invalid Selection", "Please select different accounts")
+        
+        ttk.Button(button_frame, text="Transfer", command=transfer_seat).pack(side='left', padx=5)
+        ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side='left', padx=5)
+    def _transfer_seat(self, from_idx, to_idx):
+        """Transfer seat(s) from one user to another based on Dseats_var"""
+        from_user = self.users[from_idx]
+        to_user = self.users[to_idx]
+        
+        from_bot = from_user.get('bot_instance')
+        to_bot = to_user.get('bot_instance')
+        
+        if not from_bot or not to_bot:
+            return
+        
+        # Get number of seats to transfer from Dseats_var
+        try:
+            dseats_var = getattr(self, 'Dseats_var', None)
+            print(f'dseats_var {dseats_var}')
+            if dseats_var and hasattr(dseats_var, 'get'):
+                # It's a StringVar or similar, get its value
+                seats_to_transfer_count = int(dseats_var.get())
+            else:
+                # It's already a value or doesn't exist
+                seats_to_transfer_count = int(dseats_var) if dseats_var else 1
+        except (ValueError, AttributeError):
+            # If conversion fails, default to 1
+            seats_to_transfer_count = 1
+        
+        print(f'seats_to_transfer_count {seats_to_transfer_count}')
+        def log_from(msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            from_user['logs'].append(f"[{timestamp}] {msg}")
+        
+        def log_to(msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            to_user['logs'].append(f"[{timestamp}] {msg}")
+        
+        # Update initial statuses
+        self.ui_queue.put(('update_user', from_idx, 'status', f'Releasing {seats_to_transfer_count} seat(s)...'))
+        self.ui_queue.put(('update_user', to_idx, 'status', f'Waiting for {seats_to_transfer_count} seat(s)...'))
+        
+        transferred_seats = []
+        failed_transfers = []
+        
+        try:
+            # Transfer each seat
+            for i in range(seats_to_transfer_count):
+                if not from_user.get('assigned_seats'):
+                    break
+                    
+                seat_to_transfer = from_user['assigned_seats'][0]  # Always take the first available seat
+                
+                log_from(f"📤 Releasing seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count}) for transfer...")
+                
+                # Step 1: Release seat from sender
+                release_result = from_bot.releaseSeat(
+                    seat_to_transfer,
+                    from_bot.webook_hold_token,
+                    log_callback=log_from
+                )
+                
+                if release_result.get('success'):
+                    # Update sender's seats
+                    from_user['seats_booked'] -= 1
+                    from_user['assigned_seats'].remove(seat_to_transfer)
+                    self.ui_queue.put(('update_user', from_idx, 'seats_booked', from_user['seats_booked']))
+                    log_from(f"✓ Seat {seat_to_transfer} released ({i+1}/{seats_to_transfer_count})")
+                    
+                    # Step 2: Take seat with receiver
+                    log_to(f"📥 Taking transferred seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count})...")
+                    take_result = to_bot.takeSeat(
+                        seat_to_transfer,
+                        log_callback=log_to
+                    )
+                    
+                    if take_result.get('success'):
+                        # Update receiver's seats
+                        to_user['seats_booked'] = to_user.get('seats_booked', 0) + 1
+                        if 'assigned_seats' not in to_user:
+                            to_user['assigned_seats'] = []
+                        to_user['assigned_seats'].append(seat_to_transfer)
+                        self.ui_queue.put(('update_user', to_idx, 'seats_booked', to_user['seats_booked']))
+                        log_to(f"✓ Seat {seat_to_transfer} acquired ({i+1}/{seats_to_transfer_count})")
+                        transferred_seats.append(seat_to_transfer)
+                    else:
+                        log_to(f"✗ Failed to take seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count})")
+                        failed_transfers.append(seat_to_transfer)
+                else:
+                    log_from(f"✗ Failed to release seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count})")
+                    failed_transfers.append(seat_to_transfer)
+                    break  # Stop trying if release fails
+            
+            # Update final statuses
+            if len(transferred_seats) == seats_to_transfer_count:
+                self.ui_queue.put(('update_user', from_idx, 'status', f'Transfer complete ({len(transferred_seats)} seats)'))
+                self.ui_queue.put(('update_user', to_idx, 'status', f'Transfer complete ({len(transferred_seats)} seats)'))
+                log_from(f"✓ Successfully transferred {len(transferred_seats)} seat(s)")
+                log_to(f"✓ Successfully received {len(transferred_seats)} seat(s)")
+            elif len(transferred_seats) > 0:
+                self.ui_queue.put(('update_user', from_idx, 'status', f'Partial transfer ({len(transferred_seats)}/{seats_to_transfer_count})'))
+                self.ui_queue.put(('update_user', to_idx, 'status', f'Partial transfer ({len(transferred_seats)}/{seats_to_transfer_count})'))
+                log_from(f"⚠ Partial transfer: {len(transferred_seats)}/{seats_to_transfer_count} seats")
+                log_to(f"⚠ Partial transfer: {len(transferred_seats)}/{seats_to_transfer_count} seats")
+            else:
+                self.ui_queue.put(('update_user', from_idx, 'status', 'Transfer failed'))
+                self.ui_queue.put(('update_user', to_idx, 'status', 'Transfer failed'))
+                log_from(f"✗ Transfer failed: 0/{seats_to_transfer_count} seats transferred")
+                log_to(f"✗ Transfer failed: 0/{seats_to_transfer_count} seats received")
+                
+        except Exception as e:
+            log_from(f"✗ Transfer error: {str(e)}")
+            log_to(f"✗ Transfer error: {str(e)}")
+            self.ui_queue.put(('update_user', from_idx, 'status', 'Transfer error'))
+            self.ui_queue.put(('update_user', to_idx, 'status', 'Transfer error'))
     def start_countdown_timer(self):
         """Countdown timer for expire times"""
         def update_countdowns():
@@ -1356,9 +1888,14 @@ class BotGUI:
                     
                     # When reaches 0, regenerate hold token
                     if user['expireTime'] == 0 and user.get('bot_instance'):
+                        def regenerate_and_retry():
+                            success = self.regenerate_hold_token(i, user)
+                            # ONLY retry seats if token regeneration was successful
+                            if success and user.get('assigned_seats'):
+                                self._take_seats_for_user(i, user, user['assigned_seats'])
+                        
                         threading.Thread(
-                            target=self.regenerate_hold_token,
-                            args=(i, user),
+                            target=regenerate_and_retry,
                             daemon=True
                         ).start()
             
@@ -1384,8 +1921,11 @@ class BotGUI:
             user['expireTime'] = bot.expireTime
             self.ui_queue.put(('update_user', user_index, 'expireTime', bot.expireTime))
             log(f"✓ New hold token generated, expires in {bot.expireTime} seconds")
+            return True
         except Exception as e:
-            log(f"✗ Failed to regenerate hold token: {str(e)}")
+            log(f"🔄 Retrying token generation ...")
+            time.sleep(2)  # Wait 2 seconds before retry
+            return self.regenerate_hold_token(user_index, user)
     def _create_checkBox(self): 
         """Create checkboxes for channel selection in one line"""
         if not hasattr(self, 'channels') or not self.channels:
@@ -1413,7 +1953,9 @@ class BotGUI:
             checkbox = ttk.Checkbutton(self.checkbox_frame, text=f"{prefix}", variable=var)
             checkbox.pack(side='left', padx=5)
             setattr(self, f"{prefix}_var", var)
-        
+        # Update scroll region after adding checkboxes
+        self.checkbox_frame.update_idletasks()
+        self.checkbox_canvas.configure(scrollregion=self.checkbox_canvas.bbox('all'))
         self.displayChannels = True
     def _create_users_table(self):
         """Create the users display table"""
@@ -1489,7 +2031,7 @@ class BotGUI:
                 user = {
                     'email': row.get('email', '').strip(),
                     'password': row.get('password', '').strip(),
-                    'type': row.get('type', '').strip(),
+                    'type': row.get('type', '*').strip(),
                     'proxy': None,
                     'status': 'Ready',
                     'expireTime': 0,
@@ -1581,7 +2123,8 @@ class BotGUI:
         
         try:
             seats_count = int(self.seats_var.get())
-            if seats_count < 1:
+            dSeats_count = int(self.Dseats_var.get())
+            if seats_count < 1 or dSeats_count < 1:
                 raise ValueError()
         except ValueError:
             messagebox.showerror("Invalid Seats", "Please enter a valid number of seats")
@@ -1598,7 +2141,7 @@ class BotGUI:
         for i, user in enumerate(self.users):
             worker = threading.Thread(
                 target=self._worker_thread,
-                args=(i, user, event_url, seats_count),
+                args=(i, user, event_url, seats_count, dSeats_count),
                 daemon=True
             )
             self.workers.append(worker)
@@ -1614,7 +2157,7 @@ class BotGUI:
         self.stop_btn.config(state='disabled')
         self.status_var.set("Stopping bot...")
     
-    def _worker_thread(self, user_index, user, event_url, seats_count):
+    def _worker_thread(self, user_index, user, event_url, seats_count, dSeats_count):
         """Worker thread for individual user operations"""
         def log(message):
             timestamp = datetime.now().strftime('%H:%M:%S')
@@ -1673,7 +2216,8 @@ class BotGUI:
                 path_parts = urlparse(event_url).path.strip("/").split("/")
                 event_id = path_parts[2]
                 bot.send_event_detail_request(event_id, log_callback=log)
-                self.channels = bot.get_rendering_info(log_callback=log)
+                self.channels, self.seasonStructure = bot.get_rendering_info(log_callback=log)
+                #print(self.channels)
                 
                 if not self.displayChannels and user_index == 0:
                     self._create_checkBox()
@@ -1694,8 +2238,26 @@ class BotGUI:
                 self.init_barrier.wait()
                 update_status("All users ready - starting operations")
                 log("All users initialized, starting synchronized operations")
+                
                 # Now you can add seat booking logic here
                 # All threads will execute this part in parallel
+                # Every user updates the scanner with their info
+                # Start scanner once with all users
+                if user_index == 0 and not self.scanner_started:
+                    try:
+                        self.seat_scanner.set_event_key(bot.event_key, bot.seasonStructure)
+                        self.seat_scanner.set_users(self.users)  # All users, scanner will filter by type *
+                        self.seat_scanner.start_scanning()
+                        self.scanner_started = True
+                        log("🔍 Auto-started seat scanner for all type * users")
+                        self.status_var.set("Bot ready - Scanner monitoring seats...")
+                    except Exception as e:
+                        log(f"Failed to start scanner: {str(e)}")
+
+                # Always update scanner with current user list after all users are ready
+                if user_index == len(self.users) - 1:  # Last user updates the complete list
+                    self.seat_scanner.set_users(self.users)
+                    log(f"🔍 Scanner updated with {len(self.users)} users")
                 
             except Exception as e:
                 update_status("Initialization failed")
@@ -1809,23 +2371,23 @@ class BotGUI:
         # Group users by type
         users_by_type = {}
         for user in self.users:
-            user_type = user.get('type', 'standard')
+            user_type = user.get('type', '*')
             if user_type not in users_by_type:
                 users_by_type[user_type] = []
             users_by_type[user_type].append(user)
-        
+        #print(users_by_type)
         # Distribute seats
         seat_assignments = {}
         seat_index = 0
-        
-        for user_type, type_users in users_by_type.items():
-            for user in type_users:
-                user_seats = []
-                for _ in range(min(seats_per_user, len(available_seats) - seat_index)):
-                    if seat_index < len(available_seats):
-                        user_seats.append(available_seats[seat_index])
-                        seat_index += 1
-                seat_assignments[user['email']] = user_seats
+        star_users = users_by_type.get('*', [])
+        #for user_type, type_users in users_by_type.items():
+        for user in star_users:
+            user_seats = []
+            for _ in range(min(seats_per_user, len(available_seats) - seat_index)):
+                if seat_index < len(available_seats):
+                    user_seats.append(available_seats[seat_index])
+                    seat_index += 1
+            seat_assignments[user['email']] = user_seats
         
         # Start parallel seat taking
         threading.Thread(target=self._execute_seat_taking, args=(seat_assignments,), daemon=True).start()
@@ -1835,15 +2397,18 @@ class BotGUI:
         threads = []
         
         for i, user in enumerate(self.users):
-            seats = seat_assignments.get(user['email'], [])
-            if seats and user.get('bot_instance'):
-                thread = threading.Thread(
-                    target=self._take_seats_for_user,
-                    args=(i, user, seats),
-                    daemon=True
-                )
-                threads.append(thread)
-                thread.start()
+            # Only process users with type '*'
+            if user.get('type') == '*':
+                seats = seat_assignments.get(user['email'], [])
+                user['assigned_seats'] = seats
+                if seats and user.get('bot_instance'):
+                    thread = threading.Thread(
+                        target=self._take_seats_for_user,
+                        args=(i, user, seats),
+                        daemon=True
+                    )
+                    threads.append(thread)
+                    thread.start()
         
         # Wait for all to complete
         for thread in threads:
@@ -1863,18 +2428,30 @@ class BotGUI:
         self.ui_queue.put(('update_user', user_index, 'status', 'Taking seats...'))
         
         taken_count = 0
-        for seat in seats:
-            try:
-                result = bot.takeSeat(seat, log_callback=log)
-                if result.get('success'):
-                    taken_count += 1
-                    user['seats_booked'] = taken_count
-                    self.ui_queue.put(('update_user', user_index, 'seats_booked', taken_count))
-                    log(f"✓ Seat {seat} taken successfully")
-                else:
-                    log(f"✗ Failed to take seat {seat}")
-            except Exception as e:
-                log(f"✗ Error taking seat {seat}: {str(e)}")
+        
+        # Send all requests without waiting
+        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+            # Submit all requests immediately
+            futures = {}
+            for seat in seats:
+                future = executor.submit(bot.takeSeat, seat, log_callback=log)
+                futures[future] = seat
+                log(f"→ Request sent for seat {seat}")
+            
+            # Process responses as they arrive (FIFO)
+            for future in concurrent.futures.as_completed(futures):
+                seat = futures[future]
+                try:
+                    result = future.result(timeout=30)  # Don't wait long
+                    if result.get('success'):
+                        taken_count += 1
+                        user['seats_booked'] = taken_count
+                        self.ui_queue.put(('update_user', user_index, 'seats_booked', taken_count))
+                        log(f"✓ Seat {seat} taken successfully")
+                    else:
+                        log(f"✗ Failed to take seat {seat}")
+                except Exception as e:
+                    log(f"✗ Error for seat {seat}: {str(e)}")
         
         self.ui_queue.put(('update_user', user_index, 'status', f'Completed - {taken_count} seats'))
 def main():
