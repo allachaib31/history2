@@ -1481,7 +1481,7 @@ class SeatScanner:
         
         if not seat_id:
             return
-        
+        #if seat_id
         if status == 'free':
             self._handle_seat_free(seat_id)
         elif status == 'reservedByToken' and hold_token_hash:
@@ -1888,11 +1888,14 @@ class BotGUI:
                     
                     # When reaches 0, regenerate hold token
                     if user['expireTime'] == 0 and user.get('bot_instance'):
+                        user['assigned_seats'] = []
+                        user['seats_booked'] = 0
+                        self.ui_queue.put(('update_user', i, 'seats_booked', 0))
                         def regenerate_and_retry():
                             success = self.regenerate_hold_token(i, user)
                             # ONLY retry seats if token regeneration was successful
-                            if success and user.get('assigned_seats'):
-                                self._take_seats_for_user(i, user, user['assigned_seats'])
+                            if success and user.get('save_seat_assignment') and user.get("type") == "*":
+                                self._take_seats_for_user(i, user, user['save_seat_assignment'])
                         
                         threading.Thread(
                             target=regenerate_and_retry,
@@ -2401,6 +2404,7 @@ class BotGUI:
             if user.get('type') == '*':
                 seats = seat_assignments.get(user['email'], [])
                 user['assigned_seats'] = seats
+                user['save_seat_assignment'] = seats
                 if seats and user.get('bot_instance'):
                     thread = threading.Thread(
                         target=self._take_seats_for_user,
@@ -2428,6 +2432,8 @@ class BotGUI:
         self.ui_queue.put(('update_user', user_index, 'status', 'Taking seats...'))
         
         taken_count = 0
+        #user['seats_booked'] = 0
+        #self._refresh_users_table()
         
         # Send all requests without waiting
         with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
