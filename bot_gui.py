@@ -115,7 +115,7 @@ class TokenManager:
 class WebookBot:
     """Main bot class for handling browser automation and API calls"""
     
-    def __init__(self, email, password,headless=True, proxy=None):
+    def __init__(self, email, password,headless=True, proxy=None, shared_data=None, shared_data_lock=None):
         self.headless = headless
         self.proxy = proxy
         self.email = email
@@ -123,20 +123,11 @@ class WebookBot:
         self.token_manager = TokenManager()
         self.session = requests.Session()
         self.browser_semaphore = threading.Semaphore(1)  # Only 1 browser at a time
-        self.commitHash = None  # Placeholder for commit hash if needed
-        self.chartToken = None
-        self.chart_key = None
-        self.event_key = None
-        self.event_id = None
-        self.channelKeyCommon = None
-        self.channelKey = None
-        self.home_team = None
-        self.away_team = None
         self.browser_id = None
-        self.channels = None
-        self.seasonStructure = None
         self.webook_hold_token = None  # Placeholder for Webook hold token
         self.expireTime = 600
+        self.shared_data = shared_data
+        self.shared_data_lock = shared_data_lock
         
         # Setup session defaults
         #self.session.headers.update({
@@ -196,19 +187,20 @@ class WebookBot:
             commit_hash_match = re.search(commit_hash_pattern, content)
             
             #result = {}
-            
-            if chart_token_match:
-                self.chartToken = chart_token_match.group(1)
-                log(f"✓ Found chartToken: {self.chartToken}")
-            else:
-                log("✗ chartToken not found")
-                
-            if commit_hash_match:
-                self.commitHash = commit_hash_match.group(1)
-                log(f"✓ Found commitHash: {self.commitHash}")
-            else:
-                log("✗ commitHash not found")
-                
+            with self.shared_data_lock:
+
+                if chart_token_match:
+                    self.shared_data['chartToken'] = chart_token_match.group(1)
+                    log(f"✓ Found chartToken: {self.shared_data['chartToken']}")
+                else:
+                    log("✗ chartToken not found")
+                    
+                if commit_hash_match:
+                    self.shared_data['commitHash'] = commit_hash_match.group(1)
+                    log(f"✓ Found commitHash: {self.shared_data['commitHash']}")
+                else:
+                    log("✗ commitHash not found")
+                    
             # Also extract other useful data
             
             #return result
@@ -293,13 +285,14 @@ class WebookBot:
                 response_data = response.json()
                 log("✓ Response received successfully")
                 #print(response_data)
-                self.chart_key = response_data['data']['seats_io']['chart_key']
-                self.event_key = response_data['data']['seats_io']['event_key']
-                self.channelKeyCommon = response_data['data']['channel_keys']['common']
-                self.channelKey = response_data['data']['channel_keys']
-                self.event_id = response_data['data']['_id']
-                self.home_team = response_data['data']['home_team']
-                self.away_team = response_data['data']['away_team']
+                with self.shared_data_lock:
+                    self.shared_data['chart_key'] = response_data['data']['seats_io']['chart_key']
+                    self.shared_data['event_key'] = response_data['data']['seats_io']['event_key']
+                    self.shared_data['channelKeyCommon'] = response_data['data']['channel_keys']['common']
+                    self.shared_data['channelKey'] = response_data['data']['channel_keys']
+                    self.shared_data['event_id'] = response_data['data']['_id']
+                    self.shared_data['home_team'] = response_data['data']['home_team']
+                    self.shared_data['away_team'] = response_data['data']['away_team']
             except json.JSONDecodeError:
                 return {
                     'status_code': response.status_code,
@@ -365,7 +358,7 @@ class WebookBot:
             'accept': '*/*',
             'accept-language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
             'priority': 'u=1, i',
-            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00383-tzm/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.commitHash}',
+            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00383-tzm/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data["commitHash"]}',
             'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Linux"',
@@ -380,7 +373,7 @@ class WebookBot:
         }
         
         params = {
-            'event_key': self.event_key
+            'event_key': self.shared_data['event_key']
         }
         
         # Generate signature (this is a placeholder - you'll need the actual signing logic)
@@ -401,16 +394,18 @@ class WebookBot:
             response.raise_for_status()
             
             data = response.json()
-            log(f"✓ Successfully fetched rendering info")
-            #print(data)
-            all_objects = []
-            seasonStructure = data.get('seasonStructure', {}).get('topLevelSeasonKey', None)
-            print(f'seasonStructure: {seasonStructure}')
-            for channel in data.get('channels', []):
-                if 'objects' in channel:
-                    all_objects.extend(channel['objects'])
-            self.channels = all_objects
-            return self.channels, seasonStructure
+            with self.shared_data_lock:
+
+                log(f"✓ Successfully fetched rendering info")
+                #print(data)
+                all_objects = []
+                self.shared_data['seasonStructure'] = data.get('seasonStructure', {}).get('topLevelSeasonKey', None)
+                print(f'seasonStructure: {self.shared_data['seasonStructure']}')
+                for channel in data.get('channels', []):
+                    if 'objects' in channel:
+                        all_objects.extend(channel['objects'])
+                self.shared_data['channels'] = all_objects
+                return self.shared_data['channels'], self.shared_data['seasonStructure']
             
         except requests.exceptions.RequestException as e:
             error_msg = f"Failed to fetch rendering info: {str(e)}"
@@ -444,7 +439,7 @@ class WebookBot:
             str: The signature hash
         """
         # Get chartToken (should be available from extract_seatsio_chart_data)
-        if not self.chartToken:
+        if not self.shared_data['chartToken']:
             raise ValueError("chartToken is required for signature generation")
         
         # Convert request_body to string if it's not already
@@ -452,7 +447,7 @@ class WebookBot:
             request_body = str(request_body) if request_body else ""
         
         # Reverse the chartToken
-        reversed_token = self.chartToken[::-1]
+        reversed_token = self.shared_data['chartToken'][::-1]
         
         # Concatenate reversed token with request body
         data_to_hash = reversed_token + request_body
@@ -779,7 +774,7 @@ class WebookBot:
         
         # Prepare request body
         request_body = {
-            "event_id": self.event_id,
+            "event_id": self.shared_data['event_id'],
             "lang": lang
         }
         
@@ -802,7 +797,7 @@ class WebookBot:
         }
         
         try:
-            log(f"Requesting Webook hold token for event: {self.event_id}")
+            log(f"Requesting Webook hold token for event: {self.shared_data['event_id']}")
             session = requests.Session()
             if self.proxy:
                 session.proxies = {
@@ -865,7 +860,7 @@ class WebookBot:
             print(msg)
         
         # Validate prerequisites
-        if not self.chartToken:
+        if not self.shared_data['chartToken']:
             raise ValueError("chartToken not available. Run extract_seatsio_chart_data() first")
         
         # Generate browser ID if not exists
@@ -885,7 +880,7 @@ class WebookBot:
             'accept': '*/*',
             'accept-language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
             'priority': 'u=1, i',
-            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.commitHash}',
+            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data['commitHash']}',
             'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Linux"',
@@ -962,9 +957,9 @@ class WebookBot:
             print(msg)
         
         # Validate prerequisites
-        if not self.chartToken:
+        if not self.shared_data['chartToken']:
             raise ValueError("chartToken not available. Run extract_seatsio_chart_data() first")
-        if not self.event_key and not event_keys:
+        if not self.shared_data['event_key'] and not event_keys:
             raise ValueError("event_key not available. Run send_event_detail_request() first")
         
         # Generate browser ID if not exists
@@ -974,11 +969,11 @@ class WebookBot:
         
         # Use provided event_keys or default to self.event_key
         if not event_keys:
-            event_keys = [self.event_key]
+            event_keys = [self.shared_data['event_key']]
         
         # Use provided channel_keys or default
         if not channel_keys:
-            channel_keys = ["NO_CHANNEL", *self.channelKeyCommon, *self.channelKey.get(self.home_team['_id'])]
+            channel_keys = ["NO_CHANNEL", *self.shared_data['channelKeyCommon'], *self.shared_data['channelKey'].get(self.shared_data['home_team']['_id'])]
         
         # Generate a unique hold token (UUID v4)
         hold_token = self.webook_hold_token
@@ -1011,7 +1006,7 @@ class WebookBot:
             'content-type': 'application/json',
             'origin': 'https://cdn-eu.seatsio.net',
             'priority': 'u=1, i',
-            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.commitHash}',
+            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data['commitHash']}',
             'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Linux"',
@@ -1133,9 +1128,9 @@ class WebookBot:
             print(msg)
         
         # Validate prerequisites
-        if not self.chartToken:
+        if not self.shared_data['chartToken']:
             raise ValueError("chartToken not available. Run extract_seatsio_chart_data() first")
-        if not self.event_key and not event_keys:
+        if not self.shared_data['event_key'] and not event_keys:
             raise ValueError("event_key not available. Run send_event_detail_request() first")
         
         # Generate browser ID if not exists
@@ -1145,7 +1140,7 @@ class WebookBot:
         
         # Use provided event_keys or default to self.event_key
         if not event_keys:
-            event_keys = [self.event_key]
+            event_keys = [self.shared_data['event_key']]
         
         # Prepare the request body (same structure as hold)
         request_body = {
@@ -1173,7 +1168,7 @@ class WebookBot:
             'content-type': 'application/json',
             'origin': 'https://cdn-eu.seatsio.net',
             'priority': 'u=1, i',
-            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.commitHash}',
+            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data['commitHash']}',
             'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Linux"',
@@ -1618,7 +1613,7 @@ class BotGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Webook Bot - Browser Automation")
-        self.root.geometry("1300x700")
+        self.root.geometry("1700x800")
         
         # Data storage
         self.users = []
@@ -1638,7 +1633,21 @@ class BotGUI:
         
         # UI queue for thread-safe updates
         self.ui_queue = queue.Queue()
-        
+        self.shared_event_data = {
+            'chart_key': None,
+            'event_key': None,
+            'channelKeyCommon': None,
+            'channelKey': None,
+            'event_id': None,
+            'home_team': None,
+            'away_team': None,
+            'channels': None,
+            'seasonStructure': None,
+            'chartToken': None,
+            'commitHash': None
+        }
+        self.shared_data_lock = threading.Lock()
+        self.shared_data_fetched = threading.Event()
         # Settings
         self.headless_var = tk.BooleanVar(value=False)
         
@@ -2183,7 +2192,9 @@ class BotGUI:
                     email=user['email'],
                     password=user['password'],
                     headless=self.headless_var.get(),
-                    proxy=user.get('proxy')
+                    proxy=user.get('proxy'),
+                    shared_data=self.shared_event_data,
+                    shared_data_lock=self.shared_data_lock
                 )
                 
                 # Store bot instance in user dict
@@ -2213,59 +2224,70 @@ class BotGUI:
             # AFTER LOGIN - ALL THREADS WORK IN PARALLEL
             # No semaphore here - all threads can work simultaneously
             update_status("Initializing seat system...")
-            
-            try:
-                bot.extract_seatsio_chart_data(log_callback=log)
-                path_parts = urlparse(event_url).path.strip("/").split("/")
-                event_id = path_parts[2]
-                bot.send_event_detail_request(event_id, log_callback=log)
-                self.channels, self.seasonStructure = bot.get_rendering_info(log_callback=log)
-                #print(self.channels)
-                
-                if not self.displayChannels and user_index == 0:
-                    self._create_checkBox()
-                
-                # Get hold token and expire time
-                bot.getWebookHoldToken(log_callback=log)
-                bot.getExpireTime(log_callback=log)
-                
-                # Update expire time in user dict and UI
-                user['expireTime'] = bot.expireTime
-                self.ui_queue.put(('update_user', user_index, 'expireTime', bot.expireTime))
-                
-                update_status("Ready for booking")
-                log(f"✓ System ready, hold token expires in {bot.expireTime} seconds")
-                # Enable fill seats button when first user is ready
-                if user_index == 0:
-                    self.fill_seats_btn.config(state='normal')
-                self.init_barrier.wait()
-                update_status("All users ready - starting operations")
-                log("All users initialized, starting synchronized operations")
-                
-                # Now you can add seat booking logic here
-                # All threads will execute this part in parallel
-                # Every user updates the scanner with their info
-                # Start scanner once with all users
-                if user_index == 0 and not self.scanner_started:
-                    try:
-                        self.seat_scanner.set_event_key(bot.event_key, bot.seasonStructure)
-                        self.seat_scanner.set_users(self.users)  # All users, scanner will filter by type *
-                        self.seat_scanner.start_scanning()
-                        self.scanner_started = True
-                        log("🔍 Auto-started seat scanner for all type * users")
-                        self.status_var.set("Bot ready - Scanner monitoring seats...")
-                    except Exception as e:
-                        log(f"Failed to start scanner: {str(e)}")
+            if not self.shared_data_fetched.is_set():
+                try:
+                    bot.extract_seatsio_chart_data(log_callback=log)
+                    path_parts = urlparse(event_url).path.strip("/").split("/")
+                    event_id = path_parts[2]
+                    bot.send_event_detail_request(event_id, log_callback=log)
+                    bot.get_rendering_info(log_callback=log)
+                    self.shared_data_fetched.set()
+                    self.channels = self.shared_event_data['channels']
+                    self.seasonStructure = self.shared_event_data['seasonStructure']
+                    log("✓ Fetched shared event data for all users")
+                    #print(self.channels)
+                    
+                    if not self.displayChannels and user_index == 0:
+                        self._create_checkBox()
+                    
+                    # Get hold token and expire time
+                    bot.getWebookHoldToken(log_callback=log)
+                    bot.getExpireTime(log_callback=log)
+                    
+                    # Update expire time in user dict and UI
+                    user['expireTime'] = bot.expireTime
+                    self.ui_queue.put(('update_user', user_index, 'expireTime', bot.expireTime))
+                    
+                    update_status("Ready for booking")
+                    log(f"✓ System ready, hold token expires in {bot.expireTime} seconds")
+                    # Enable fill seats button when first user is ready
+                    if user_index == 0:
+                        self.fill_seats_btn.config(state='normal')
+                    self.init_barrier.wait()
+                    update_status("All users ready - starting operations")
+                    log("All users initialized, starting synchronized operations")
+                    
+                    # Now you can add seat booking logic here
+                    # All threads will execute this part in parallel
+                    # Every user updates the scanner with their info
+                    # Start scanner once with all users
+                    if user_index == 0 and not self.scanner_started:
+                        try:
+                            self.seat_scanner.set_event_key(
+                                self.shared_event_data['event_key'], 
+                                self.shared_event_data['seasonStructure']
+                            )
+                            self.seat_scanner.set_users(self.users)  # All users, scanner will filter by type *
+                            self.seat_scanner.start_scanning()
+                            self.scanner_started = True
+                            log("🔍 Auto-started seat scanner for all type * users")
+                            self.status_var.set("Bot ready - Scanner monitoring seats...")
+                        except Exception as e:
+                            log(f"Failed to start scanner: {str(e)}")
 
-                # Always update scanner with current user list after all users are ready
-                if user_index == len(self.users) - 1:  # Last user updates the complete list
-                    self.seat_scanner.set_users(self.users)
-                    log(f"🔍 Scanner updated with {len(self.users)} users")
-                
-            except Exception as e:
-                update_status("Initialization failed")
-                log(f"✗ Failed to initialize: {str(e)}")
-                
+                    # Always update scanner with current user list after all users are ready
+                    if user_index == len(self.users) - 1:  # Last user updates the complete list
+                        self.seat_scanner.set_users(self.users)
+                        log(f"🔍 Scanner updated with {len(self.users)} users")
+                    
+                except Exception as e:
+                    update_status("Initialization failed")
+                    log(f"✗ Failed to initialize: {str(e)}")
+            else:
+                # Wait for shared data to be available
+                self.shared_data_fetched.wait(timeout=30)
+                log("✓ Using shared event data")
+
         except Exception as e:
             update_status("Error")
             log(f"✗ Worker error: {str(e)}")
@@ -2354,21 +2376,21 @@ class BotGUI:
 
     def fill_seats(self):
         """Distribute and take seats"""
-        print(f"Fill seats called - Channels: {len(self.channels)}")
+        print(f"Fill seats called - Channels: {len(self.shared_event_data['channels'])}")
         print(f"Selected sections check...")
 
         seats_per_user = int(self.seats_var.get())
         
         # Get selected sections from checkboxes
         selected_sections = []
-        for channel in self.channels:
+        for channel in self.shared_event_data['channels']:
             if isinstance(channel, str) and '-' in channel:
                 prefix = channel.split('-')[0]
                 if hasattr(self, f"{prefix}_var") and getattr(self, f"{prefix}_var").get():
                     selected_sections.append(prefix)
         
         # Filter channels by selected sections
-        available_seats = [ch for ch in self.channels 
+        available_seats = [ch for ch in self.shared_event_data['channels'] 
                         if any(ch.startswith(prefix) for prefix in selected_sections)]
         
         # Group users by type
