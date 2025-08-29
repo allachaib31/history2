@@ -35,6 +35,10 @@ import hashlib
 from urllib.parse import urlparse
 import time
 import websocket
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Add this at the top of your file after imports
 
 # Playwright imports with error handling
 try:
@@ -128,6 +132,32 @@ class WebookBot:
         self.expireTime = 600
         self.shared_data = shared_data
         self.shared_data_lock = shared_data_lock
+        self.session = requests.Session()
+        
+        # Set proxy if provided
+        if proxy:
+            self.session.proxies = {
+                'http': proxy,
+                'https': proxy
+            }
+        
+        # Connection pooling adapter with proxy support
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=10,
+            max_retries=0
+        )
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+        
+        # Fast HTTP settings
+        self.session.headers.update({
+            'Connection': 'keep-alive',
+            'Keep-Alive': 'timeout=5, max=100'
+        })
+        
+        # Disable SSL verification for speed (optional)
+        self.session.verify = False
         
         # Setup session defaults
         #self.session.headers.update({
@@ -248,25 +278,31 @@ class WebookBot:
         token = self.token_manager.get_valid_token(self.email)['token']
         # Set up headers (exactly like the curl command)
         headers = {
-            'sec-ch-ua-platform': '"Linux"',
-            'Referer': '',
-            'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
-            'sec-ch-ua-mobile': '?0',
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'token': token
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Content-Type": "application/json",
+            "token": token,
+            "Origin": "https://webook.com",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
         }
         
         try:
             # Set up session with proxy if provided
             session = requests.Session()
             if self.proxy:
+                #print(self.proxy)
                 session.proxies = {
                     'http': self.proxy,
                     'https': self.proxy
                 }
-            
+            #test_url = "https://httpbin.org/ip"
+            #response2 = session.get(test_url, timeout=10)
+            #print("Proxy IP:", response2.json()["origin"])
             log(f"Sending request to: {api_url}")
             log(f"Token: {token[:20]}...")
             
@@ -328,6 +364,7 @@ class WebookBot:
                 'success': False,
                 'error': error_msg
             }
+    
     def get_rendering_info(self, log_callback=None):
         """
         Fetch SeatsIO rendering info for a specific event
@@ -356,18 +393,6 @@ class WebookBot:
         
         headers = {
             'accept': '*/*',
-            'accept-language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
-            'priority': 'u=1, i',
-            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00383-tzm/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data["commitHash"]}',
-            'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Linux"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin',
-            'sec-fetch-storage-access': 'active',
-            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
-            'x-browser-id': self.browser_id,
             'x-client-tool': 'Renderer',
             'x-request-origin': 'webook.com'
         }
@@ -777,25 +802,22 @@ class WebookBot:
             "event_id": self.shared_data['event_id'],
             "lang": lang
         }
-        
         # Prepare headers
         headers = {
-            'accept': 'application/json',
-            'accept-language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
-            'authorization': f'Bearer {access_token}',
-            'content-type': 'application/json',
-            'origin': 'https://webook.com',
-            'priority': 'u=1, i',
-            'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Linux"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-site',
-            'token': token,
-            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "token": token,
+            "Origin": "https://webook.com",
+            "Connection": "keep-alive",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-site",
         }
-        
+
         try:
             log(f"Requesting Webook hold token for event: {self.shared_data['event_id']}")
             session = requests.Session()
@@ -1023,25 +1045,19 @@ class WebookBot:
         try:
             log(f"Attempting to hold {seat_objects}")
             log(f"For event(s): {', '.join(event_keys)}")
-            #print(f'url', url)
-            #print(f'headers', headers)
-            #print(f'request_body_str', request_body_str)
-            session = requests.Session()
+            '''session = requests.Session()
             if self.proxy:
                 session.proxies = {
                     'http': self.proxy,
                     'https': self.proxy
-                }
-            # Make the POST request
-            response = session.post(
+                }'''
+            response = self.session.post(
                 url,
                 headers=headers,
-                data=request_body_str,  # Send as string, not dict
-                timeout=30
+                data=request_body_str,
+                timeout=10
             )
-            
-            log(f"Response status: {response.status_code}")
-            
+            print(f"takeSeat response ala : {response.status_code}")
             if response.status_code == 200 or response.status_code == 204:
                 try:
                     response_data = response.json()
@@ -1287,17 +1303,68 @@ class SeatScanner:
         self.ws = None
         self.is_connected = False
         self.is_running = False
-        
+        self.ui_queue = None
         # Seat tracking
-        self.reserved_seats_map = {}  # holdTokenHash -> list of seats
+        self.global_reserved_seats = {}  # holdTokenHash -> list of seats
         self.users_by_type = {}  # type -> list of users
         self.log_callback = None
+        self.current_user_index = 0
+        self.users = []
         
         # Channels
         self.workspace_channel = workspace_key
         self.event_channel = f"{workspace_key}-{event_key}" if event_key else None
         self.event_channel2 = f"{workspace_key}-{seasonStructure}" if seasonStructure else None
+    def _get_next_user(self):
+        if not self.users_by_type:
+            return None
         
+        all_users = []
+        for users in self.users_by_type.values():
+            all_users.extend(users)
+        
+        if not all_users:
+            return None
+            
+        selected_user = all_users[self.current_user_index % len(all_users)]
+        self.current_user_index += 1
+        return selected_user
+    def _get_next_available_user(self):
+        """Get next user who can actually take seats"""
+        if not self.users_by_type:
+            return None
+        
+        all_users = []
+        for users in self.users_by_type.values():
+            all_users.extend(users)
+        
+        if not all_users:
+            return None
+        
+        # Try up to len(all_users) times to find available user
+        attempts = 0
+        while attempts < len(all_users):
+            selected_user = all_users[self.current_user_index % len(all_users)]
+            self.current_user_index += 1
+            attempts += 1
+            
+            # Check if user can take more seats
+            user_type = selected_user.get('type', '*')
+            if user_type == '+':
+                current_seats = selected_user.get('seats_booked', 0)
+                max_seats = getattr(self, 'dseats_limit', 1)
+                if current_seats >= max_seats:
+                    continue  # Skip this user, try next
+            
+            # Check if user has valid bot
+            bot = selected_user.get('bot_instance')
+            if bot and hasattr(bot, 'webook_hold_token') and bot.webook_hold_token:
+                return selected_user
+                
+        return None  # No available users found
+    def set_ui_queue(self, ui_queue):
+        """Set UI queue for updating GUI"""
+        self.ui_queue = ui_queue
     def set_event_key(self, event_key, seasonStructure):
         """Set the event key and update event channel"""
         self.event_key = event_key
@@ -1307,6 +1374,7 @@ class SeatScanner:
     
     def set_users(self, users):
         """Set users and group them by type"""
+        self.users = users  # Store the original users list
         self.users_by_type = {}
         for user in users:
             user_type = user.get('type', '*')
@@ -1356,16 +1424,26 @@ class SeatScanner:
     
     def _run_websocket(self):
         """Run WebSocket connection with auto-reconnect"""
+        reconnect_delay = 5
+        max_delay = 30
+        
         while self.is_running:
             try:
+                self.log("Attempting WebSocket connection...")
                 self._connect_websocket()
-                time.sleep(5)  # Wait before reconnecting
+                
             except Exception as e:
                 self.log(f"WebSocket error: {str(e)}")
-                time.sleep(5)
+                
+            if self.is_running:  # Only wait if still supposed to be running
+                self.log(f"Reconnecting in {reconnect_delay} seconds...")
+                time.sleep(reconnect_delay)
+                
+                # Increase delay for next attempt (exponential backoff)
+                reconnect_delay = min(reconnect_delay * 1.5, max_delay)
     
     def _connect_websocket(self):
-        """Establish WebSocket connection"""
+        """Establish WebSocket connection with timeout handling"""
         ws_url = "wss://messaging-eu.seatsio.net/ws"
         
         headers = {
@@ -1374,7 +1452,6 @@ class SeatScanner:
             'Accept-Language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
             'Pragma': 'no-cache',
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
-            #'Sec-WebSocket-Extensions': 'permessage-deflate; client_max_window_bits'
         }
         
         self.ws = websocket.WebSocketApp(
@@ -1385,8 +1462,13 @@ class SeatScanner:
             on_error=self._on_error,
             on_close=self._on_close
         )
-        self.ws.compression = None
-        self.ws.run_forever()
+        
+        # Set ping/pong to detect dead connections
+        self.ws.run_forever(
+            ping_interval=30,    # Send ping every 30 seconds
+            ping_timeout=10,     # Wait 10 seconds for pong
+            ping_payload="keepalive"
+        )
     
     def _on_open(self, ws):
         """Handle WebSocket connection opened"""
@@ -1428,7 +1510,7 @@ class SeatScanner:
         """Handle incoming WebSocket messages"""
         try:
             data = json.loads(message)
-            print(data)
+            #print(data)
             
             # Handle array of messages
             if isinstance(data, list):
@@ -1483,58 +1565,43 @@ class SeatScanner:
             self._handle_seat_reserved(seat_id, hold_token_hash)
     
     def _handle_seat_free(self, seat_id):
-        """Handle when a seat becomes free - trigger * users to attempt booking"""
-        self.log(f"🟢 SEAT FREE: {seat_id}")
-        
-        # Get users with type '*'
-        star_users = self.users_by_type.get('*', [])
-        
-        if star_users:
-            # Try to book with all * users simultaneously
-            self._attempt_seat_booking(star_users, seat_id, "free_seat")
+        selected_user = self._get_next_available_user()  # Use improved method
+        if selected_user:
+            self._book_seat_for_user(selected_user, selected_user['bot_instance'], seat_id, "free_seat")
     
     def _handle_seat_reserved(self, seat_id, hold_token_hash):
         """Handle when a seat is reserved - track the reservation"""
-        self.log(f"🟡 SEAT RESERVED: {seat_id} (token: {hold_token_hash[:12]}...)")
-        
-        # Add to reserved seats map
-        if hold_token_hash not in self.reserved_seats_map:
-            self.reserved_seats_map[hold_token_hash] = []
-        
-        if seat_id not in self.reserved_seats_map[hold_token_hash]:
-            self.reserved_seats_map[hold_token_hash].append(seat_id)
-            self.log(f"📝 Tracked seat {seat_id} for token {hold_token_hash[:12]}...")
+        #self.log(f"🟡 SEAT RESERVED: {seat_id} (token: {hold_token_hash[:12]}...)")
+        if hold_token_hash not in self.global_reserved_seats:
+            self.global_reserved_seats[hold_token_hash] = {'seats': [], 'user_email': None}
+        self.global_reserved_seats[hold_token_hash]['seats'].append(seat_id)
+        #self.log(f"📝 Tracked seat {seat_id} for token {hold_token_hash[:12]}...")
     
     def _handle_hold_token_expired(self, hold_token):
         """Handle hold token expiration - trigger ** users for tracked seats"""
         # Generate SHA1 hash of the hold token
         hold_token_hash = hashlib.sha1(hold_token.encode()).hexdigest()
         
-        self.log(f"⏰ HOLD TOKEN EXPIRED: {hold_token[:12]}... (hash: {hold_token_hash[:12]}...)")
+        #self.log(f"⏰ HOLD TOKEN EXPIRED: {hold_token[:12]}... (hash: {hold_token_hash[:12]}...)")
         
         # Check if we have tracked seats for this token
-        if hold_token_hash in self.reserved_seats_map:
-            expired_seats = self.reserved_seats_map[hold_token_hash]
-            self.log(f"🎯 Found {len(expired_seats)} seats to attempt: {expired_seats}")
+        if hold_token_hash in self.global_reserved_seats:
+            expired_seats = self.global_reserved_seats[hold_token_hash]['seats']
+            selected_user = self._get_next_user()  # Pick ANY available user
             
-            # Get users with type '**'
-            # Get users with type '*'
-            star_users = self.users_by_type.get('*', [])
-
-            if star_users and expired_seats:
-                # Try to book expired seats with * users
+            if selected_user:
                 for seat_id in expired_seats:
-                    self._attempt_seat_booking(star_users, seat_id, "expired_token")
-            
-            # Remove from tracking map
-            del self.reserved_seats_map[hold_token_hash]
-            self.log(f"🗑️ Removed tracking for expired token {hold_token_hash[:12]}...")
+                    self._book_seat_for_user(selected_user, selected_user['bot_instance'], seat_id, "expired_token")
+                # Remove from tracking map
+            del self.global_reserved_seats[hold_token_hash]
+            #self.log(f"🗑️ Removed tracking for expired token {hold_token_hash[:12]}...")
         else:
-            self.log(f"ℹ️ No tracked seats found for expired token {hold_token_hash[:12]}...")
+            return
+            #self.log(f"ℹ️ No tracked seats found for expired token {hold_token_hash[:12]}...")
     
     def _attempt_seat_booking(self, users, seat_id, trigger_type):
         """Attempt to book a seat with multiple users"""
-        self.log(f"🚀 BOOKING ATTEMPT: {seat_id} with {len(users)} users (trigger: {trigger_type})")
+        #self.log(f"🚀 BOOKING ATTEMPT: {seat_id} with {len(users)} users (trigger: {trigger_type})")
         
         # Use ThreadPoolExecutor for concurrent booking attempts
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(users)) as executor:
@@ -1556,45 +1623,72 @@ class SeatScanner:
     def _book_seat_for_user(self, user, bot, seat_id, trigger_type):
         """Book seat for a specific user"""
         email = user.get('email', 'unknown')
-        
+        user_type = user.get('type', '*')
+        print(f'user_type, {user_type}')
+        if not bot:
+            print(f"[{email}] ERROR: No bot instance!")
+            return False
+        if not hasattr(bot, 'webook_hold_token') or not bot.webook_hold_token:
+            self.log(f"[{email}] ERROR: No hold token!")
+            return False
+    
+        # Check if login was successful
+        if not bot.token_manager.get_valid_token(bot.email):
+            self.log(f"[{email}] ERROR: No valid login token!")
+            return False
         def user_log(msg):
             timestamp = datetime.now().strftime('%H:%M:%S')
             log_entry = f"[{timestamp}] [SCANNER-{trigger_type.upper()}] {msg}"
             if 'logs' in user:
                 user['logs'].append(log_entry)
-            self.log(f"[{email}] {msg}")
+            #self.log(f"[{email}] {msg}")
         
         try:
-            user_log(f"→ Attempting to book {seat_id}")
+            if user_type == '+':
+                current_seats = user.get('seats_booked', 0)
+                # Get DSeats limit (you'll need to pass this to scanner)
+                max_seats = getattr(self, 'dseats_limit', 1)  # Default to 1
+                if current_seats >= max_seats:
+                    self.log(f"[{email}] Seat limit reached ({current_seats}/{max_seats})")
+                    return False
+            #user_log(f"→ Attempting to book {seat_id}")
             
             result = bot.takeSeat(seat_id, log_callback=user_log)
             
             if result and result.get('success'):
-                user_log(f"✅ SUCCESS: Booked {seat_id}")
+                #user_log(f"✅ SUCCESS: Booked {seat_id}")
                 
                 # Update user's seat count
                 user['seats_booked'] = user.get('seats_booked', 0) + 1
                 if 'assigned_seats' not in user:
                     user['assigned_seats'] = []
                 user['assigned_seats'].append(seat_id)
-                
+                if self.ui_queue:
+                    # Find user index in the MAIN users list, not the type-specific list
+                    for i, u in enumerate(self.users):  # <-- Use self.users, not users_by_type
+                        if u['email'] == user['email']:
+                            self.ui_queue.put(('update_user', i, 'seats_booked', user['seats_booked']))
+                            break
                 return True
             else:
-                user_log(f"❌ FAILED: Could not book {seat_id}")
+                #user_log(f"❌ FAILED: Could not book {seat_id}")
                 return False
                 
         except Exception as e:
-            user_log(f"💥 ERROR: {str(e)}")
+            #user_log(f"💥 ERROR: {str(e)}")
             return False
-    
-    def _on_error(self, ws, error):
-        """Handle WebSocket errors"""
-        self.log(f"❌ WebSocket error: {str(error)}")
-        self.is_connected = False
     
     def _on_close(self, ws, close_status_code, close_msg):
         """Handle WebSocket connection closed"""
-        self.log(f"🔌 WebSocket closed: {close_status_code} - {close_msg}")
+        self.log(f"WebSocket closed: {close_status_code} - {close_msg}")
+        self.is_connected = False
+        # Don't log as error - this is expected for reconnection
+
+    def _on_error(self, ws, error):
+        """Handle WebSocket errors"""
+        # Only log real errors, not connection issues during reconnect
+        if "Connection is already closed" not in str(error):
+            self.log(f"WebSocket error: {str(error)}")
         self.is_connected = False
     
     def get_status(self):
@@ -1633,6 +1727,7 @@ class BotGUI:
         
         # UI queue for thread-safe updates
         self.ui_queue = queue.Queue()
+        self.seat_scanner.set_ui_queue(self.ui_queue) 
         self.shared_event_data = {
             'chart_key': None,
             'event_key': None,
@@ -1800,7 +1895,12 @@ class BotGUI:
         except (ValueError, AttributeError):
             # If conversion fails, default to 1
             seats_to_transfer_count = 1
-        
+        if to_user.get('type') == '+':
+            current_seats = to_user.get('seats_booked', 0)
+            if current_seats + seats_to_transfer_count > int(self.Dseats_var.get()):
+                messagebox.showwarning("Limit Exceeded", 
+                    f"User {to_user['email']} can only have {self.Dseats_var.get()} seats total")
+                return
         print(f'seats_to_transfer_count {seats_to_transfer_count}')
         def log_from(msg):
             timestamp = datetime.now().strftime('%H:%M:%S')
@@ -1816,6 +1916,9 @@ class BotGUI:
         
         transferred_seats = []
         failed_transfers = []
+
+        original_from_seats = from_user['seats_booked']
+        original_from_assigned = from_user['assigned_seats'].copy()
         
         try:
             # Transfer each seat
@@ -1835,38 +1938,38 @@ class BotGUI:
                 )
                 
                 if release_result.get('success'):
-                    # Update sender's seats
-                    from_user['seats_booked'] -= 1
+                            # Temporarily remove from sender
                     from_user['assigned_seats'].remove(seat_to_transfer)
-                    self.ui_queue.put(('update_user', from_idx, 'seats_booked', from_user['seats_booked']))
-                    log_from(f"✓ Seat {seat_to_transfer} released ({i+1}/{seats_to_transfer_count})")
-                    
-                    # Step 2: Take seat with receiver
-                    log_to(f"📥 Taking transferred seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count})...")
+                            
+                            # Step 2: Try to take with receiver
                     take_result = to_bot.takeSeat(
-                        seat_to_transfer,
-                        log_callback=log_to
-                    )
-                    
+                                seat_to_transfer,
+                                log_callback=log_to
+                            )
+                            
                     if take_result.get('success'):
-                        # Update receiver's seats
+                                # Success - update both users
+                        transferred_seats.append(seat_to_transfer)
                         to_user['seats_booked'] = to_user.get('seats_booked', 0) + 1
                         if 'assigned_seats' not in to_user:
                             to_user['assigned_seats'] = []
-                        to_user['assigned_seats'].append(seat_to_transfer)
-                        self.ui_queue.put(('update_user', to_idx, 'seats_booked', to_user['seats_booked']))
-                        log_to(f"✓ Seat {seat_to_transfer} acquired ({i+1}/{seats_to_transfer_count})")
-                        transferred_seats.append(seat_to_transfer)
-                    else:
-                        log_to(f"✗ Failed to take seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count})")
-                        failed_transfers.append(seat_to_transfer)
+                            to_user['assigned_seats'].append(seat_to_transfer)
+                        else:
+                                # Failed to take - add back to sender
+                            log_to(f"✗ Failed to take seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count})")
+                            from_user['assigned_seats'].insert(0, seat_to_transfer)
+                            failed_transfers.append(seat_to_transfer)
                 else:
                     log_from(f"✗ Failed to release seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count})")
                     failed_transfers.append(seat_to_transfer)
-                    break  # Stop trying if release fails
-            
+                    break
+                from_user['seats_booked'] = original_from_seats - len(transferred_seats)
+    
+            # Update UI with correct counts
+            self.ui_queue.put(('update_user', from_idx, 'seats_booked', from_user['seats_booked']))
+            self.ui_queue.put(('update_user', to_idx, 'seats_booked', to_user['seats_booked']))
             # Update final statuses
-            if len(transferred_seats) == seats_to_transfer_count:
+            '''if len(transferred_seats) == seats_to_transfer_count:
                 self.ui_queue.put(('update_user', from_idx, 'status', f'Transfer complete ({len(transferred_seats)} seats)'))
                 self.ui_queue.put(('update_user', to_idx, 'status', f'Transfer complete ({len(transferred_seats)} seats)'))
                 log_from(f"✓ Successfully transferred {len(transferred_seats)} seat(s)")
@@ -1880,7 +1983,7 @@ class BotGUI:
                 self.ui_queue.put(('update_user', from_idx, 'status', 'Transfer failed'))
                 self.ui_queue.put(('update_user', to_idx, 'status', 'Transfer failed'))
                 log_from(f"✗ Transfer failed: 0/{seats_to_transfer_count} seats transferred")
-                log_to(f"✗ Transfer failed: 0/{seats_to_transfer_count} seats received")
+                log_to(f"✗ Transfer failed: 0/{seats_to_transfer_count} seats received")'''
                 
         except Exception as e:
             log_from(f"✗ Transfer error: {str(e)}")
@@ -2263,23 +2366,18 @@ class BotGUI:
                     # Start scanner once with all users
                     if user_index == 0 and not self.scanner_started:
                         try:
+                            self.seat_scanner.dseats_limit = dSeats_count
                             self.seat_scanner.set_event_key(
                                 self.shared_event_data['event_key'], 
                                 self.shared_event_data['seasonStructure']
                             )
-                            self.seat_scanner.set_users(self.users)  # All users, scanner will filter by type *
+                            self.seat_scanner.set_users(self.users)
                             self.seat_scanner.start_scanning()
                             self.scanner_started = True
-                            log("🔍 Auto-started seat scanner for all type * users")
-                            self.status_var.set("Bot ready - Scanner monitoring seats...")
+                            log("🔍 Started single shared scanner for all users")
                         except Exception as e:
                             log(f"Failed to start scanner: {str(e)}")
 
-                    # Always update scanner with current user list after all users are ready
-                    if user_index == len(self.users) - 1:  # Last user updates the complete list
-                        self.seat_scanner.set_users(self.users)
-                        log(f"🔍 Scanner updated with {len(self.users)} users")
-                    
                 except Exception as e:
                     update_status("Initialization failed")
                     log(f"✗ Failed to initialize: {str(e)}")
@@ -2490,3 +2588,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
