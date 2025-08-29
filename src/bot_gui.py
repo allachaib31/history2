@@ -1329,6 +1329,30 @@ class SeatScanner:
         selected_user = all_users[self.current_user_index % len(all_users)]
         self.current_user_index += 1
         return selected_user
+    def _get_selected_sections(self):
+        """Get currently selected sections from GUI"""
+        if not hasattr(self, 'gui_ref'):
+            return []  # No GUI reference, allow all
+        
+        selected_sections = []
+        if hasattr(self.gui_ref, 'shared_event_data') and self.gui_ref.shared_event_data.get('channels'):
+            for channel in self.gui_ref.shared_event_data['channels']:
+                if isinstance(channel, str) and '-' in channel:
+                    prefix = channel.split('-')[0]
+                    if hasattr(self.gui_ref, f"{prefix}_var") and getattr(self.gui_ref, f"{prefix}_var").get():
+                        selected_sections.append(prefix)
+        
+        return selected_sections
+
+    def _is_seat_in_selected_sections(self, seat_id):
+        """Check if seat matches selected sections"""
+        selected_sections = self._get_selected_sections()
+        
+        if not selected_sections:
+            return True  # No sections selected = allow all
+        
+        # Check if seat starts with any selected section prefix
+        return any(seat_id.startswith(prefix) for prefix in selected_sections)
     def _get_next_available_user(self):
         """Get next user who can actually take seats"""
         if not self.users_by_type:
@@ -1565,7 +1589,10 @@ class SeatScanner:
             self._handle_seat_reserved(seat_id, hold_token_hash)
     
     def _handle_seat_free(self, seat_id):
-        selected_user = self._get_next_available_user()  # Use improved method
+        if not self._is_seat_in_selected_sections(seat_id):
+            return  # Skip seats not in selected sections
+        
+        selected_user = self._get_next_available_user()
         if selected_user:
             self._book_seat_for_user(selected_user, selected_user['bot_instance'], seat_id, "free_seat")
     
@@ -1578,26 +1605,23 @@ class SeatScanner:
         #self.log(f"📝 Tracked seat {seat_id} for token {hold_token_hash[:12]}...")
     
     def _handle_hold_token_expired(self, hold_token):
-        """Handle hold token expiration - trigger ** users for tracked seats"""
-        # Generate SHA1 hash of the hold token
+        """Handle hold token expiration - only take seats in selected sections"""
         hold_token_hash = hashlib.sha1(hold_token.encode()).hexdigest()
         
-        #self.log(f"⏰ HOLD TOKEN EXPIRED: {hold_token[:12]}... (hash: {hold_token_hash[:12]}...)")
-        
-        # Check if we have tracked seats for this token
         if hold_token_hash in self.global_reserved_seats:
             expired_seats = self.global_reserved_seats[hold_token_hash]['seats']
-            selected_user = self._get_next_user()  # Pick ANY available user
+            selected_user = self._get_next_user()
             
             if selected_user:
-                for seat_id in expired_seats:
+                # Filter expired seats to only include selected sections
+                filtered_seats = [seat for seat in expired_seats 
+                                if self._is_seat_in_selected_sections(seat)]
+                
+                for seat_id in filtered_seats:
                     self._book_seat_for_user(selected_user, selected_user['bot_instance'], seat_id, "expired_token")
-                # Remove from tracking map
+            
+            # Remove from tracking map
             del self.global_reserved_seats[hold_token_hash]
-            #self.log(f"🗑️ Removed tracking for expired token {hold_token_hash[:12]}...")
-        else:
-            return
-            #self.log(f"ℹ️ No tracked seats found for expired token {hold_token_hash[:12]}...")
     
     def _attempt_seat_booking(self, users, seat_id, trigger_type):
         """Attempt to book a seat with multiple users"""
@@ -2367,6 +2391,7 @@ class BotGUI:
                     if user_index == 0 and not self.scanner_started:
                         try:
                             self.seat_scanner.dseats_limit = dSeats_count
+                            self.seat_scanner.gui_ref = self  # Add GUI reference
                             self.seat_scanner.set_event_key(
                                 self.shared_event_data['event_key'], 
                                 self.shared_event_data['seasonStructure']
