@@ -35,6 +35,7 @@ import hashlib
 from urllib.parse import urlparse
 import time
 import websocket
+import socket
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -167,7 +168,60 @@ class WebookBot:
         #    'Content-Type': 'application/json',
         #})
     
-
+    def update_profile(self, favorite_team_id, log_callback=None):
+        """Update user profile with favorite team"""
+        def log(msg):
+            if log_callback:
+                log_callback(msg)
+            print(msg)
+        
+        # Get tokens from token manager
+        token_data = self.token_manager.get_valid_token(self.email)
+        if not token_data:
+            raise ValueError(f"No valid token for {self.email}. Login required.")
+        
+        access_token = token_data.get('access_token')
+        token = token_data.get('token')
+        
+        if not access_token or not token:
+            raise ValueError("Missing required tokens (access_token or token)")
+        
+        url = "https://api.webook.com/api/v2/update-profile?lang=en"
+        
+        payload = {
+            "favorite_team": favorite_team_id
+        }
+        
+        headers = {
+            "accept": "application/json",
+            "authorization": f"Bearer {access_token}",
+            "content-type": "application/json", 
+            "token": token,
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        
+        try:
+            log(f"Updating profile for {self.email} with favorite team: {favorite_team_id}")
+            
+            response = self.session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=30
+            )
+            
+            log(f"Update profile response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                log("✓ Profile updated successfully")
+                return True
+            else:
+                log(f"✗ Update profile failed with status {response.status_code}")
+                return False
+                
+        except Exception as e:
+            log(f"✗ Update profile error: {str(e)}")
+            return False
     def extract_seatsio_chart_data(self,log_callback=None):
         """
         Fetch SeatsIO chart.js and extract chartToken and commitHash
@@ -994,8 +1048,14 @@ class WebookBot:
             event_keys = [self.shared_data['event_key']]
         
         # Use provided channel_keys or default
+        # Use provided channel_keys or build dynamically based on selected team
         if not channel_keys:
-            channel_keys = ["NO_CHANNEL", *self.shared_data['channelKeyCommon'], *self.shared_data['channelKey'].get(self.shared_data['home_team']['_id'])]
+            if hasattr(self, 'gui_ref') and hasattr(self.gui_ref, 'build_channel_keys'):
+                channel_keys = self.gui_ref.build_channel_keys()
+            else:
+                # Fallback to home team if GUI reference not available
+                channel_keys = ["NO_CHANNEL", *self.shared_data['channelKeyCommon'], *self.shared_data['channelKey'].get(self.shared_data['home_team']['_id'])]
+        
         
         # Generate a unique hold token (UUID v4)
         hold_token = self.webook_hold_token
@@ -1294,134 +1354,138 @@ class WebookBot:
         return "unknown-event-id"
 
 
+import collections
+import copy
+
 class SeatScanner:
     """WebSocket-based seat scanning system for real-time seat monitoring"""
     
-    def __init__(self, workspace_key="3d443a0c-83b8-4a11-8c57-3db9d116ef76", event_key=None,seasonStructure = None):
+    def __init__(self, workspace_key="3d443a0c-83b8-4a11-8c57-3db9d116ef76", event_key=None, seasonStructure=None):
         self.workspace_key = workspace_key
         self.event_key = event_key
         self.ws = None
         self.is_connected = False
         self.is_running = False
         self.ui_queue = None
+        self.log_callback = None
+        self.users = []
+
         # Seat tracking
         self.global_reserved_seats = {}  # holdTokenHash -> list of seats
-        self.users_by_type = {}  # type -> list of users
-        self.log_callback = None
-        self.current_user_index = 0
-        self.users = []
+        
+        # --- OPTIMIZATION 1: High-speed user queue using deque ---
+        # This gives us instant access to the next available user without a slow loop.
+        self.ready_user_queue = collections.deque()
+        self.ready_user_lock = threading.Lock() # Protect the queue
         
         # Channels
         self.workspace_channel = workspace_key
         self.event_channel = f"{workspace_key}-{event_key}" if event_key else None
         self.event_channel2 = f"{workspace_key}-{seasonStructure}" if seasonStructure else None
-    def _get_next_user(self):
-        if not self.users_by_type:
-            return None
-        
-        all_users = []
-        for users in self.users_by_type.values():
-            all_users.extend(users)
-        
-        if not all_users:
-            return None
-            
-        selected_user = all_users[self.current_user_index % len(all_users)]
-        self.current_user_index += 1
-        return selected_user
+
+    # --- DEPRECATED: Replaced by the high-speed deque ---
+    # def _get_next_user(self): ...
+    # def _get_next_available_user(self): ...
+
     def _get_selected_sections(self):
         """Get currently selected sections from GUI"""
         if not hasattr(self, 'gui_ref'):
-            return []  # No GUI reference, allow all
+            return []
         
-        selected_sections = []
-        if hasattr(self.gui_ref, 'shared_event_data') and self.gui_ref.shared_event_data.get('channels'):
-            for channel in self.gui_ref.shared_event_data['channels']:
-                if isinstance(channel, str) and '-' in channel:
-                    prefix = channel.split('-')[0]
-                    if hasattr(self.gui_ref, f"{prefix}_var") and getattr(self.gui_ref, f"{prefix}_var").get():
-                        selected_sections.append(prefix)
-        
-        return selected_sections
+        return [
+            channel.split('-')[0]
+            for channel in getattr(self.gui_ref, 'shared_event_data', {}).get('channels', [])
+            if isinstance(channel, str) and '-' in channel
+            and hasattr(self.gui_ref, f"{channel.split('-')[0]}_var")
+            and getattr(self.gui_ref, f"{channel.split('-')[0]}_var").get()
+        ]
 
     def _is_seat_in_selected_sections(self, seat_id):
         """Check if seat matches selected sections"""
         selected_sections = self._get_selected_sections()
-        
         if not selected_sections:
-            return True  # No sections selected = allow all
-        
-        # Check if seat starts with any selected section prefix
+            return False
         return any(seat_id.startswith(prefix) for prefix in selected_sections)
-    def _get_next_available_user(self):
-        """Get next user who can actually take seats"""
-        if not self.users_by_type:
-            return None
-        
-        all_users = []
-        for users in self.users_by_type.values():
-            all_users.extend(users)
-        
-        if not all_users:
-            return None
-        
-        # Try up to len(all_users) times to find available user
-        attempts = 0
-        while attempts < len(all_users):
-            selected_user = all_users[self.current_user_index % len(all_users)]
-            self.current_user_index += 1
-            attempts += 1
-            
-            # Check if user can take more seats
-            user_type = selected_user.get('type', '*')
-            if user_type == '+':
-                current_seats = selected_user.get('seats_booked', 0)
-                max_seats = getattr(self, 'dseats_limit', 1)
-                if current_seats >= max_seats:
-                    continue  # Skip this user, try next
-            
-            # Check if user has valid bot
-            bot = selected_user.get('bot_instance')
-            if bot and hasattr(bot, 'webook_hold_token') and bot.webook_hold_token:
-                return selected_user
-                
-        return None  # No available users found
+
     def set_ui_queue(self, ui_queue):
-        """Set UI queue for updating GUI"""
         self.ui_queue = ui_queue
+
     def set_event_key(self, event_key, seasonStructure):
-        """Set the event key and update event channel"""
         self.event_key = event_key
         self.event_channel = f"{self.workspace_key}-{event_key}"
         self.event_channel2 = f"{self.workspace_key}-{seasonStructure}"
         self.log(f"Event channel updated: {self.event_channel}")
     
+    # --- OPTIMIZATION 2: Pre-build requests when users are set ---
     def set_users(self, users):
-        """Set users and group them by type"""
-        self.users = users  # Store the original users list
-        self.users_by_type = {}
-        for user in users:
-            user_type = user.get('type', '*')
-            if user_type not in self.users_by_type:
-                self.users_by_type[user_type] = []
-            self.users_by_type[user_type].append(user)
+        self.users = users
+        self.log(f"Preparing {len(users)} users for high-speed scanning...")
         
-        # Log how many users of each type are available for scanning
-        for user_type, type_users in self.users_by_type.items():
-            self.log(f"📊 Type '{user_type}': {len(type_users)} users ready for scanning")
-    
+        with self.ready_user_lock:
+            self.ready_user_queue.clear()
+            for user in users:
+                user_type = user.get('type', '*')
+                bot = user.get('bot_instance')
+                if (user_type == '*' or user_type == '+') and bot and bot.webook_hold_token:
+                    try:
+                        # Pre-build the entire request object for this user
+                        prepared_request = self._prepare_booking_request(bot)
+                        user['prepared_request'] = prepared_request
+                        self.ready_user_queue.append(user)
+                    except Exception as e:
+                        self.log(f"Could not prepare user {user['email']}: {e}")
+
+        self.log(f"🚀 {len(self.ready_user_queue)} users are armed and ready in the high-speed queue.")
+
+    def _prepare_booking_request(self, bot):
+        """Pre-builds the entire HTTP request for maximum speed."""
+        if not bot.shared_data.get('chartToken') or not bot.shared_data.get('event_key'):
+            raise ValueError("Bot is missing chartToken or event_key for preparation.")
+            
+        if not bot.browser_id:
+            bot.generate_browser_id()
+
+        channel_keys = bot.gui_ref.build_channel_keys()
+        
+        # This is the template for the request body. The seat ID is a placeholder.
+        request_body_template = {
+            "events": [bot.shared_data['event_key']],
+            "holdToken": bot.webook_hold_token,
+            "objects": [{"objectId": "{SEAT_ID}"}], # Placeholder
+            "channelKeys": channel_keys,
+            "validateEventsLinkedToSameChart": True
+        }
+        
+        # Headers are constant, so we build them once.
+        headers = {
+            'accept': '*/*',
+            'content-type': 'application/json',
+            'origin': 'https://cdn-eu.seatsio.net',
+            'x-browser-id': bot.browser_id,
+            'x-client-tool': 'Renderer',
+            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+            'referer': f"https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={bot.shared_data['commitHash']}"
+        }
+        
+        return {
+            'url': f"https://cdn-eu.seatsio.net/system/public/{self.workspace_key}/events/groups/actions/hold-objects",
+            'headers': headers,
+            'body_template': request_body_template,
+            'http_session': bot.session,
+            'chart_token': bot.shared_data['chartToken']
+        }
+
     def set_log_callback(self, callback):
-        """Set logging callback function"""
         self.log_callback = callback
     
     def log(self, message):
-        """Log message with timestamp"""
-        timestamp = datetime.now().strftime('%H:%M:%S')
+        timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3] # Add milliseconds
         log_msg = f"[{timestamp}] [SCANNER] {message}"
         if self.log_callback:
             self.log_callback(log_msg)
         print(log_msg)
     
+    # ... (start_scanning, stop_scanning, _run_websocket, etc. remain the same) ...
     def start_scanning(self):
         """Start the WebSocket scanning system"""
         if self.is_running:
@@ -1486,12 +1550,13 @@ class SeatScanner:
             on_error=self._on_error,
             on_close=self._on_close
         )
-        
+        sockopts = [(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)]
         # Set ping/pong to detect dead connections
         self.ws.run_forever(
             ping_interval=30,    # Send ping every 30 seconds
             ping_timeout=10,     # Wait 10 seconds for pong
-            ping_payload="keepalive"
+            ping_payload="keepalive",
+            sockopt=sockopts
         )
     
     def _on_open(self, ws):
@@ -1534,9 +1599,7 @@ class SeatScanner:
         """Handle incoming WebSocket messages"""
         try:
             data = json.loads(message)
-            #print(data)
             
-            # Handle array of messages
             if isinstance(data, list):
                 for msg in data:
                     self._process_message(msg)
@@ -1557,174 +1620,130 @@ class SeatScanner:
         channel = message.get('channel')
         body = message.get('body', {})
         
-        # Handle workspace channel messages (hold token expiration)
         if channel == self.workspace_channel:
             self._handle_workspace_message(body)
         
-        # Handle event channel messages (seat status changes)
         elif channel == self.event_channel:
             self._handle_event_message(body)
     
     def _handle_workspace_message(self, body):
-        """Handle workspace channel messages (hold token expiration)"""
         message_type = body.get('messageType')
-        
         if message_type == 'HOLD_TOKEN_EXPIRED':
             hold_token = body.get('holdToken')
             if hold_token:
                 self._handle_hold_token_expired(hold_token)
     
     def _handle_event_message(self, body):
-        """Handle event channel messages (seat status changes)"""
         status = body.get('status')
         seat_id = body.get('objectLabelOrUuid')
         hold_token_hash = body.get('holdTokenHash')
         
         if not seat_id:
             return
-        #if seat_id
+
         if status == 'free':
             self._handle_seat_free(seat_id)
         elif status == 'reservedByToken' and hold_token_hash:
             self._handle_seat_reserved(seat_id, hold_token_hash)
     
+    # --- OPTIMIZATION 3: Make the critical path "dumb and fast" ---
     def _handle_seat_free(self, seat_id):
+        # This first check is quick
         if not self._is_seat_in_selected_sections(seat_id):
-            return  # Skip seats not in selected sections
-        
-        selected_user = self._get_next_available_user()
-        if selected_user:
-            self._book_seat_for_user(selected_user, selected_user['bot_instance'], seat_id, "free_seat")
-    
+            return
+
+        with self.ready_user_lock:
+            if not self.ready_user_queue:
+                # self.log("Seat free, but no users ready.") # Can be noisy
+                return
+            # INSTANTLY get the next user
+            user = self.ready_user_queue.popleft()
+
+        # Fire the booking in a new thread to avoid blocking the WebSocket loop
+        threading.Thread(target=self._fire_prepared_request, args=(user, seat_id)).start()
+
     def _handle_seat_reserved(self, seat_id, hold_token_hash):
-        """Handle when a seat is reserved - track the reservation"""
-        #self.log(f"🟡 SEAT RESERVED: {seat_id} (token: {hold_token_hash[:12]}...)")
         if hold_token_hash not in self.global_reserved_seats:
             self.global_reserved_seats[hold_token_hash] = {'seats': [], 'user_email': None}
         self.global_reserved_seats[hold_token_hash]['seats'].append(seat_id)
-        #self.log(f"📝 Tracked seat {seat_id} for token {hold_token_hash[:12]}...")
     
     def _handle_hold_token_expired(self, hold_token):
-        """Handle hold token expiration - only take seats in selected sections"""
         hold_token_hash = hashlib.sha1(hold_token.encode()).hexdigest()
         
         if hold_token_hash in self.global_reserved_seats:
             expired_seats = self.global_reserved_seats[hold_token_hash]['seats']
-            selected_user = self._get_next_user()
+            filtered_seats = [seat for seat in expired_seats if self._is_seat_in_selected_sections(seat)]
             
-            if selected_user:
-                # Filter expired seats to only include selected sections
-                filtered_seats = [seat for seat in expired_seats 
-                                if self._is_seat_in_selected_sections(seat)]
-                
-                for seat_id in filtered_seats:
-                    self._book_seat_for_user(selected_user, selected_user['bot_instance'], seat_id, "expired_token")
+            for seat_id in filtered_seats:
+                # Reuse the same fast logic
+                self._handle_seat_free(seat_id)
             
-            # Remove from tracking map
             del self.global_reserved_seats[hold_token_hash]
-    
-    def _attempt_seat_booking(self, users, seat_id, trigger_type):
-        """Attempt to book a seat with multiple users"""
-        #self.log(f"🚀 BOOKING ATTEMPT: {seat_id} with {len(users)} users (trigger: {trigger_type})")
-        
-        # Use ThreadPoolExecutor for concurrent booking attempts
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(users)) as executor:
-            futures = []
-            
-            for user in users:
-                bot = user.get('bot_instance')
-                if bot and hasattr(bot, 'takeSeat'):
-                    future = executor.submit(self._book_seat_for_user, user, bot, seat_id, trigger_type)
-                    futures.append(future)
-            
-            # Process results
-            for future in concurrent.futures.as_completed(futures, timeout=10):
-                try:
-                    future.result()
-                except Exception as e:
-                    self.log(f"Booking error: {str(e)}")
-    
-    def _book_seat_for_user(self, user, bot, seat_id, trigger_type):
-        """Book seat for a specific user"""
+
+    def _fire_prepared_request(self, user, seat_id):
+        """The new, ultra-fast booking function."""
         email = user.get('email', 'unknown')
-        user_type = user.get('type', '*')
-        print(f'user_type, {user_type}')
-        if not bot:
-            print(f"[{email}] ERROR: No bot instance!")
-            return False
-        if not hasattr(bot, 'webook_hold_token') or not bot.webook_hold_token:
-            self.log(f"[{email}] ERROR: No hold token!")
-            return False
-    
-        # Check if login was successful
-        if not bot.token_manager.get_valid_token(bot.email):
-            self.log(f"[{email}] ERROR: No valid login token!")
-            return False
-        def user_log(msg):
-            timestamp = datetime.now().strftime('%H:%M:%S')
-            log_entry = f"[{timestamp}] [SCANNER-{trigger_type.upper()}] {msg}"
-            if 'logs' in user:
-                user['logs'].append(log_entry)
-            #self.log(f"[{email}] {msg}")
-        
+        prepared_request = user.get('prepared_request')
+
+        if not prepared_request:
+            self.log(f"[{email}] ERROR: No prepared request found!")
+            return
+
         try:
-            if user_type == '+':
-                current_seats = user.get('seats_booked', 0)
-                # Get DSeats limit (you'll need to pass this to scanner)
-                max_seats = getattr(self, 'dseats_limit', 1)  # Default to 1
-                if current_seats >= max_seats:
-                    self.log(f"[{email}] Seat limit reached ({current_seats}/{max_seats})")
-                    return False
-            #user_log(f"→ Attempting to book {seat_id}")
+            # 1. Copy the body template to inject the seat ID
+            final_body = copy.deepcopy(prepared_request['body_template'])
+            final_body['objects'][0]['objectId'] = seat_id
+            body_str = json.dumps(final_body, separators=(',', ':'))
+
+            # 2. Generate the signature (this is the only slow part left, but it's very fast)
+            reversed_token = prepared_request['chart_token'][::-1]
+            signature = hashlib.sha256((reversed_token + body_str).encode('utf-8')).hexdigest()
             
-            result = bot.takeSeat(seat_id, log_callback=user_log)
-            
-            if result and result.get('success'):
-                #user_log(f"✅ SUCCESS: Booked {seat_id}")
-                
-                # Update user's seat count
+            # 3. Create final headers with the new signature
+            final_headers = prepared_request['headers'].copy()
+            final_headers['x-signature'] = signature
+
+            # 4. FIRE!
+            response = prepared_request['http_session'].post(
+                prepared_request['url'],
+                headers=final_headers,
+                data=body_str,
+                timeout=2 # Use a short timeout
+            )
+
+            if response.status_code in [200, 204]:
+                self.log(f"✅ SUCCESS [{email}] booked {seat_id} [Status: {response.status_code}]")
                 user['seats_booked'] = user.get('seats_booked', 0) + 1
-                if 'assigned_seats' not in user:
-                    user['assigned_seats'] = []
+                if 'assigned_seats' not in user: user['assigned_seats'] = []
                 user['assigned_seats'].append(seat_id)
-                if self.ui_queue:
-                    # Find user index in the MAIN users list, not the type-specific list
-                    for i, u in enumerate(self.users):  # <-- Use self.users, not users_by_type
-                        if u['email'] == user['email']:
-                            self.ui_queue.put(('update_user', i, 'seats_booked', user['seats_booked']))
-                            break
-                return True
-            else:
-                #user_log(f"❌ FAILED: Could not book {seat_id}")
-                return False
                 
+                # Find original user index to update GUI
+                for i, u in enumerate(self.users):
+                    if u['email'] == email:
+                        self.ui_queue.put(('update_user', i, 'seats_booked', user['seats_booked']))
+                        break
+            else:
+                # self.log(f"❌ FAILED [{email}] for {seat_id} [Status: {response.status_code}]") # Can be noisy
+                pass
+
         except Exception as e:
-            #user_log(f"💥 ERROR: {str(e)}")
-            return False
-    
+            # self.log(f"💥 ERROR [{email}] booking {seat_id}: {e}") # Can be noisy
+            pass
+        finally:
+            # IMPORTANT: Add the user back to the queue so they can be used again.
+            with self.ready_user_lock:
+                self.ready_user_queue.append(user)
+
     def _on_close(self, ws, close_status_code, close_msg):
         """Handle WebSocket connection closed"""
         self.log(f"WebSocket closed: {close_status_code} - {close_msg}")
         self.is_connected = False
-        # Don't log as error - this is expected for reconnection
 
     def _on_error(self, ws, error):
         """Handle WebSocket errors"""
-        # Only log real errors, not connection issues during reconnect
         if "Connection is already closed" not in str(error):
             self.log(f"WebSocket error: {str(error)}")
         self.is_connected = False
-    
-    def get_status(self):
-        """Get current scanner status"""
-        return {
-            'is_running': self.is_running,
-            'is_connected': self.is_connected,
-            'tracked_tokens': len(self.reserved_seats_map),
-            'tracked_seats': sum(len(seats) for seats in self.reserved_seats_map.values())
-        }
-
-
 class BotGUI:
     """Main GUI application"""
     
@@ -1772,7 +1791,38 @@ class BotGUI:
         
         self._create_widgets()
         self._start_ui_updater()
-    
+    def get_selected_team_id(self):
+        """Get the currently selected team ID from GUI"""
+        if hasattr(self, 'team_var'):
+            selection = self.team_var.get()
+            if selection.startswith('home'):
+                return self.shared_event_data.get('home_team', {}).get('_id')
+            elif selection.startswith('away'):
+                return self.shared_event_data.get('away_team', {}).get('_id')
+        
+        # Default to home team
+        return self.shared_event_data.get('home_team', {}).get('_id')
+
+    def build_channel_keys(self, team_id=None):
+        """Build channel keys array for the selected team"""
+        if not team_id:
+            team_id = self.get_selected_team_id()
+        
+        channel_keys = ["NO_CHANNEL"]
+        
+        # Add common channels
+        if self.shared_event_data.get('channelKeyCommon'):
+            channel_keys.extend(self.shared_event_data['channelKeyCommon'])
+        
+        # Add team-specific channels
+        if self.shared_event_data.get('channelKey') and team_id:
+            team_channels = self.shared_event_data['channelKey'].get(team_id, [])
+            if isinstance(team_channels, list):
+                channel_keys.extend(team_channels)
+            elif isinstance(team_channels, str):
+                channel_keys.append(team_channels)
+        
+        return channel_keys
     def _create_widgets(self):
         """Create GUI widgets"""
         # Top frame for controls
@@ -1812,6 +1862,16 @@ class BotGUI:
 
         self.send_seat_btn = ttk.Button(top_frame, text="Send Seat", command=self.open_send_seat_dialog)
         self.send_seat_btn.grid(row=0, column=11, padx=5)
+
+        team_frame = ttk.Frame(self.root)
+        team_frame.pack(fill='x', padx=10, pady=5)
+
+        ttk.Label(team_frame, text="Favorite Team:").pack(side='left', padx=(0,10))
+        self.team_var = tk.StringVar(value="home")
+        self.team_combo = ttk.Combobox(team_frame, textvariable=self.team_var, width=20, state='readonly')
+        self.team_combo['values'] = ["home", "away"]
+        self.team_combo.bind('<<ComboboxSelected>>', self.on_team_selection_changed)
+        self.team_combo.pack(side='left', padx=5)
         # Create scrollable checkbox container
         checkbox_container = ttk.Frame(self.root)
         checkbox_container.pack(fill='x', padx=12, pady=5)
@@ -1895,8 +1955,42 @@ class BotGUI:
         
         ttk.Button(button_frame, text="Transfer", command=transfer_seat).pack(side='left', padx=5)
         ttk.Button(button_frame, text="Cancel", command=dialog.destroy).pack(side='left', padx=5)
+
+    def _atomic_transfer_seat(self, from_bot, to_bot, seat_id, prepared_request, log_from, log_to):
+        """Atomic release + immediate take with zero delay"""
+        
+        # STEP 1: Release seat
+        log_from(f"Releasing {seat_id}...")
+        release_result = from_bot.releaseSeat(seat_id, from_bot.webook_hold_token, log_callback=log_from)
+        
+        if not release_result.get('success'):
+            return False, "RELEASE_FAILED", f"Release failed: {release_result.get('error', 'Unknown error')}"
+        
+        # STEP 2: IMMEDIATELY fire pre-built take request
+        try:
+            # Use the correct key name
+            http_session = prepared_request['http_session']
+            
+            response = http_session.post(
+                prepared_request['url'],
+                headers=prepared_request['headers'],
+                data=prepared_request['data'],
+                timeout=3
+            )
+            
+            if response.status_code in [200, 204]:
+                log_to(f"ATOMIC SUCCESS: {seat_id}")
+                return True, "SUCCESS", None
+            else:
+                return False, "TAKE_FAILED", f"Take failed: HTTP {response.status_code}"
+                
+        except KeyError as e:
+            return False, "TAKE_FAILED", f"Prepared request missing key: {str(e)}"
+        except Exception as e:
+            return False, "TAKE_FAILED", f"Take request failed: {str(e)}"
+
     def _transfer_seat(self, from_idx, to_idx):
-        """Transfer seat(s) from one user to another based on Dseats_var"""
+        """Ultra-fast atomic transfer with pre-built requests"""
         from_user = self.users[from_idx]
         to_user = self.users[to_idx]
         
@@ -1906,26 +2000,15 @@ class BotGUI:
         if not from_bot or not to_bot:
             return
         
-        # Get number of seats to transfer from Dseats_var
-        try:
-            dseats_var = getattr(self, 'Dseats_var', None)
-            print(f'dseats_var {dseats_var}')
-            if dseats_var and hasattr(dseats_var, 'get'):
-                # It's a StringVar or similar, get its value
-                seats_to_transfer_count = int(dseats_var.get())
-            else:
-                # It's already a value or doesn't exist
-                seats_to_transfer_count = int(dseats_var) if dseats_var else 1
-        except (ValueError, AttributeError):
-            # If conversion fails, default to 1
-            seats_to_transfer_count = 1
-        if to_user.get('type') == '+':
-            current_seats = to_user.get('seats_booked', 0)
-            if current_seats + seats_to_transfer_count > int(self.Dseats_var.get()):
-                messagebox.showwarning("Limit Exceeded", 
-                    f"User {to_user['email']} can only have {self.Dseats_var.get()} seats total")
-                return
-        print(f'seats_to_transfer_count {seats_to_transfer_count}')
+        # Calculate remaining seats needed
+        max_seats = int(self.Dseats_var.get())
+        current_seats = to_user.get('seats_booked', 0)
+        remaining_needed = max_seats - current_seats
+        
+        if remaining_needed <= 0:
+            messagebox.showinfo("Transfer Complete", f"User {to_user['email']} already has {max_seats} seats")
+            return
+        
         def log_from(msg):
             timestamp = datetime.now().strftime('%H:%M:%S')
             from_user['logs'].append(f"[{timestamp}] {msg}")
@@ -1934,86 +2017,131 @@ class BotGUI:
             timestamp = datetime.now().strftime('%H:%M:%S')
             to_user['logs'].append(f"[{timestamp}] {msg}")
         
-        # Update initial statuses
-        self.ui_queue.put(('update_user', from_idx, 'status', f'Releasing {seats_to_transfer_count} seat(s)...'))
-        self.ui_queue.put(('update_user', to_idx, 'status', f'Waiting for {seats_to_transfer_count} seat(s)...'))
+        # Get seats to transfer (limit to remaining needed)
+        seats_to_transfer = from_user.get('assigned_seats', [])[:remaining_needed]
         
-        transferred_seats = []
-        failed_transfers = []
-
-        original_from_seats = from_user['seats_booked']
-        original_from_assigned = from_user['assigned_seats'].copy()
+        if not seats_to_transfer:
+            log_from("No seats available to transfer")
+            return
         
-        try:
-            # Transfer each seat
-            for i in range(seats_to_transfer_count):
-                if not from_user.get('assigned_seats'):
-                    break
-                    
-                seat_to_transfer = from_user['assigned_seats'][0]  # Always take the first available seat
-                
-                log_from(f"📤 Releasing seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count}) for transfer...")
-                
-                # Step 1: Release seat from sender
-                release_result = from_bot.releaseSeat(
-                    seat_to_transfer,
-                    from_bot.webook_hold_token,
-                    log_callback=log_from
-                )
-                
-                if release_result.get('success'):
-                            # Temporarily remove from sender
-                    from_user['assigned_seats'].remove(seat_to_transfer)
-                            
-                            # Step 2: Try to take with receiver
-                    take_result = to_bot.takeSeat(
-                                seat_to_transfer,
-                                log_callback=log_to
-                            )
-                            
-                    if take_result.get('success'):
-                                # Success - update both users
-                        transferred_seats.append(seat_to_transfer)
-                        to_user['seats_booked'] = to_user.get('seats_booked', 0) + 1
-                        if 'assigned_seats' not in to_user:
-                            to_user['assigned_seats'] = []
-                            to_user['assigned_seats'].append(seat_to_transfer)
-                        else:
-                                # Failed to take - add back to sender
-                            log_to(f"✗ Failed to take seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count})")
-                            from_user['assigned_seats'].insert(0, seat_to_transfer)
-                            failed_transfers.append(seat_to_transfer)
-                else:
-                    log_from(f"✗ Failed to release seat {seat_to_transfer} ({i+1}/{seats_to_transfer_count})")
-                    failed_transfers.append(seat_to_transfer)
-                    break
-                from_user['seats_booked'] = original_from_seats - len(transferred_seats)
-    
-            # Update UI with correct counts
+        log_from(f"Starting ULTRA-FAST transfer of {len(seats_to_transfer)} seats")
+        log_to(f"Pre-building {len(seats_to_transfer)} take requests...")
+        
+        # PHASE 1: PRE-BUILD ALL TAKE REQUESTS (like Go code)
+        prepared_requests = {}
+        for seat_id in seats_to_transfer:
+            try:
+                prepared_request = self._prepare_take_seat_request(to_bot, seat_id)
+                prepared_requests[seat_id] = prepared_request
+            except Exception as e:
+                log_to(f"Failed to prepare request for {seat_id}: {str(e)}")
+        
+        log_to(f"Pre-built {len(prepared_requests)} requests, starting atomic transfers...")
+        
+        # PHASE 2: ATOMIC TRANSFERS (zero delay between release and take)
+        successful_transfers = 0
+        
+        for seat_id in seats_to_transfer:
+            if seat_id not in prepared_requests:
+                continue
+            
+            prepared_request = prepared_requests[seat_id]
+            
+            # Update UI immediately - remove from sender
+            from_user['seats_booked'] -= 1
+            from_user['assigned_seats'].remove(seat_id)
             self.ui_queue.put(('update_user', from_idx, 'seats_booked', from_user['seats_booked']))
-            self.ui_queue.put(('update_user', to_idx, 'seats_booked', to_user['seats_booked']))
-            # Update final statuses
-            '''if len(transferred_seats) == seats_to_transfer_count:
-                self.ui_queue.put(('update_user', from_idx, 'status', f'Transfer complete ({len(transferred_seats)} seats)'))
-                self.ui_queue.put(('update_user', to_idx, 'status', f'Transfer complete ({len(transferred_seats)} seats)'))
-                log_from(f"✓ Successfully transferred {len(transferred_seats)} seat(s)")
-                log_to(f"✓ Successfully received {len(transferred_seats)} seat(s)")
-            elif len(transferred_seats) > 0:
-                self.ui_queue.put(('update_user', from_idx, 'status', f'Partial transfer ({len(transferred_seats)}/{seats_to_transfer_count})'))
-                self.ui_queue.put(('update_user', to_idx, 'status', f'Partial transfer ({len(transferred_seats)}/{seats_to_transfer_count})'))
-                log_from(f"⚠ Partial transfer: {len(transferred_seats)}/{seats_to_transfer_count} seats")
-                log_to(f"⚠ Partial transfer: {len(transferred_seats)}/{seats_to_transfer_count} seats")
-            else:
-                self.ui_queue.put(('update_user', from_idx, 'status', 'Transfer failed'))
-                self.ui_queue.put(('update_user', to_idx, 'status', 'Transfer failed'))
-                log_from(f"✗ Transfer failed: 0/{seats_to_transfer_count} seats transferred")
-                log_to(f"✗ Transfer failed: 0/{seats_to_transfer_count} seats received")'''
+            
+            # ATOMIC TRANSFER
+            success, error_type, error_msg = self._atomic_transfer_seat(
+                from_bot, to_bot, seat_id, prepared_request, log_from, log_to
+            )
+            
+            if success:
+                # SUCCESS: Update receiving user
+                to_user['seats_booked'] += 1
+                if 'assigned_seats' not in to_user:
+                    to_user['assigned_seats'] = []
+                to_user['assigned_seats'].append(seat_id)
                 
-        except Exception as e:
-            log_from(f"✗ Transfer error: {str(e)}")
-            log_to(f"✗ Transfer error: {str(e)}")
-            self.ui_queue.put(('update_user', from_idx, 'status', 'Transfer error'))
-            self.ui_queue.put(('update_user', to_idx, 'status', 'Transfer error'))
+                self.ui_queue.put(('update_user', to_idx, 'seats_booked', to_user['seats_booked']))
+                successful_transfers += 1
+                
+            else:
+                # FAILURE: Handle based on error type
+                log_from(f"TRANSFER FAILED: {seat_id} - {error_msg}")
+                
+                # Always revert UI first
+                from_user['seats_booked'] += 1
+                from_user['assigned_seats'].insert(0, seat_id)
+                self.ui_queue.put(('update_user', from_idx, 'seats_booked', from_user['seats_booked']))
+                
+                # Only restore if RELEASE failed, not if TAKE failed
+                if error_type == "RELEASE_FAILED":
+                    # Release failed - seat still belongs to user 1, no restore needed
+                    log_from(f"Release failed for {seat_id}, seat still held")
+                elif error_type == "TAKE_FAILED":
+                    # Take failed - seat is now FREE, let scanner handle it
+                    log_from(f"Take failed for {seat_id}, seat is now free")
+                    # DON'T restore - let the seat be free for scanner or manual booking
+                
+                # STOP on any failure
+                break
+        # Final status
+        final_seats = to_user.get('seats_booked', 0)
+        remaining = max_seats - final_seats
+        
+        log_from(f"ULTRA-FAST transfer result: {successful_transfers} seats transferred")
+        
+        if remaining == 0:
+            self.ui_queue.put(('update_user', to_idx, 'status', f'Complete: {max_seats}/{max_seats} seats'))
+        elif successful_transfers > 0:
+            self.ui_queue.put(('update_user', to_idx, 'status', f'Progress: {final_seats}/{max_seats} seats'))
+        else:
+            self.ui_queue.put(('update_user', to_idx, 'status', f'Failed: {final_seats}/{max_seats} seats'))
+    
+    def _prepare_take_seat_request(self, bot, seat_id):
+        """Pre-build complete takeSeat request - everything ready to fire"""
+        
+        # Validate bot session exists
+        if not hasattr(bot, 'session') or bot.session is None:
+            raise ValueError("Bot session not initialized")
+        
+        # Build channel keys dynamically
+        channel_keys = self.build_channel_keys()
+        
+        # Build request body
+        request_body = {
+            "events": [bot.shared_data['event_key']],
+            "holdToken": bot.webook_hold_token,
+            "objects": [{"objectId": seat_id}],
+            "channelKeys": channel_keys,  # Use dynamic channel keys
+            "validateEventsLinkedToSameChart": True
+        }
+        
+        request_body_str = json.dumps(request_body, separators=(',', ':'))
+        signature = bot.generate_signature(request_body_str)
+        
+        # Pre-build complete headers
+        headers = {
+            'accept': '*/*',
+            'content-type': 'application/json',
+            'origin': 'https://cdn-eu.seatsio.net',
+            'x-browser-id': bot.browser_id,
+            'x-client-tool': 'Renderer',
+            'x-signature': signature,
+            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={bot.shared_data["commitHash"]}'
+        }
+        
+        return {
+            'url': f"https://cdn-eu.seatsio.net/system/public/3d443a0c-83b8-4a11-8c57-3db9d116ef76/events/groups/actions/hold-objects",
+            'headers': headers,
+            'data': request_body_str,
+            'http_session': bot.session,
+            'seat_id': seat_id
+        }
+
+    
     def start_countdown_timer(self):
         """Countdown timer for expire times"""
         def update_countdowns():
@@ -2102,7 +2230,7 @@ class BotGUI:
         table_frame.pack(fill='both', expand=True, padx=10, pady=10)
         
         # Treeview for users
-        columns = ('Email', 'Type', 'Proxy', 'Status', 'Expire Time', 'Seats Booked', 'Last Update')
+        columns = ('Email', 'Type', 'Proxy', 'Status', 'Expire Time', 'Seats Booked', 'Last Update', 'Pay')
         self.tree = ttk.Treeview(table_frame, columns=columns, show='headings', selectmode='browse')
         
         # Configure columns
@@ -2118,6 +2246,8 @@ class BotGUI:
                 self.tree.column(col, width=100, anchor='center')
             elif col in ['Seats Booked', 'Type']:
                 self.tree.column(col, width=100, anchor='center')
+            elif col == 'Pay':
+                self.tree.column(col, width=80, anchor='center')
             else:
                 self.tree.column(col, width=150)
         
@@ -2138,6 +2268,8 @@ class BotGUI:
         
         # Double-click to view logs
         self.tree.bind('<Double-1>', self.show_user_logs)
+        self.tree.bind('<Button-1>', self.handle_table_click)
+
     
     def load_users(self):
         """Load users from CSV file"""
@@ -2238,7 +2370,8 @@ class BotGUI:
                 user['status'],
                 str(user.get('expireTime', 0)),
                 str(user['seats_booked']),
-                user['last_update']
+                user['last_update'],
+                'Pay'
             )
             self.tree.insert('', 'end', iid=str(i), values=values)
     
@@ -2250,9 +2383,9 @@ class BotGUI:
         
         if not PLAYWRIGHT_AVAILABLE:
             messagebox.showerror("Missing Dependency", 
-                               "Playwright is not installed.\n\nInstall with:\n"
-                               "pip install playwright\n"
-                               "python -m playwright install chromium")
+                            "Playwright is not installed.\n\nInstall with:\n"
+                            "pip install playwright\n"
+                            "python -m playwright install chromium")
             return
         
         event_url = self.event_url_var.get().strip()
@@ -2269,6 +2402,20 @@ class BotGUI:
             messagebox.showerror("Invalid Seats", "Please enter a valid number of seats")
             return
         
+        # Get selected team ID before starting
+        selected_team_selection = self.team_var.get()
+        if selected_team_selection.startswith('home'):
+            self.selected_team_type = 'home'
+        elif selected_team_selection.startswith('away'):
+            self.selected_team_type = 'away'
+        else:
+            self.selected_team_type = 'home'  # Default
+        
+        # Store the team selection for use in worker threads
+        self.team_selection_for_startup = self.selected_team_type
+        
+        self.status_var.set(f"Starting bot with {self.selected_team_type} team preference...")
+        
         # Update UI state
         self.start_btn.config(state='disabled')
         self.stop_btn.config(state='normal')
@@ -2276,7 +2423,7 @@ class BotGUI:
         
         # Start worker threads
         self.workers = []
-        self.init_barrier = threading.Barrier(len(self.users))  # Add this line
+        self.init_barrier = threading.Barrier(len(self.users))
         for i, user in enumerate(self.users):
             worker = threading.Thread(
                 target=self._worker_thread,
@@ -2286,7 +2433,7 @@ class BotGUI:
             self.workers.append(worker)
             worker.start()
         
-        self.status_var.set(f"Bot started with {len(self.workers)} workers")
+        self.status_var.set(f"Bot started with {len(self.workers)} workers - {self.selected_team_type} team")
     
     def stop_bot(self):
         """Stop the bot operations"""
@@ -2311,7 +2458,7 @@ class BotGUI:
         
         try:
             # BROWSER OPERATIONS - ONE AT A TIME (only for login)
-            with self.browser_semaphore:  # Only one browser at a time for login
+            with self.browser_semaphore:
                 update_status("Waiting in queue...")
                 log("Waiting for browser availability...")
                 
@@ -2323,8 +2470,7 @@ class BotGUI:
                     shared_data=self.shared_event_data,
                     shared_data_lock=self.shared_data_lock
                 )
-                
-                # Store bot instance in user dict
+                bot.gui_ref = self
                 user['bot_instance'] = bot
                 
                 # Step 1: Login and get tokens
@@ -2332,24 +2478,19 @@ class BotGUI:
                 log(f"Starting login process for {user['email']}")
                 
                 try:
-                    token_data = bot.login_with_browser(
-                        event_url,
-                        log_callback=log
-                    )
-                    
+                    token_data = bot.login_with_browser(event_url, log_callback=log)
                     if not token_data:
                         raise Exception("Login failed - no tokens received")
                     
                     update_status("Login successful")
-                    log("✓ Login completed successfully")
+                    log("Login completed successfully")
                     
                 except Exception as e:
                     update_status("Login failed")
-                    log(f"✗ Login failed: {str(e)}")
+                    log(f"Login failed: {str(e)}")
                     return
             
             # AFTER LOGIN - ALL THREADS WORK IN PARALLEL
-            # No semaphore here - all threads can work simultaneously
             update_status("Initializing seat system...")
             if not self.shared_data_fetched.is_set():
                 try:
@@ -2361,65 +2502,216 @@ class BotGUI:
                     self.shared_data_fetched.set()
                     self.channels = self.shared_event_data['channels']
                     self.seasonStructure = self.shared_event_data['seasonStructure']
-                    log("✓ Fetched shared event data for all users")
-                    #print(self.channels)
+                    log("Fetched shared event data for all users")
                     
                     if not self.displayChannels and user_index == 0:
                         self._create_checkBox()
+                        # Update team combo with actual team names
+                        home_team_name = self.shared_event_data.get('home_team', {}).get('name', 'Home Team')
+                        away_team_name = self.shared_event_data.get('away_team', {}).get('name', 'Away Team')
+                        self.team_combo['values'] = [
+                            f"home - {home_team_name}",
+                            f"away - {away_team_name}"
+                        ]
+                        # Set to the pre-selected team
+                        if self.team_selection_for_startup == 'home':
+                            self.team_combo.set(f"home - {home_team_name}")
+                        else:
+                            self.team_combo.set(f"away - {away_team_name}")
                     
                     # Get hold token and expire time
                     bot.getWebookHoldToken(log_callback=log)
                     bot.getExpireTime(log_callback=log)
                     
-                    # Update expire time in user dict and UI
                     user['expireTime'] = bot.expireTime
                     self.ui_queue.put(('update_user', user_index, 'expireTime', bot.expireTime))
                     
-                    update_status("Ready for booking")
-                    log(f"✓ System ready, hold token expires in {bot.expireTime} seconds")
-                    # Enable fill seats button when first user is ready
                     if user_index == 0:
                         self.fill_seats_btn.config(state='normal')
-                    self.init_barrier.wait()
-                    update_status("All users ready - starting operations")
-                    log("All users initialized, starting synchronized operations")
-                    
-                    # Now you can add seat booking logic here
-                    # All threads will execute this part in parallel
-                    # Every user updates the scanner with their info
-                    # Start scanner once with all users
-                    if user_index == 0 and not self.scanner_started:
-                        try:
-                            self.seat_scanner.dseats_limit = dSeats_count
-                            self.seat_scanner.gui_ref = self  # Add GUI reference
-                            self.seat_scanner.set_event_key(
-                                self.shared_event_data['event_key'], 
-                                self.shared_event_data['seasonStructure']
-                            )
-                            self.seat_scanner.set_users(self.users)
-                            self.seat_scanner.start_scanning()
-                            self.scanner_started = True
-                            log("🔍 Started single shared scanner for all users")
-                        except Exception as e:
-                            log(f"Failed to start scanner: {str(e)}")
-
+                        
                 except Exception as e:
                     update_status("Initialization failed")
-                    log(f"✗ Failed to initialize: {str(e)}")
+                    log(f"Failed to initialize: {str(e)}")
+                    return
             else:
                 # Wait for shared data to be available
                 self.shared_data_fetched.wait(timeout=30)
-                log("✓ Using shared event data")
+                log("Using shared event data")
+            
+            # UPDATE PROFILE WITH PRE-SELECTED TEAM (for ALL users)
+            try:
+                update_status("Updating profile...")
+                log("Updating user profile with pre-selected team")
+                
+                # Determine team ID based on startup selection
+                if self.team_selection_for_startup == 'home':
+                    selected_team_id = self.shared_event_data.get('home_team', {}).get('_id')
+                else:
+                    selected_team_id = self.shared_event_data.get('away_team', {}).get('_id')
+                
+                success = bot.update_profile(selected_team_id, log_callback=log)
+                if success:
+                    log(f"Profile updated successfully for {self.team_selection_for_startup} team")
+                else:
+                    log("Profile update failed, continuing anyway...")
+            except Exception as e:
+                log(f"Profile update error: {str(e)}, continuing anyway...")
+            
+            # Wait for all users to complete initialization
+            self.init_barrier.wait()
+            update_status("All users ready - starting operations")
+            log("All users initialized, starting synchronized operations")
+            
+            # Start scanner once with all users
+            if user_index == 0 and not self.scanner_started:
+                try:
+                    self.seat_scanner.dseats_limit = dSeats_count
+                    self.seat_scanner.gui_ref = self
+                    self.seat_scanner.set_event_key(
+                        self.shared_event_data['event_key'], 
+                        self.shared_event_data['seasonStructure']
+                    )
+                    self.seat_scanner.set_users(self.users)
+                    self.seat_scanner.start_scanning()
+                    self.scanner_started = True
+                    log("Started single shared scanner for all users")
+                except Exception as e:
+                    log(f"Failed to start scanner: {str(e)}")
+            
+            update_status("Ready for booking")
+            log(f"System ready, hold token expires in {bot.expireTime} seconds")
 
         except Exception as e:
             update_status("Error")
-            log(f"✗ Worker error: {str(e)}")
+            log(f"Worker error: {str(e)}")
             traceback.print_exc()
         
         finally:
             if not self.stop_event.is_set():
                 update_status("Completed")
                 log("Worker thread completed")
+    
+    def on_team_selection_changed(self, event=None):
+        """Handle team selection change and update all user profiles"""
+        if not hasattr(self, 'users') or not self.users:
+            return
+        
+        selected_team_id = self.get_selected_team_id()
+        
+        # Update all users' profiles in background
+        def update_all_profiles():
+            for i, user in enumerate(self.users):
+                bot = user.get('bot_instance')
+                if bot:
+                    try:
+                        self.ui_queue.put(('update_user', i, 'status', 'Updating profile...'))
+                        success = bot.update_profile(selected_team_id)
+                        if success:
+                            timestamp = datetime.now().strftime('%H:%M:%S')
+                            user['logs'].append(f"[{timestamp}] [PROFILE] Team preference updated")
+                            self.ui_queue.put(('update_user', i, 'status', 'Profile updated'))
+                        else:
+                            self.ui_queue.put(('update_user', i, 'status', 'Profile update failed'))
+                    except Exception as e:
+                        timestamp = datetime.now().strftime('%H:%M:%S')
+                        user['logs'].append(f"[{timestamp}] [PROFILE] Update failed: {str(e)}")
+                        self.ui_queue.put(('update_user', i, 'status', 'Profile update error'))
+        
+        # Run in background thread
+        threading.Thread(target=update_all_profiles, daemon=True).start()
+    def handle_table_click(self, event):
+        """Handle clicks on the table"""
+        region = self.tree.identify("region", event.x, event.y)
+        if region == "cell":
+            column = self.tree.identify("column", event.x, event.y)
+            item = self.tree.identify("row", event.x, event.y)
+            
+            # Check if Pay column was clicked (column #8)
+            if column == '#8' and item:  # Pay column
+                user_index = int(item)
+                self.handle_payment(user_index)
+
+    def handle_payment(self, user_index):
+        """Handle payment request for a specific user"""
+        if user_index >= len(self.users):
+            return
+        
+        user = self.users[user_index]
+        
+        # Start payment in background thread to avoid blocking UI
+        threading.Thread(
+            target=self._send_payment_request,
+            args=(user_index, user),
+            daemon=True
+        ).start()
+
+    def _send_payment_request(self, user_index, user):
+        """Send payment request to the endpoint"""
+        def log(msg):
+            timestamp = datetime.now().strftime('%H:%M:%S')
+            log_entry = f"[{timestamp}] [PAYMENT] {msg}"
+            user['logs'].append(log_entry)
+        
+        try:
+            # Update status
+            self.ui_queue.put(('update_user', user_index, 'status', 'Processing payment...'))
+            log(f"Starting payment process for {user['email']}")
+            
+            # Prepare request data
+            payment_data = {
+                'email': user['email'],
+                'password': user['password'],
+                'eventsUrl': self.event_url_var.get(),
+                'proxyUrl': user.get('proxy', '')
+            }
+            
+            log(f"Sending payment request to localhost:3000")
+            
+            # Send POST request
+            response = requests.post(
+                'http://localhost:3000/getPayment',
+                json=payment_data,
+                timeout=30,
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            log(f"Payment response status: {response.status_code}")
+            
+            # Print response as requested
+            try:
+                response_json = response.json()
+                print(f"Payment Response for {user['email']}:")
+                print(json.dumps(response_json, indent=2))
+                log(f"Payment response: {response_json}")
+            except:
+                print(f"Payment Response for {user['email']} (text):")
+                print(response.text)
+                log(f"Payment response (text): {response.text}")
+            
+            if response.status_code == 200:
+                self.ui_queue.put(('update_user', user_index, 'status', 'Payment completed'))
+                log("Payment completed successfully")
+            else:
+                self.ui_queue.put(('update_user', user_index, 'status', 'Payment failed'))
+                log(f"Payment failed with status {response.status_code}")
+                
+        except requests.exceptions.ConnectionError:
+            error_msg = "Could not connect to payment server (localhost:3000)"
+            log(error_msg)
+            print(f"Payment Error for {user['email']}: {error_msg}")
+            self.ui_queue.put(('update_user', user_index, 'status', 'Payment server offline'))
+            
+        except requests.exceptions.Timeout:
+            error_msg = "Payment request timed out"
+            log(error_msg)
+            print(f"Payment Error for {user['email']}: {error_msg}")
+            self.ui_queue.put(('update_user', user_index, 'status', 'Payment timeout'))
+            
+        except Exception as e:
+            error_msg = f"Payment error: {str(e)}"
+            log(error_msg)
+            print(f"Payment Error for {user['email']}: {error_msg}")
+            self.ui_queue.put(('update_user', user_index, 'status', 'Payment error'))
     def show_user_logs(self, event):
         """Show detailed logs for selected user"""
         selection = self.tree.selection()
@@ -2485,6 +2777,9 @@ class BotGUI:
                                     values[5] = str(value)
                                 elif field == 'last_update':
                                     values[6] = value
+                                # Keep Pay button text
+                                if len(values) == 8:
+                                    values[7] = 'Pay'
                                 self.tree.item(item_id, values=values)
                         
                     except queue.Empty:
