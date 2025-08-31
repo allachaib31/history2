@@ -38,7 +38,7 @@ import websocket
 import socket
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
+import httpx
 # Add this at the top of your file after imports
 
 # Playwright imports with error handling
@@ -1599,6 +1599,7 @@ class SeatScanner:
         """Handle incoming WebSocket messages"""
         try:
             data = json.loads(message)
+            print(data)
             
             if isinstance(data, list):
                 for msg in data:
