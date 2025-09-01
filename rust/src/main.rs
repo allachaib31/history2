@@ -45,10 +45,18 @@ pub struct WebbookBot {
     assigned_seats_receiver: Option<mpsc::UnboundedReceiver<(usize, String)>>, // ADD THIS
     ctx: Option<egui::Context>,
     shared_data: Option<Arc<RwLock<SharedData>>>,
-    scanner_running: bool,
-    reserved_seats_map: HashMap<String, Vec<String>>,
-    ready_star_users: Vec<usize>, // Indices of ready users
-    next_user_index: usize,
+    scanner_running: bool, // Indices of ready users
+    // ADD these fields:
+    reserved_seats_map: Arc<Mutex<HashMap<String, Vec<String>>>>, // holdTokenHash -> seats
+    ready_star_users: Arc<Mutex<Vec<usize>>>, // Indices of ready users  
+    next_user_index: Arc<AtomicUsize>,
+    ws_connection: Option<Arc<Mutex<Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>>>,
+    show_transfer_modal: bool,
+    transfer_from_user: String,
+    transfer_to_user: String,
+    show_logs_modal: bool,
+    selected_user_logs: Vec<String>,
+    selected_user_email: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -73,6 +81,10 @@ struct User {
     target_seats: Vec<String>, // Seats to attempt taking
     #[serde(skip)]
     assigned_seats: Vec<String>,
+    #[serde(skip)]
+    held_seats: Vec<String>,
+    #[serde(skip)]
+    logs: Vec<String>, 
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -164,6 +176,8 @@ impl Default for User {
             pay_status: "Pay".to_string(),
             assigned_seats: Vec::new(),
             target_seats: Vec::new(),
+            held_seats: Vec::new(),  // ADD THIS LINE
+            logs: Vec::new(),
         }
     }
 }
@@ -223,6 +237,108 @@ impl BotUser {
             browser_id: Arc::new(Mutex::new(None)),
             held_seats: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+    async fn release_seat(&self, seat_id: &str, event_keys: &[String]) -> Result<bool> {
+        let hold_token = self.webook_hold_token.lock().clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
+    
+        let request_body = json!({
+            "events": event_keys,
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat_id}],
+            "validateEventsLinkedToSameChart": true
+        });
+    
+        let request_body_str = request_body.to_string();
+        let signature = self.generate_signature(&request_body_str).await?;
+    
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "*/*".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
+        headers.insert("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?);
+        headers.insert("x-client-tool", "Renderer".parse()?);
+        headers.insert("x-signature", signature.parse()?);
+    
+        if let Some(browser_id) = self.browser_id.lock().as_ref() {
+            headers.insert("x-browser-id", browser_id.parse()?);
+        }
+    
+        if let Some(commit_hash) = &self.shared_data.read().await.commit_hash {
+            let referer = format!(
+                "https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={}",
+                commit_hash
+            );
+            headers.insert("referer", referer.parse()?);
+        }
+    
+        let url = format!(
+            "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/release-held-objects",
+            WORKSPACE_KEY
+        );
+    
+        let response = self.client
+            .post(&url)
+            .headers(headers)
+            .body(request_body_str)
+            .send()
+            .await?;
+    
+        let success = response.status() == 200 || response.status() == 204;
+        
+        if success {
+            // Remove from held seats
+            let mut held = self.held_seats.lock();
+            held.retain(|s| s != seat_id);
+            println!("Released seat: {}", seat_id);
+        }
+    
+        Ok(success)
+    }
+    async fn prepare_take_request(
+        &self,
+        seat_id: &str,
+        channel_keys: &[String],
+        event_keys: &[String]
+    ) -> Result<(String, reqwest::header::HeaderMap, String)> {
+        let hold_token = self.webook_hold_token.lock().clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
+    
+        let request_body = json!({
+            "events": event_keys,
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat_id}],
+            "channelKeys": channel_keys,
+            "validateEventsLinkedToSameChart": true
+        });
+    
+        let request_body_str = request_body.to_string();
+        let signature = self.generate_signature(&request_body_str).await?;
+    
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "*/*".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
+        headers.insert("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?);
+        headers.insert("x-client-tool", "Renderer".parse()?);
+        headers.insert("x-signature", signature.parse()?);
+    
+        if let Some(browser_id) = self.browser_id.lock().as_ref() {
+            headers.insert("x-browser-id", browser_id.parse()?);
+        }
+    
+        if let Some(commit_hash) = &self.shared_data.read().await.commit_hash {
+            let referer = format!(
+                "https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={}",
+                commit_hash
+            );
+            headers.insert("referer", referer.parse()?);
+        }
+    
+        let url = format!(
+            "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
+            WORKSPACE_KEY
+        );
+    
+        Ok((url, headers, request_body_str))
     }
     async fn retake_seats(
         &self,
@@ -802,7 +918,6 @@ impl BotManager {
                         user.email, attempt
                     ))
                     .ok();
-
                 match user.get_webook_hold_token().await {
                     Ok(_) => {
                         status_sender
@@ -880,12 +995,275 @@ impl WebbookBot {
             assigned_seats_receiver: None, // This exists
             ctx: None,           
             scanner_running: false,
-            reserved_seats_map: HashMap::new(),
-            ready_star_users: Vec::new(),
-            next_user_index: 0,     
-            ..Default::default()
+            reserved_seats_map: Arc::new(Mutex::new(HashMap::new())),
+            ready_star_users: Arc::new(Mutex::new(Vec::new())),
+            next_user_index: Arc::new(AtomicUsize::new(0)),
+            ws_connection: None,
+            show_transfer_modal: false,
+            transfer_from_user: String::new(),
+            transfer_to_user: String::new(),
+            show_logs_modal: false,
+            selected_user_logs: Vec::new(),
+            selected_user_email: String::new(),
         };
         app
+    }
+    fn add_log(&mut self, user_index: usize, message: &str) {
+        if user_index < self.users.len() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            let log_entry = format!("[{}] {}", 
+                Self::format_timestamp(timestamp), 
+                message
+            );
+            
+            self.users[user_index].logs.push(log_entry);
+        }
+    }
+    
+    fn format_timestamp(timestamp: u64) -> String {
+        // Simple time formatting - you can improve this
+        let hours = (timestamp / 3600) % 24;
+        let minutes = (timestamp / 60) % 60;
+        let seconds = timestamp % 60;
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
+    
+    fn show_logs_modal(&mut self, ctx: &egui::Context) {
+        let mut close_modal = false;
+        
+        egui::Window::new(&format!("Logs for {}", self.selected_user_email))
+            .default_size([800.0, 600.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.selected_user_logs.is_empty() {
+                            ui.label("No logs available");
+                        } else {
+                            for log_entry in &self.selected_user_logs {
+                                ui.label(log_entry);
+                            }
+                        }
+                    });
+                
+                ui.separator();
+                
+                if ui.button("Close").clicked() {
+                    close_modal = true;
+                }
+            });
+        
+        if close_modal {
+            self.show_logs_modal = false;
+            self.selected_user_logs.clear();
+            self.selected_user_email.clear();
+        }
+    }
+    fn show_transfer_modal(&mut self, ctx: &egui::Context) {
+        let mut close_modal = false;
+    
+            egui::Window::new("Transfer Seats")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| { 
+                ui.vertical(|ui| {
+                    // Get users by type
+                    let star_users: Vec<String> = self.users.iter()
+                        .filter(|u| u.user_type == "*")
+                        .map(|u| u.email.clone())
+                        .collect();
+    
+                    let plus_users: Vec<String> = self.users.iter()
+                        .filter(|u| u.user_type == "+")
+                        .map(|u| u.email.clone())
+                        .collect();
+    
+                    // From user (*)
+                    ui.horizontal(|ui| {
+                        ui.label("From (*) user:");
+                        egui::ComboBox::from_id_source("from_user")
+                            .selected_text(&self.transfer_from_user)
+                            .show_ui(ui, |ui| {
+                                for user in &star_users {
+                                    ui.selectable_value(&mut self.transfer_from_user, user.clone(), user);
+                                }
+                            });
+                    });
+    
+                    // To user (+)
+                    ui.horizontal(|ui| {
+                        ui.label("To (+) user:");
+                        egui::ComboBox::from_id_source("to_user")
+                            .selected_text(&self.transfer_to_user)
+                            .show_ui(ui, |ui| {
+                                for user in &plus_users {
+                                    ui.selectable_value(&mut self.transfer_to_user, user.clone(), user);
+                                }
+                            });
+                    });
+    
+                    ui.separator();
+    
+                    // Validation and info
+                    let from_user_seats = self.users.iter()
+                        .find(|u| u.email == self.transfer_from_user)
+                        .map(|u| u.held_seats.len())
+                        .unwrap_or(0);
+    
+                    let to_user_seats = self.users.iter()
+                        .find(|u| u.email == self.transfer_to_user)
+                        .map(|u| u.held_seats.len())
+                        .unwrap_or(0);
+    
+                    let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+    
+                    ui.label(format!("From user has {} seats", from_user_seats));
+                    ui.label(format!("To user has {}/{} seats", to_user_seats, d_seats_limit));
+    
+                    ui.separator();
+    
+                    // Buttons
+                    ui.horizontal(|ui| {
+                        let can_transfer = !self.transfer_from_user.is_empty() 
+                            && !self.transfer_to_user.is_empty()
+                            && from_user_seats > 0
+                            && (d_seats_limit == 0 || to_user_seats < d_seats_limit);
+    
+                        if ui.add_enabled(can_transfer, egui::Button::new("Transfer")).clicked() {
+                            // Find user indices
+                            let from_index = self.users.iter().position(|u| u.email == self.transfer_from_user);
+                            let to_index = self.users.iter().position(|u| u.email == self.transfer_to_user);
+    
+                            if let (Some(from_idx), Some(to_idx)) = (from_index, to_index) {
+                                self.execute_transfer(from_idx, to_idx);
+                            }
+                            close_modal = true;
+                        }
+    
+                        if ui.button("Cancel").clicked() {
+                            close_modal = true;
+                        }
+                    });
+                });
+            });
+    
+        if close_modal {
+            self.show_transfer_modal = false;
+            self.transfer_from_user.clear();
+            self.transfer_to_user.clear();
+        }
+    }  
+    fn execute_transfer(&mut self, from_user_index: usize, to_user_index: usize) {
+        if let (Some(bot_manager), Some(rt)) = (&self.bot_manager, &self.rt) {
+            let from_user = bot_manager.users[from_user_index].clone();
+            let to_user = bot_manager.users[to_user_index].clone();
+            
+            // Get seats to transfer
+            let seats_to_transfer = from_user.held_seats.lock().clone();
+            let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+    
+            println!("Starting transfer: {} seats from {} to {}", 
+                seats_to_transfer.len(), from_user.email, to_user.email);
+    
+            rt.spawn(async move {
+                let channel_keys = vec!["NO_CHANNEL".to_string()]; // Simplified
+                let event_keys = if let Ok(data) = from_user.shared_data.try_read() {
+                    if let Some(event_key) = &data.event_key {
+                        vec![event_key.clone()]
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                };
+    
+                let mut successful_transfers = 0;
+    
+                for seat_id in seats_to_transfer {
+                    // Check if to_user is at limit
+                    let to_user_seat_count = to_user.held_seats.lock().len();
+                    if d_seats_limit > 0 && to_user_seat_count >= d_seats_limit {
+                        println!("Target user reached seat limit, stopping transfer");
+                        break;
+                    }
+    
+                    // Perform atomic transfer
+                    match Self::atomic_transfer_seat(&from_user, &to_user, &seat_id, &channel_keys, &event_keys).await {
+                        Ok(true) => {
+                            successful_transfers += 1;
+                            println!("Successfully transferred seat: {}", seat_id);
+                        }
+                        Ok(false) => {
+                            println!("Failed to transfer seat: {}", seat_id);
+                            break; // Stop on first failure
+                        }
+                        Err(e) => {
+                            println!("Transfer error for seat {}: {}", seat_id, e);
+                            break;
+                        }
+                    }
+                }
+    
+                println!("Transfer complete: {} seats transferred successfully", successful_transfers);
+            });
+        }
+    }
+    async fn atomic_transfer_seat(
+        from_user: &BotUser,
+        to_user: &BotUser, 
+        seat_id: &str,
+        channel_keys: &[String],
+        event_keys: &[String]
+    ) -> Result<bool> {
+        // Step 1: Pre-build the take request for target user
+        let (take_url, take_headers, take_body) = to_user.prepare_take_request(
+            seat_id, 
+            channel_keys, 
+            event_keys
+        ).await?;
+    
+        // Step 2: Release seat from source user
+        if !from_user.release_seat(seat_id, event_keys).await? {
+            return Ok(false);
+        }
+    
+        // Step 3: IMMEDIATELY fire the pre-built take request (NO DELAY)
+        let response = to_user.client
+            .post(&take_url)
+            .headers(take_headers)
+            .body(take_body)
+            .send()
+            .await?;
+    
+        let success = response.status() == 200 || response.status() == 204;
+    
+        if success {
+            // Update target user's held seats
+            to_user.held_seats.lock().push(seat_id.to_string());
+            println!("Atomic transfer SUCCESS: {}", seat_id);
+        } else {
+            // Try to restore seat to original user if take failed
+            let restore_channel_keys = vec!["NO_CHANNEL".to_string()];
+            if let Ok((restore_url, restore_headers, restore_body)) = from_user.prepare_take_request(
+                seat_id, 
+                &restore_channel_keys, 
+                event_keys
+            ).await {
+                let _ = from_user.client
+                    .post(&restore_url)
+                    .headers(restore_headers)
+                    .body(restore_body)
+                    .send()
+                    .await;
+            }
+        }
+    
+        Ok(success)
     }
     fn build_channel_keys(&self) -> Vec<String> {
         let mut channel_keys = vec!["NO_CHANNEL".to_string()];
@@ -1220,7 +1598,6 @@ impl WebbookBot {
             println!("Please load users and proxies first");
             return;
         }
-
         let users_data: Vec<(String, String)> = self
             .users
             .iter()
@@ -1261,7 +1638,7 @@ impl WebbookBot {
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                             for (i, user) in bot_manager_arc.users.iter().enumerate() {
                                 let expire_time = user.expire_time.load(Ordering::Relaxed);
-                                
+                                status_sender_clone.send(format!("User {}: Bot started", user.email)).ok();
                                 if expire_time > 0 {
                                     let remaining = expire_time.saturating_sub(1);
                                     user.expire_time.store(remaining, Ordering::Relaxed);
@@ -1311,6 +1688,7 @@ impl WebbookBot {
                                         }
                                     }
                                 }
+                            
                             }
                         }
                     }
@@ -1369,6 +1747,9 @@ impl WebbookBot {
             if ui.button("Fill Seats").clicked() {
                 self.fill_seats(); // ← Correct!
             }
+            if ui.button("Transfer Seat").clicked() {
+                self.show_transfer_modal = true;
+            }
         });
 
         ui.separator();
@@ -1415,34 +1796,65 @@ impl WebbookBot {
             }
 
             // Display checkboxes - 10 per line
+            // Display checkboxes in scrollable area
+            
             let mut sections_to_display: Vec<String> =
-                self.selected_sections.keys().cloned().collect();
+            self.selected_sections.keys().cloned().collect();
             sections_to_display.sort();
 
             let mut selection_changed = false;
-
-            for chunk in sections_to_display.chunks(10) {
-                ui.horizontal(|ui| {
-                    for section in chunk {
-                        if let Some(is_selected) = self.selected_sections.get_mut(section) {
-                            if ui.checkbox(is_selected, section).changed() {
-                                selection_changed = true;
+            ui.horizontal(|ui| {
+                if ui.button("Select All").clicked() {
+                    for (_, is_selected) in self.selected_sections.iter_mut() {
+                        *is_selected = true;
+                    }
+                    selection_changed = true;
+                }
+                if ui.button("Clear All").clicked() {
+                    for (_, is_selected) in self.selected_sections.iter_mut() {
+                        *is_selected = false;
+                    }
+                    selection_changed = true;
+                }
+            });
+            let selected_count = self.selected_sections.values().filter(|&&v| v).count();
+            ui.label(format!("Sections: {} selected", selected_count));
+            // Create scrollable area with fixed height
+            egui::ScrollArea::both()
+            .id_source("sections_scroll")  // ADD THIS LINE - unique ID
+            .max_height(200.0)
+            .show(ui, |ui| {
+                // Use a grid for better layout control
+                egui::Grid::new("sections_grid")
+                    .num_columns(10)
+                    .spacing([5.0, 5.0])
+                    .show(ui, |ui| {
+                        for (index, section) in sections_to_display.iter().enumerate() {
+                            if let Some(is_selected) = self.selected_sections.get_mut(section) {
+                                if ui.checkbox(is_selected, section).changed() {
+                                    selection_changed = true;
+                                }
+                            }
+                            
+                            // End row after 10 items
+                            if (index + 1) % 10 == 0 {
+                                ui.end_row();
                             }
                         }
-                    }
-                });
-            }
+                    });
+            });
 
             // If selection changed, redistribute seats
             // If selection changed, redistribute seats AND start scanner
             if selection_changed {
+                println!("selection succed");
                 self.distribute_seats_to_users();
                 
                 // Start scanner when first checkbox is selected
                 let has_selected = self.selected_sections.values().any(|&selected| selected);
                 if has_selected && !self.scanner_running && self.bot_running {
                     self.start_scanner();
-                } else if !has_selected && self.scanner_running {
+                }else if !has_selected && self.scanner_running {
                     self.scanner_running = false; // Stop if no sections selected
                 }
             }
@@ -1450,7 +1862,16 @@ impl WebbookBot {
 
         ui.separator();
     }
-
+    fn update_ready_star_users_atomic(&self) {  // Remove async
+        let mut users = self.ready_star_users.lock();  // Remove .await and if let Some
+        users.clear();
+        
+        for (i, user) in self.users.iter().enumerate() {
+            if user.user_type == "*" && user.status == "Active" {
+                users.push(i);
+            }
+        }
+    }
     fn render_user_table(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
 
@@ -1492,35 +1913,49 @@ impl WebbookBot {
                 });
             })
             .body(|mut body| {
-                for user in &mut self.users {
+                for (user_index, user) in self.users.iter_mut().enumerate() {
                     body.row(25.0, |mut row| {
-                        row.col(|ui| {
-                            ui.label(&user.email);
+                        // Make the entire row clickable for logs
+                        let row_response = row.col(|ui| {
+                            if ui.button(&user.email).clicked() {
+                                // Show logs when email clicked
+                                self.selected_user_email = user.email.clone();
+                                self.selected_user_logs = user.logs.clone();
+                                self.show_logs_modal = true;
+                            }
                         });
+            
                         row.col(|ui| {
                             ui.label(&user.user_type);
                         });
+                        
                         row.col(|ui| {
                             ui.label(&user.proxy);
                         });
+                        
                         row.col(|ui| {
                             let color = match user.status.as_str() {
                                 "Ready" => egui::Color32::GREEN,
                                 "Error" => egui::Color32::RED,
                                 "Running" => egui::Color32::YELLOW,
+                                "Active" => egui::Color32::BLUE,
                                 _ => egui::Color32::GRAY,
                             };
                             ui.colored_label(color, &user.status);
                         });
+                        
                         row.col(|ui| {
                             ui.label(&user.expire);
                         });
+                        
                         row.col(|ui| {
                             ui.label(&user.seats);
                         });
+                        
                         row.col(|ui| {
                             ui.label(&user.last_update);
                         });
+                        
                         row.col(|ui| {
                             if ui.button(&user.pay_status).clicked() {
                                 println!("Pay button clicked for {}", user.email);
@@ -1565,7 +2000,7 @@ impl WebbookBot {
         }
 
         self.scanner_running = true;
-        self.reserved_seats_map.clear();
+        self.reserved_seats_map.lock().clear();
         self.update_ready_star_users();
 
         if let Some(rt) = &self.rt {
@@ -1602,13 +2037,17 @@ impl WebbookBot {
     }
 
     fn update_ready_star_users(&mut self) {
-        self.ready_star_users = self
+        let new_users: Vec<usize> = self
             .users
             .iter()
             .enumerate()
             .filter(|(_, user)| user.user_type == "*" && user.status == "Active")
             .map(|(i, _)| i)
             .collect();
+        
+        let mut ready_users = self.ready_star_users.lock();
+        ready_users.clear();
+        ready_users.extend(new_users);
     }
 
     async fn run_websocket_scanner(
@@ -1637,6 +2076,7 @@ impl WebbookBot {
         let data = shared_data.read().await;
         if let Some(event_key) = &data.event_key {
             let event_channel = format!("{}-{}", WORKSPACE_KEY, event_key);
+            println!("{:?}",event_channel);
             let event_sub = serde_json::json!({
                 "type": "SUBSCRIBE",
                 "data": {
@@ -1644,6 +2084,17 @@ impl WebbookBot {
                 }
             });
             write.send(Message::Text(event_sub.to_string())).await?;
+        }
+        if let Some(season_structure) = &data.season_structure {
+            let season_channel = format!("{}-{}", WORKSPACE_KEY, season_structure);
+            println!("{:?}",season_channel);
+            let season_sub = serde_json::json!({
+                "type": "SUBSCRIBE", 
+                "data": {
+                    "channel": season_channel
+                }
+            });
+            write.send(Message::Text(season_sub.to_string())).await?;
         }
         drop(data);
     
@@ -1653,11 +2104,10 @@ impl WebbookBot {
         while let Some(msg) = read.next().await {
             match msg? {
                 Message::Text(text) => {
-                    Self::process_websocket_message(
+                    Self::process_websocket_message_simple(
                         &text,
                         &selected_channels,
                         &bot_manager,
-                        &shared_data,
                         &users_data,
                     ).await;
                 }
@@ -1671,14 +2121,13 @@ impl WebbookBot {
     
         Ok(())
     }
-    async fn process_websocket_message(
+    async fn process_websocket_message_simple(
         msg_text: &str,
         selected_channels: &[String],
         bot_manager: &Option<Arc<BotManager>>,
-        shared_data: &Arc<RwLock<SharedData>>,
         users_data: &[User],
     ) {
-        // Try to parse as array first, then single message
+        println!("{:?}",msg_text);
         let messages: Vec<ScannerMessage> = if let Ok(msgs) = serde_json::from_str(msg_text) {
             msgs
         } else if let Ok(single_msg) = serde_json::from_str::<ScannerMessage>(msg_text) {
@@ -1686,24 +2135,200 @@ impl WebbookBot {
         } else {
             return;
         };
-
+        //println!("{:?}", messages);
+    
         for message in messages {
-
-            println!("{:?}",message);
             if message.message_type != "MESSAGE_PUBLISHED" {
                 continue;
             }
     
             let body = &message.message.body;
     
-            // Handle seat becoming free
+            // Handle seat becoming free - Simple version
             if let (Some(status), Some(object_label)) = (&body.status, &body.object_label) {
-                //println!("{:?}",status);
                 if status == "free" && !object_label.is_empty() {
-                    Self::handle_seat_free(object_label, selected_channels, bot_manager, shared_data, users_data).await;
-                    // Remove the duplicate line
+                    Self::handle_seat_free(object_label, selected_channels, bot_manager, &Arc::new(RwLock::new(SharedData::default())), users_data).await;
                 }
             }
+        }
+    }
+    async fn process_websocket_message(
+        msg_text: &str,
+        selected_channels: &[String], 
+        bot_manager: &Option<Arc<BotManager>>,
+        shared_data: &Arc<RwLock<SharedData>>,
+        users_data: &[User],
+        reserved_seats_map: &Arc<Mutex<HashMap<String, Vec<String>>>>,
+        ready_star_users: &Arc<Mutex<Vec<usize>>>,
+        next_user_index: &Arc<AtomicUsize>,
+    ) {
+        let messages: Vec<ScannerMessage> = if let Ok(msgs) = serde_json::from_str(msg_text) {
+            msgs
+        } else if let Ok(single_msg) = serde_json::from_str::<ScannerMessage>(msg_text) {
+            vec![single_msg]
+        } else {
+            return;
+        };
+    
+        for message in messages {
+            if message.message_type != "MESSAGE_PUBLISHED" {
+                continue;
+            }
+    
+            let body = &message.message.body;
+    
+            // Handle seat becoming free - ROCKET LOGIC
+            if let (Some(status), Some(object_label)) = (&body.status, &body.object_label) {
+                if status == "free" && !object_label.is_empty() {
+                    Self::handle_seat_free_rocket(object_label, selected_channels, bot_manager, ready_star_users, next_user_index).await;
+                }
+            }
+    
+            // Handle seat reserved tracking
+            if let (Some(status), Some(hold_token_hash), Some(object_label)) = (&body.status, &body.hold_token_hash, &body.object_label) {
+                if status == "reservedByToken" && !hold_token_hash.is_empty() {
+                    let mut map = reserved_seats_map.lock();
+                    map.entry(hold_token_hash.clone()).or_insert_with(Vec::new).push(object_label.clone());
+                }
+            }
+    
+            // Handle token expired
+            if let (Some(message_type), Some(hold_token)) = (&body.message_type, &body.hold_token) {
+                if message_type == "HOLD_TOKEN_EXPIRED" && !hold_token.is_empty() {
+                    Self::handle_token_expired(hold_token, selected_channels, bot_manager, reserved_seats_map).await;
+                }
+            }
+        }
+    }
+    async fn handle_token_expired(
+        hold_token: &str,
+        selected_channels: &[String],
+        bot_manager: &Option<Arc<BotManager>>,
+        reserved_seats_map: &Arc<Mutex<HashMap<String, Vec<String>>>>,
+    ) {
+        // Generate SHA1 hash of hold token
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(hold_token.as_bytes());
+        let hold_token_hash = hex::encode(hasher.finalize());
+    
+        // Get and remove expired seats
+        let expired_seats = {
+            let mut map = reserved_seats_map.lock();
+            map.remove(&hold_token_hash).unwrap_or_default()
+        };
+    
+        if expired_seats.is_empty() {
+            return;
+        }
+    
+        println!("⏰ TOKEN EXPIRED: {} seats available", expired_seats.len());
+    
+        // Process each expired seat
+        for seat_id in expired_seats {
+            // Check if seat matches selected channels
+            let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
+            if !matches_prefix {
+                continue;
+            }
+    
+            // Attempt booking with all ready star users
+            if let Some(manager) = bot_manager {
+                for (i, bot_user) in manager.users.iter().enumerate() {
+                    // Launch concurrent attempts (don't wait)
+                    let user_clone = bot_user.clone();
+                    let seat_clone = seat_id.clone();
+                    
+                    tokio::spawn(async move {
+                        if let Ok(_) = Self::take_seat_ultra_fast(&user_clone, &seat_clone).await {
+                            println!("🎯 TOKEN EXPIRED BOOKING: {} booked by {}", seat_clone, user_clone.email);
+                        }
+                    });
+                }
+            }
+        }
+    }
+    async fn handle_seat_free_rocket(
+        seat_id: &str,
+        selected_channels: &[String], 
+        bot_manager: &Option<Arc<BotManager>>,
+        ready_star_users: &Arc<Mutex<Vec<usize>>>,
+        next_user_index: &Arc<AtomicUsize>,
+    ) {
+        // Check prefix match
+        let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
+        if !matches_prefix {
+            return;
+        }
+    
+        if let Some(manager) = bot_manager {
+            let users = ready_star_users.lock();
+            if users.is_empty() {
+                return;
+            }
+    
+            // Round-robin selection
+            let current_index = next_user_index.load(Ordering::Relaxed);
+            let user_index = users[current_index % users.len()];
+            next_user_index.store((current_index + 1) % users.len(), Ordering::Relaxed);
+            
+            if let Some(bot_user) = manager.users.get(user_index) {
+                println!("🟢 SEAT FREE: {}. Assigning sniper shot to {}", seat_id, bot_user.email);
+                
+                let user_clone = bot_user.clone();
+                let seat_clone = seat_id.to_string();
+                
+                tokio::spawn(async move {
+                    // Direct fast take without waiting
+                    if let Err(e) = Self::take_seat_ultra_fast(&user_clone, &seat_clone).await {
+                        // Don't log failures to reduce overhead
+                    } else {
+                        println!("🚀 ROCKET SUCCESS: {} booked by {}", seat_clone, user_clone.email);
+                    }
+                });
+            }
+        }
+    }
+    async fn take_seat_ultra_fast(
+        user: &BotUser,
+        seat_id: &str,
+    ) -> Result<()> {
+        // Ultra-fast implementation with minimal overhead
+        let hold_token = user.webook_hold_token.lock().clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token"))?;
+    
+        let request_body = json!({
+            "events": [user.shared_data.read().await.event_key],
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat_id}],
+            "channelKeys": ["NO_CHANNEL"],
+            "validateEventsLinkedToSameChart": true
+        });
+    
+        let signature = user.generate_signature(&request_body.to_string()).await?;
+        
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "*/*".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
+        headers.insert("x-client-tool", "Renderer".parse()?);
+        headers.insert("x-signature", signature.parse()?);
+        
+        if let Some(browser_id) = user.browser_id.lock().as_ref() {
+            headers.insert("x-browser-id", browser_id.parse()?);
+        }
+    
+        let response = user.client
+            .post(&format!("https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects", WORKSPACE_KEY))
+            .headers(headers)
+            .body(request_body.to_string())
+            .send()
+            .await?;
+    
+        if response.status() == 200 || response.status() == 204 {
+            user.held_seats.lock().push(seat_id.to_string());
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Seat take failed"))
         }
     }
 
@@ -1804,8 +2429,11 @@ impl eframe::App for WebbookBot {
             ui.add_space(10.0);
 
             // Main table
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::both()
                 .auto_shrink([false, true])
+                .id_source("table_scroll")  // ADD THIS LINE - unique ID
+                .max_height(400.0)
+                .max_width(800.0)
                 .show(ui, |ui| {
                     self.render_user_table(ui);
                 });
@@ -1828,6 +2456,13 @@ impl eframe::App for WebbookBot {
             self.update_countdowns();
             self.update_assigned_seats();
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        if self.show_transfer_modal {
+            self.show_transfer_modal(ctx);  // Pass ctx, not ui
+        }
+        // Show logs modal if requested
+        if self.show_logs_modal {
+            self.show_logs_modal(ctx);
         }
     }
 }

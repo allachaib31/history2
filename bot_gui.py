@@ -25,7 +25,7 @@ import queue
 import csv
 import json
 import os
-import requests
+import httpx
 from pathlib import Path
 from datetime import datetime, timedelta
 import traceback
@@ -35,10 +35,10 @@ import hashlib
 from urllib.parse import urlparse
 import time
 import websocket
+import asyncio
 import socket
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-import httpx
 # Add this at the top of your file after imports
 
 # Playwright imports with error handling
@@ -126,30 +126,32 @@ class WebookBot:
         self.email = email
         self.password = password
         self.token_manager = TokenManager()
-        self.session = requests.Session()
         self.browser_semaphore = threading.Semaphore(1)  # Only 1 browser at a time
         self.browser_id = None
         self.webook_hold_token = None  # Placeholder for Webook hold token
         self.expireTime = 600
         self.shared_data = shared_data
         self.shared_data_lock = shared_data_lock
-        self.session = requests.Session()
         
         # Set proxy if provided
         if proxy:
-            self.session.proxies = {
-                'http': proxy,
-                'https': proxy
-            }
+            self.session = httpx.Client(
+                http2=True,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+                timeout=10.0,
+                verify=False,
+                transport=httpx.HTTPTransport(retries=0),
+                proxies=proxy  # httpx uses 'proxies' parameter
+            )
+        else:
+            self.session = httpx.Client(
+                http2=True,
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
+                timeout=10.0,
+                verify=False,
+                transport=httpx.HTTPTransport(retries=0)
+            )
         
-        # Connection pooling adapter with proxy support
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=10,
-            max_retries=0
-        )
-        self.session.mount('https://', adapter)
-        self.session.mount('http://', adapter)
         
         # Fast HTTP settings
         self.session.headers.update({
@@ -249,7 +251,7 @@ class WebookBot:
         
         try:
             log("Fetching SeatsIO chart.js...")
-            session = requests.Session()
+            session = httpx.Client()
             if self.proxy:
                 session.proxies = {
                     'http': self.proxy,
@@ -289,7 +291,7 @@ class WebookBot:
             
             #return result
             
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             error_msg = f"Failed to fetch chart.js: {str(e)}"
             log(error_msg)
             log(f"🔄 Retrying chart.js fetch...")
@@ -347,7 +349,7 @@ class WebookBot:
         
         try:
             # Set up session with proxy if provided
-            session = requests.Session()
+            session = httpx.Client()
             if self.proxy:
                 #print(self.proxy)
                 session.proxies = {
@@ -391,7 +393,7 @@ class WebookBot:
                     'error': 'Invalid JSON response'
                 }
                 
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             error_msg = "Request timeout"
             log(f"✗ {error_msg}")
             return {
@@ -400,7 +402,7 @@ class WebookBot:
                 'success': False,
                 'error': error_msg
             }
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             error_msg = f"Network error: {str(e)}"
             log(f"✗ {error_msg}")
             return {
@@ -462,7 +464,7 @@ class WebookBot:
         
         try:
             log(f"Using browser ID: {self.browser_id}")
-            session = requests.Session()
+            session = httpx.Client()
             if self.proxy:
                 session.proxies = {
                     'http': self.proxy,
@@ -479,14 +481,14 @@ class WebookBot:
                 #print(data)
                 all_objects = []
                 self.shared_data['seasonStructure'] = data.get('seasonStructure', {}).get('topLevelSeasonKey', None)
-                print(f'seasonStructure: {self.shared_data['seasonStructure']}')
+                print(f"seasonStructure: {self.shared_data['seasonStructure']}")
                 for channel in data.get('channels', []):
                     if 'objects' in channel:
                         all_objects.extend(channel['objects'])
                 self.shared_data['channels'] = all_objects
                 return self.shared_data['channels'], self.shared_data['seasonStructure']
             
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             error_msg = f"Failed to fetch rendering info: {str(e)}"
             log(error_msg)
             raise Exception(error_msg)
@@ -548,7 +550,7 @@ class WebookBot:
             user['proxy'] = self.proxies[i % len(self.proxies)]
     def test_proxy(self, proxy_url):
         try:
-            test_session = requests.Session()
+            test_session = httpx.Client()
             test_session.proxies = {'http': proxy_url, 'https': proxy_url}
             response = test_session.get('http://httpbin.org/ip', timeout=10)
             return response.status_code == 200
@@ -874,7 +876,7 @@ class WebookBot:
 
         try:
             log(f"Requesting Webook hold token for event: {self.shared_data['event_id']}")
-            session = requests.Session()
+            session = httpx.Client()
             if self.proxy:
                 session.proxies = {
                     'http': self.proxy,
@@ -910,10 +912,10 @@ class WebookBot:
                 
                 log(f"✗ {error_msg}")
                 
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             error_msg = "Request timeout while getting Webook hold token"
             log(f"✗ {error_msg}")
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             error_msg = f"Network error while getting Webook hold token: {str(e)}"
             log(f"✗ {error_msg}")
         except Exception as e:
@@ -956,7 +958,7 @@ class WebookBot:
             'accept': '*/*',
             'accept-language': 'ar,en-US;q=0.9,en;q=0.8,fr;q=0.7',
             'priority': 'u=1, i',
-            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data['commitHash']}',
+            'referer': f"https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data['commitHash']}",
             'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Linux"',
@@ -972,7 +974,7 @@ class WebookBot:
         
         try:
             log(f"Getting info for expire time of hold token: {self.webook_hold_token}")
-            session = requests.Session()
+            session = httpx.Client()
             if self.proxy:
                 session.proxies = {
                     'http': self.proxy,
@@ -1005,9 +1007,9 @@ class WebookBot:
                 
                 log(f"✗ {error_msg}")
                 
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             error_msg = "Request timeout while getting Expire time of hold token info"
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             error_msg = f"Network error while getting Expire time of hold token info: {str(e)}"
             log(f"✗ {error_msg}")
         except Exception as e:
@@ -1088,7 +1090,7 @@ class WebookBot:
             'content-type': 'application/json',
             'origin': 'https://cdn-eu.seatsio.net',
             'priority': 'u=1, i',
-            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data['commitHash']}',
+            'referer': f"https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data['commitHash']}",
             'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Linux"',
@@ -1114,7 +1116,7 @@ class WebookBot:
             response = self.session.post(
                 url,
                 headers=headers,
-                data=request_body_str,
+                content=request_body_str,
                 timeout=10
             )
             print(f"takeSeat response ala : {response.status_code}")
@@ -1158,7 +1160,7 @@ class WebookBot:
                     'hold_token': hold_token
                 }
                 
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             error_msg = "Request timeout while holding seats"
             log(f"✗ {error_msg}")
             return {
@@ -1167,7 +1169,7 @@ class WebookBot:
                 'error': error_msg,
                 'hold_token': hold_token
             }
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             error_msg = f"Network error while holding seats: {str(e)}"
             log(f"✗ {error_msg}")
             return {
@@ -1244,7 +1246,7 @@ class WebookBot:
             'content-type': 'application/json',
             'origin': 'https://cdn-eu.seatsio.net',
             'priority': 'u=1, i',
-            'referer': f'https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data['commitHash']}',
+            'referer': f"https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={self.shared_data['commitHash']}",
             'sec-ch-ua': '"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"',
             'sec-ch-ua-mobile': '?0',
             'sec-ch-ua-platform': '"Linux"',
@@ -1262,7 +1264,7 @@ class WebookBot:
             log(f"Attempting to release {seat_objects}")
             log(f"Using hold token: {hold_token}")
             log(f"For event(s): {', '.join(event_keys)}")
-            session = requests.Session()
+            session = httpx.Client()
             if self.proxy:
                 session.proxies = {
                     'http': self.proxy,
@@ -1272,7 +1274,7 @@ class WebookBot:
             response = session.post(
                 url,
                 headers=headers,
-                data=request_body_str,  # Send as string, not dict
+                content=request_body_str,  # Send as string, not dict
                 timeout=30
             )
             
@@ -1316,7 +1318,7 @@ class WebookBot:
                     'error': error_msg
                 }
                 
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             error_msg = "Request timeout while releasing seats"
             log(f"✗ {error_msg}")
             return {
@@ -1324,7 +1326,7 @@ class WebookBot:
                 'status_code': 0,
                 'error': error_msg
             }
-        except requests.exceptions.RequestException as e:
+        except httpx.RequestError as e:
             error_msg = f"Network error while releasing seats: {str(e)}"
             log(f"✗ {error_msg}")
             return {
@@ -1382,10 +1384,7 @@ class SeatScanner:
         self.workspace_channel = workspace_key
         self.event_channel = f"{workspace_key}-{event_key}" if event_key else None
         self.event_channel2 = f"{workspace_key}-{seasonStructure}" if seasonStructure else None
-
-    # --- DEPRECATED: Replaced by the high-speed deque ---
-    # def _get_next_user(self): ...
-    # def _get_next_available_user(self): ...
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=100)
 
     def _get_selected_sections(self):
         """Get currently selected sections from GUI"""
@@ -1438,41 +1437,42 @@ class SeatScanner:
         self.log(f"🚀 {len(self.ready_user_queue)} users are armed and ready in the high-speed queue.")
 
     def _prepare_booking_request(self, bot):
-        """Pre-builds the entire HTTP request for maximum speed."""
+        """Pre-compute everything possible"""
         if not bot.shared_data.get('chartToken') or not bot.shared_data.get('event_key'):
-            raise ValueError("Bot is missing chartToken or event_key for preparation.")
+            raise ValueError("Bot is missing chartToken or event_key")
             
         if not bot.browser_id:
             bot.generate_browser_id()
 
         channel_keys = bot.gui_ref.build_channel_keys()
         
-        # This is the template for the request body. The seat ID is a placeholder.
         request_body_template = {
             "events": [bot.shared_data['event_key']],
             "holdToken": bot.webook_hold_token,
-            "objects": [{"objectId": "{SEAT_ID}"}], # Placeholder
+            "objects": [{"objectId": "{SEAT_ID}"}],
             "channelKeys": channel_keys,
             "validateEventsLinkedToSameChart": True
         }
         
-        # Headers are constant, so we build them once.
+        # Pre-stringify the template
+        body_template_str = json.dumps(request_body_template, separators=(',', ':'))
+        
         headers = {
             'accept': '*/*',
             'content-type': 'application/json',
             'origin': 'https://cdn-eu.seatsio.net',
             'x-browser-id': bot.browser_id,
             'x-client-tool': 'Renderer',
-            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
             'referer': f"https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={bot.shared_data['commitHash']}"
         }
         
         return {
             'url': f"https://cdn-eu.seatsio.net/system/public/{self.workspace_key}/events/groups/actions/hold-objects",
             'headers': headers,
-            'body_template': request_body_template,
+            'body_template_str': body_template_str,
             'http_session': bot.session,
-            'chart_token': bot.shared_data['chartToken']
+            'chart_token_reversed': bot.shared_data['chartToken'][::-1]
         }
 
     def set_log_callback(self, callback):
@@ -1649,19 +1649,16 @@ class SeatScanner:
     
     # --- OPTIMIZATION 3: Make the critical path "dumb and fast" ---
     def _handle_seat_free(self, seat_id):
-        # This first check is quick
         if not self._is_seat_in_selected_sections(seat_id):
             return
 
         with self.ready_user_lock:
             if not self.ready_user_queue:
-                # self.log("Seat free, but no users ready.") # Can be noisy
                 return
-            # INSTANTLY get the next user
             user = self.ready_user_queue.popleft()
-
-        # Fire the booking in a new thread to avoid blocking the WebSocket loop
-        threading.Thread(target=self._fire_prepared_request, args=(user, seat_id)).start()
+        
+        # Use thread pool instead of creating new thread
+        self.executor.submit(self._fire_prepared_request, user, seat_id)
 
     def _handle_seat_reserved(self, seat_id, hold_token_hash):
         if hold_token_hash not in self.global_reserved_seats:
@@ -1682,56 +1679,39 @@ class SeatScanner:
             del self.global_reserved_seats[hold_token_hash]
 
     def _fire_prepared_request(self, user, seat_id):
-        """The new, ultra-fast booking function."""
+        """Ultra-fast booking - minimal overhead"""
         email = user.get('email', 'unknown')
         prepared_request = user.get('prepared_request')
-
+        
         if not prepared_request:
-            self.log(f"[{email}] ERROR: No prepared request found!")
             return
 
         try:
-            # 1. Copy the body template to inject the seat ID
-            final_body = copy.deepcopy(prepared_request['body_template'])
-            final_body['objects'][0]['objectId'] = seat_id
-            body_str = json.dumps(final_body, separators=(',', ':'))
-
-            # 2. Generate the signature (this is the only slow part left, but it's very fast)
-            reversed_token = prepared_request['chart_token'][::-1]
-            signature = hashlib.sha256((reversed_token + body_str).encode('utf-8')).hexdigest()
+            # Direct string replacement (faster than json)
+            body_str = prepared_request['body_template_str'].replace('"{SEAT_ID}"', f'"{seat_id}"')
             
-            # 3. Create final headers with the new signature
-            final_headers = prepared_request['headers'].copy()
-            final_headers['x-signature'] = signature
-
-            # 4. FIRE!
+            # Fast signature
+            sig_data = prepared_request['chart_token_reversed'] + body_str
+            signature = hashlib.sha256(sig_data.encode()).hexdigest()
+            
+            # Update headers
+            headers = prepared_request['headers'].copy()
+            headers['x-signature'] = signature
+            
+            # Fire request
             response = prepared_request['http_session'].post(
                 prepared_request['url'],
-                headers=final_headers,
-                data=body_str,
-                timeout=2 # Use a short timeout
+                headers=headers,
+                content=body_str,  # ✓ Correct for httpx
+                timeout=10
             )
-
+            
             if response.status_code in [200, 204]:
-                self.log(f"✅ SUCCESS [{email}] booked {seat_id} [Status: {response.status_code}]")
+                self.log(f"✅ [{email}] → {seat_id}")
                 user['seats_booked'] = user.get('seats_booked', 0) + 1
-                if 'assigned_seats' not in user: user['assigned_seats'] = []
-                user['assigned_seats'].append(seat_id)
-                
-                # Find original user index to update GUI
-                for i, u in enumerate(self.users):
-                    if u['email'] == email:
-                        self.ui_queue.put(('update_user', i, 'seats_booked', user['seats_booked']))
-                        break
-            else:
-                # self.log(f"❌ FAILED [{email}] for {seat_id} [Status: {response.status_code}]") # Can be noisy
-                pass
-
-        except Exception as e:
-            # self.log(f"💥 ERROR [{email}] booking {seat_id}: {e}") # Can be noisy
-            pass
+        except:
+            pass  # Silent fail for speed
         finally:
-            # IMPORTANT: Add the user back to the queue so they can be used again.
             with self.ready_user_lock:
                 self.ready_user_queue.append(user)
 
@@ -1975,7 +1955,7 @@ class BotGUI:
             response = http_session.post(
                 prepared_request['url'],
                 headers=prepared_request['headers'],
-                data=prepared_request['data'],
+                content=prepared_request['data'],
                 timeout=3
             )
             
@@ -2669,7 +2649,7 @@ class BotGUI:
             log(f"Sending payment request to localhost:3000")
             
             # Send POST request
-            response = requests.post(
+            response = httpx.post(
                 'http://localhost:3000/getPayment',
                 json=payment_data,
                 timeout=30,
@@ -2696,13 +2676,13 @@ class BotGUI:
                 self.ui_queue.put(('update_user', user_index, 'status', 'Payment failed'))
                 log(f"Payment failed with status {response.status_code}")
                 
-        except requests.exceptions.ConnectionError:
+        except httpx.ConnectError:
             error_msg = "Could not connect to payment server (localhost:3000)"
             log(error_msg)
             print(f"Payment Error for {user['email']}: {error_msg}")
             self.ui_queue.put(('update_user', user_index, 'status', 'Payment server offline'))
             
-        except requests.exceptions.Timeout:
+        except httpx.RequestError as e:
             error_msg = "Payment request timed out"
             log(error_msg)
             print(f"Payment Error for {user['email']}: {error_msg}")
