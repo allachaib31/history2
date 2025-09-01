@@ -1,297 +1,817 @@
 use anyhow::Result;
-// REMOVED: Unused import: use async_trait::async_trait;
-use chromiumoxide::{Browser, BrowserConfig};
-use chrono::{DateTime, Duration, Utc};
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use dashmap::DashMap;
 use eframe::egui;
-use parking_lot::{Mutex, RwLock};
+use log::info;
+use parking_lot::Mutex;
 use regex::Regex;
 use reqwest::{Client, Proxy};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
-use std::{fs, string};
-use tokio::sync::{Barrier, RwLock as TokioRwLock, Semaphore};
-use tokio::time::sleep; // REMOVED: Unused import `interval`
-use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn}; // REMOVED: Unused import `debug`
+use tokio::sync::{mpsc, RwLock};
 use url::Url;
-// REMOVED: Unused import: use uuid::Uuid;
-use futures_util::{SinkExt, StreamExt};
 
-// Constants
-const TOKENS_FILE: &str = "tokens.json";
-const LOGIN_TIMEOUT: u64 = 60000;
-const NAVIGATION_TIMEOUT: u64 = 60000;
-const API_TIMEOUT: u64 = 60;
-const MAX_RETRIES: u32 = 3;
 const WORKSPACE_KEY: &str = "3d443a0c-83b8-4a11-8c57-3db9d116ef76";
 
-// Data structures
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
+pub struct WebbookBot {
+    // Form fields
+    event_url: String,
+    seats: String,
+    d_seats: String,
+    favorite_team: String,
+    sections_status: String,
+
+    // User data
+    users: Vec<User>,
+    proxies: Vec<String>,
+
+    // Status
+    bot_running: bool,
+
+    // UI State
+    teams: Vec<String>,
+
+    // Runtime
+    rt: Option<tokio::runtime::Runtime>,
+    bot_manager: Option<Arc<BotManager>>,
+    selected_sections: HashMap<String, bool>,
+    status_receiver: Option<mpsc::UnboundedReceiver<String>>,
+    expire_receiver: Option<mpsc::UnboundedReceiver<(usize, usize)>>,
+    bot_manager_receiver: Option<mpsc::UnboundedReceiver<Arc<BotManager>>>,
+    assigned_seats_receiver: Option<mpsc::UnboundedReceiver<(usize, String)>>, // ADD THIS
+    ctx: Option<egui::Context>,
+    shared_data: Option<Arc<RwLock<SharedData>>>,
+    scanner_running: bool, // Indices of ready users
+    // ADD these fields:
+    reserved_seats_map: Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>, // holdTokenHash -> seats
+    ready_star_users: Arc<tokio::sync::Mutex<Vec<usize>>>, // Indices of ready users  
+    next_user_index: Arc<AtomicUsize>,
+    ws_connection: Option<Arc<Mutex<Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>>>,
+    show_transfer_modal: bool,
+    transfer_from_user: String,
+    transfer_to_user: String,
+    show_logs_modal: bool,
+    selected_user_logs: Vec<String>,
+    selected_user_email: String,
+    telegram_bot: Option<TelegramBot>,
+    captcha_solver: Option<CaptchaSolver>,
+    recaptcha_site_key: Option<String>,
+    payment_links: HashMap<String, String>, // email -> payment_link
+    show_payment_modal: bool,
+    selected_payment_user: String,
+    payment_url: String,
+}
+// Add these structs after SharedData
+#[derive(Debug, Clone)]
+struct TelegramBot {
+    token: String,
+    chat_id: i64,
+    client: Client,
+}
+
+#[derive(Debug, Clone)]
+struct CaptchaSolver {
+    api_key: String,
+    client: Client,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptchaTaskResponse {
+    #[serde(rename = "errorId")]
+    error_id: i32,
+    #[serde(rename = "taskId")]
+    task_id: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptchaResultResponse {
+    #[serde(rename = "errorId")]
+    error_id: i32,
+    status: String,
+    solution: Option<CaptchaSolution>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaptchaSolution {
+    #[serde(rename = "gRecaptchaResponse")]
+    g_recaptcha_response: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct User {
-    email: String,
-    password: String,
     #[serde(rename = "type")]
     user_type: String,
-    proxy: Option<String>,
+    email: String,
+    password: String,
+    #[serde(skip)]
+    proxy: String,
+    #[serde(skip)]
     status: String,
     #[serde(skip)]
-    expire_time: Arc<AtomicUsize>, // Change this to Arc<AtomicUsize>
-    seats_booked: usize,
-    last_update: String,
-    logs: Vec<String>,
+    expire: String,
     #[serde(skip)]
-    bot_instance: Option<Arc<WebookBot>>,
+    seats: String,
+    #[serde(skip)]
+    last_update: String,
+    #[serde(skip)]
+    pay_status: String,
+    #[serde(skip)]
+    target_seats: Vec<String>, // Seats to attempt taking
     #[serde(skip)]
     assigned_seats: Vec<String>,
     #[serde(skip)]
-    save_seat_assignment: Vec<String>,
+    held_seats: Vec<String>,
+    #[serde(skip)]
+    logs: Vec<String>, 
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct TokenData {
-    access_token: String,
-    refresh_token: Option<String>,
     token: String,
-    expires_at: i64, // Unix timestamp in milliseconds
-    user_id: Option<String>,
-    savedAt: i64, // Unix timestamp in milliseconds
+    refresh_token: String,
+    access_token: String,
+    #[serde(rename = "UtmWbkWaSessionID")]
+    session_id: String,
+    #[serde(rename = "savedAt")]
+    saved_at: u64,
+    expires_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SharedEventData {
+#[derive(Debug, Default)]
+struct SharedData {
     chart_key: Option<String>,
     event_key: Option<String>,
     channel_key_common: Option<Vec<String>>,
-    channel_key: Option<HashMap<String, Vec<String>>>,
+    channel_key: Option<Value>,
     event_id: Option<String>,
-    home_team: Option<TeamInfo>,
-    away_team: Option<TeamInfo>,
+    home_team: Option<Value>,
+    away_team: Option<Value>,
     channels: Option<Vec<String>>,
     season_structure: Option<String>,
     chart_token: Option<String>,
     commit_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TeamInfo {
-    #[serde(rename = "_id")]
-    id: String,
-    name: String,
-}
-
-// Token Manager
 struct TokenManager {
-    tokens: Arc<RwLock<HashMap<String, TokenData>>>,
-    tokens_file: PathBuf,
+    tokens: HashMap<String, TokenData>,
 }
 
-impl TokenManager {
-    fn new() -> Self {
-        let tokens_file = PathBuf::from(TOKENS_FILE);
-        let tokens = Self::load_tokens(&tokens_file);
-
-        Self {
-            tokens: Arc::new(RwLock::new(tokens)),
-            tokens_file,
-        }
-    }
-
-    fn load_tokens(path: &PathBuf) -> HashMap<String, TokenData> {
-        println!("Loading tokens from: {:?}", path);
-        if !path.exists() {
-            println!("Tokens file does not exist!");
-            return HashMap::new();
-        }
-
-        match fs::read_to_string(path) {
-            Ok(content) => {
-                println!("Loaded tokens file content ({} bytes)", content.len());
-                match serde_json::from_str::<HashMap<String, TokenData>>(&content) {
-                    Ok(tokens) => {
-                        println!("Successfully parsed {} tokens", tokens.len());
-                        tokens
-                    }
-                    Err(e) => {
-                        println!("Failed to parse tokens JSON: {}", e);
-                        HashMap::new()
-                    }
-                }
-            }
-            Err(e) => {
-                println!("Failed to read tokens file: {}", e);
-                HashMap::new()
-            }
-        }
-    }
-
-    fn save_tokens(&self) -> Result<()> {
-        let tokens = self.tokens.read();
-        let content = serde_json::to_string_pretty(&*tokens)?;
-        fs::write(&self.tokens_file, content)?;
-        Ok(())
-    }
-
-    fn get_valid_token(&self, email: &str) -> Option<TokenData> {
-        println!("Looking for token for email: {}", email);
-        let tokens = self.tokens.read();
-        println!("Total tokens loaded: {}", tokens.len());
-
-        if let Some(token) = tokens.get(email) {
-            println!(
-                "Found token for {}, expires_at: {}",
-                email, token.expires_at
-            );
-            let now_millis = Utc::now().timestamp_millis();
-            let buffer_millis = 60 * 60 * 1000; // 1 hour in milliseconds
-            let is_valid = token.expires_at > (now_millis + buffer_millis);
-            println!("Current time: {}, Token valid? {}", now_millis, is_valid);
-
-            if is_valid {
-                Some(token.clone())
-            } else {
-                println!("Token expired");
-                None
-            }
-        } else {
-            println!("No token found for email: {}", email);
-            None
-        }
-    }
-
-    /*fn store_token(&self, email: String, token_data: HashMap<String, Value>) -> Result<()> {
-        let expires_in = token_data
-            .get("token_expires_in")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(604800);
-
-        let token = TokenData {
-            access_token: token_data
-                .get("access_token")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            refresh_token: token_data
-                .get("refresh_token")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            token: token_data
-                .get("token")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            expires_at: Utc::now() + Duration::seconds(expires_in),
-            user_id: token_data
-                .get("_id")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            created_at: Utc::now(),
-        };
-
-        self.tokens.write().insert(email, token);
-        self.save_tokens()?;
-        Ok(())
-    }*/
-}
-
-// WebookBot Implementation
-struct WebookBot {
+#[derive(Clone)] // Add this line
+struct BotUser {
     email: String,
-    password: String,
-    headless: bool,
-    proxy: Option<String>,
-    token_manager: Arc<TokenManager>,
+    proxy_url: String,
     client: Client,
-    browser_id: Arc<Mutex<Option<String>>>,
+    shared_data: Arc<RwLock<SharedData>>,
+    token_manager: Arc<TokenManager>,
     webook_hold_token: Arc<Mutex<Option<String>>>,
     expire_time: Arc<AtomicUsize>,
-    shared_data: Arc<TokioRwLock<SharedEventData>>,
+    browser_id: Arc<Mutex<Option<String>>>,
+    held_seats: Arc<Mutex<Vec<String>>>,
 }
-// Add this implementation right after the WebookBot struct
 
-impl std::fmt::Debug for WebookBot {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WebookBot")
-            .field("email", &self.email)
-            .field("headless", &self.headless)
-            .field("proxy", &self.proxy)
-            .finish_non_exhaustive() // Use this for structs with non-Debug fields
+#[derive(Debug, Deserialize)]
+struct ScannerMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    message: MessageData,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageData {
+    body: MessageBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageBody {
+    #[serde(rename = "objectLabel")]
+    object_label: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "holdTokenHash")]
+    hold_token_hash: Option<String>,
+    #[serde(rename = "messageType")]
+    message_type: Option<String>,
+    #[serde(rename = "holdToken")]
+    hold_token: Option<String>,
+}
+struct BotManager {
+    shared_data: Arc<RwLock<SharedData>>,
+    token_manager: Arc<TokenManager>,
+    users: Vec<BotUser>,
+    event_url: String,
+}
+
+impl Default for User {
+    fn default() -> Self {
+        Self {
+            email: String::new(),
+            user_type: "*".to_string(),
+            password: String::new(),
+            proxy: String::new(),
+            status: "Ready".to_string(),
+            expire: "0".to_string(),
+            seats: "0".to_string(),
+            last_update: "10:37:47".to_string(),
+            pay_status: "Pay".to_string(),
+            assigned_seats: Vec::new(),
+            target_seats: Vec::new(),
+            held_seats: Vec::new(),  // ADD THIS LINE
+            logs: Vec::new(),
+        }
+    }
+}
+async fn build_channel_keys_for_user(shared_data: &Arc<RwLock<SharedData>>) -> Vec<String> {
+    let mut channel_keys = vec!["NO_CHANNEL".to_string()];
+    
+    if let Ok(data) = shared_data.try_read() {
+        if let Some(common_keys) = &data.channel_key_common {
+            channel_keys.extend(common_keys.clone());
+        }
+    }
+    
+    channel_keys
+}
+impl TokenManager {
+    fn new() -> Self {
+        Self {
+            tokens: HashMap::new(),
+        }
+    }
+
+    fn load_from_file(&mut self, path: &str) -> Result<()> {
+        let content = fs::read_to_string(path)?;
+        self.tokens = serde_json::from_str(&content)?;
+        Ok(())
+    }
+
+    fn get_valid_token(&self, email: &str) -> Option<&TokenData> {
+        self.tokens.get(email).filter(|token| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            token.expires_at > now
+        })
     }
 }
 
-impl WebookBot {
+impl BotUser {
     fn new(
         email: String,
-        password: String,
-        headless: bool,
-        proxy: Option<String>,
-        shared_data: Arc<TokioRwLock<SharedEventData>>,
+        proxy_url: String, // Use the new name
+        shared_data: Arc<RwLock<SharedData>>,
+        token_manager: Arc<TokenManager>,
     ) -> Result<Self> {
-        let mut client_builder = Client::builder()
-            .timeout(StdDuration::from_secs(API_TIMEOUT))
-            .danger_accept_invalid_certs(true)
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(StdDuration::from_secs(5));
-
-        if let Some(proxy_url) = &proxy {
-            let proxy = Proxy::all(proxy_url)?;
-            client_builder = client_builder.proxy(proxy);
-        }
-
-        let client = client_builder.build()?;
+        let proxy = Proxy::all(&proxy_url)?;
+        let client = Client::builder().proxy(proxy).build()?;
 
         Ok(Self {
             email,
-            password,
-            headless,
-            proxy,
-            token_manager: Arc::new(TokenManager::new()),
+            proxy_url, // Assign to the new field
             client,
-            browser_id: Arc::new(Mutex::new(None)),
-            webook_hold_token: Arc::new(Mutex::new(None)),
-            expire_time: Arc::new(AtomicUsize::new(600)),
             shared_data,
+            token_manager,
+            webook_hold_token: Arc::new(Mutex::new(None)),
+            expire_time: Arc::new(AtomicUsize::new(0)),
+            browser_id: Arc::new(Mutex::new(None)),
+            held_seats: Arc::new(Mutex::new(Vec::new())),
         })
     }
+    async fn refresh_token_and_retake_seats(&self) -> Result<()> {
+        println!("🔄 Token expired, starting refresh process...");
+        
+        // Save current held seats before clearing
+        let seats_to_retake = {
+            let mut held = self.held_seats.lock();
+            let seats = held.clone();
+            held.clear();
+            seats
+        };
 
-    async fn update_profile(&self, favorite_team_id: &str) -> Result<bool> {
+        println!("📝 Will attempt to retake {} seats after refresh", seats_to_retake.len());
+
+        // Get new hold token
+        self.get_webook_hold_token().await?;
+        self.get_expire_time().await?;
+
+        println!("✅ New token acquired, retaking {} seats...", seats_to_retake.len());
+
+        // Build channel keys for retaking
+        let channel_keys = build_channel_keys_for_user(&self.shared_data).await;
+        let event_keys = if let Some(event_key) = self.shared_data.read().await.event_key.as_ref() {
+            vec![event_key.clone()]
+        } else {
+            return Err(anyhow::anyhow!("No event key available"));
+        };
+
+        // Immediate retake with full concurrency
+        self.retake_seats(seats_to_retake, channel_keys, event_keys).await?;
+
+        Ok(())
+    }
+    async fn release_seat(&self, seat_id: &str, event_keys: &[String]) -> Result<bool> {
+        let hold_token = self.webook_hold_token.lock().clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
+    
+        let request_body = json!({
+            "events": event_keys,
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat_id}],
+            "validateEventsLinkedToSameChart": true
+        });
+    
+        let request_body_str = request_body.to_string();
+        let signature = self.generate_signature(&request_body_str).await?;
+    
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "*/*".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
+        headers.insert("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?);
+        headers.insert("x-client-tool", "Renderer".parse()?);
+        headers.insert("x-signature", signature.parse()?);
+    
+        if let Some(browser_id) = self.browser_id.lock().as_ref() {
+            headers.insert("x-browser-id", browser_id.parse()?);
+        }
+    
+        if let Some(commit_hash) = &self.shared_data.read().await.commit_hash {
+            let referer = format!(
+                "https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={}",
+                commit_hash
+            );
+            headers.insert("referer", referer.parse()?);
+        }
+    
+        let url = format!(
+            "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/release-held-objects",
+            WORKSPACE_KEY
+        );
+    
+        let response = self.client
+            .post(&url)
+            .headers(headers)
+            .body(request_body_str)
+            .send()
+            .await?;
+    
+        let success = response.status() == 200 || response.status() == 204;
+        
+        if success {
+            // Remove from held seats
+            let mut held = self.held_seats.lock();
+            held.retain(|s| s != seat_id);
+            println!("Released seat: {}", seat_id);
+        }
+    
+        Ok(success)
+    }
+    async fn prepare_take_request(
+        &self,
+        seat_id: &str,
+        channel_keys: &[String],
+        event_keys: &[String]
+    ) -> Result<(String, reqwest::header::HeaderMap, String)> {
+        let hold_token = self.webook_hold_token.lock().clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
+    
+        let request_body = json!({
+            "events": event_keys,
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat_id}],
+            "channelKeys": channel_keys,
+            "validateEventsLinkedToSameChart": true
+        });
+    
+        let request_body_str = request_body.to_string();
+        let signature = self.generate_signature(&request_body_str).await?;
+    
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "*/*".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
+        headers.insert("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?);
+        headers.insert("x-client-tool", "Renderer".parse()?);
+        headers.insert("x-signature", signature.parse()?);
+    
+        if let Some(browser_id) = self.browser_id.lock().as_ref() {
+            headers.insert("x-browser-id", browser_id.parse()?);
+        }
+    
+        if let Some(commit_hash) = &self.shared_data.read().await.commit_hash {
+            let referer = format!(
+                "https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={}",
+                commit_hash
+            );
+            headers.insert("referer", referer.parse()?);
+        }
+    
+        let url = format!(
+            "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
+            WORKSPACE_KEY
+        );
+    
+        Ok((url, headers, request_body_str))
+    }
+    async fn retake_seats(
+        &self,
+        seats_to_retake: Vec<String>,
+        channel_keys: Vec<String>,
+        event_keys: Vec<String>,
+    ) -> Result<()> {
+        // Prepare base headers once (same as fill_assigned_seats)
+        let mut base_headers = reqwest::header::HeaderMap::new();
+        base_headers.insert("accept", "*/*".parse()?);
+        base_headers.insert("accept-language", "ar,en-US;q=0.9,en;q=0.8,fr;q=0.7".parse()?);
+        base_headers.insert("content-type", "application/json".parse()?);
+        base_headers.insert("origin", "https://cdn-eu.seatsio.net".parse()?);
+        base_headers.insert("priority", "u=1, i".parse()?);
+    
+        let browser_id = self.browser_id.lock().clone().ok_or_else(|| anyhow::anyhow!("Browser ID not available"))?;
+        base_headers.insert("x-browser-id", browser_id.parse()?);
+        base_headers.insert("x-client-tool", "Renderer".parse()?);
+    
+        if let Some(commit_hash) = &self.shared_data.read().await.commit_hash {
+            let referer = format!(
+                "https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={}",
+                commit_hash
+            );
+            base_headers.insert("referer", referer.parse()?);
+        }
+    
+        // CREATE CONCURRENT TASKS - SAME AS FILL_ASSIGNED_SEATS
+        let tasks = seats_to_retake
+            .into_iter()
+            .map(|seat| {
+                let bot_user_clone = self.clone();
+                let channel_keys_clone = channel_keys.clone();
+                let event_keys_clone = event_keys.clone();
+                let base_headers_clone = base_headers.clone();
+    
+                tokio::spawn(async move {
+                    match bot_user_clone
+                        .take_single_seat(&seat, &channel_keys_clone, &event_keys_clone, &base_headers_clone)
+                        .await
+                    {
+                        Ok(true) => {
+                            println!("User {}: Successfully retook seat {}", bot_user_clone.email, seat);
+                        }
+                        Ok(false) => {
+                            println!("User {}: Failed to retake seat {} - not available", bot_user_clone.email, seat);
+                        }
+                        Err(e) => {
+                            println!("User {}: Error retaking seat {}: {}", bot_user_clone.email, seat, e);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+    
+        // Wait for all retake attempts to complete
+        futures::future::join_all(tasks).await;
+    
+        Ok(())
+    }
+    async fn fill_assigned_seats(
+        &self,
+        target_seats: Vec<String>,
+        channel_keys: Vec<String>,
+        event_keys: Vec<String>,
+        status_sender: mpsc::UnboundedSender<String>,
+        assigned_seats_sender: mpsc::UnboundedSender<(usize, String)>,
+        user_index: usize,
+    ) -> Result<()> {
+        if target_seats.is_empty() {
+            return Ok(());
+        }
+
+        println!(
+            "User {}: Starting to attempt {} seats",
+            self.email,
+            target_seats.len()
+        );
+
+        // Prepare base headers once (optimization)
+        let mut base_headers = reqwest::header::HeaderMap::new();
+        base_headers.insert("accept", "*/*".parse()?);
+        base_headers.insert(
+            "accept-language",
+            "ar,en-US;q=0.9,en;q=0.8,fr;q=0.7".parse()?,
+        );
+        base_headers.insert("content-type", "application/json".parse()?);
+        base_headers.insert("origin", "https://cdn-eu.seatsio.net".parse()?);
+        base_headers.insert("priority", "u=1, i".parse()?);
+
+        // Add browser ID
+        let browser_id = self
+            .browser_id
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Browser ID not available"))?;
+        base_headers.insert("x-browser-id", browser_id.parse()?);
+        base_headers.insert("x-client-tool", "Renderer".parse()?);
+
+        // Add commit hash to referer
+        let shared_data = self.shared_data.read().await;
+        if let Some(commit_hash) = &shared_data.commit_hash {
+            let referer = format!(
+                "https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={}",
+                commit_hash
+            );
+            base_headers.insert("referer", referer.parse()?);
+        }
+
+        let mut successful_seats = 0;
+        let total_seats = target_seats.len();
+
+        // In BotUser::fill_assigned_seats, after you define `base_headers`...
+
+        // 1. Create a collection of tasks, one for each seat.
+        let tasks = target_seats
+            .into_iter()
+            .map(|seat| {
+                // 2. Clone all necessary data for the new concurrent task.
+                // Your BotUser struct already derives Clone, which is perfect.
+                let bot_user_clone = self.clone();
+                let channel_keys_clone = channel_keys.clone();
+                let event_keys_clone = event_keys.clone();
+                let base_headers_clone = base_headers.clone();
+                let assigned_seats_sender_clone = assigned_seats_sender.clone();
+                let status_sender_clone = status_sender.clone();
+
+                // 3. Spawn a new task for this single seat. This happens almost instantly.
+                tokio::spawn(async move {
+                    status_sender_clone
+                        .send(format!(
+                            "User {}: Attempting seat {}",
+                            bot_user_clone.email, seat
+                        ))
+                        .ok();
+
+                    match bot_user_clone
+                        .take_single_seat(
+                            &seat,
+                            &channel_keys_clone,
+                            &event_keys_clone,
+                            &base_headers_clone,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            // Send successful seat to UI thread
+                            assigned_seats_sender_clone.send((user_index, seat)).ok();
+                        }
+                        Ok(false) => {
+                            println!(
+                                "User {}: Seat {} was not available",
+                                bot_user_clone.email, seat
+                            );
+                        }
+                        Err(e) => {
+                            println!(
+                                "User {}: Error taking seat {}: {}",
+                                bot_user_clone.email, seat, e
+                            );
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>(); // Collect all the spawned tasks into a vector.
+
+        // 4. Wait for all the seat-taking HTTP requests to complete.
+        futures::future::join_all(tasks).await;
+
+        // Update status after all attempts are done.
+        // Note: You can't easily count successful seats here without more channels,
+        // but you can signal that all attempts have been made.
+        status_sender
+            .send(format!("User {}: All seat attempts completed.", self.email))
+            .ok();
+
+        Ok(())
+    }
+
+    async fn take_single_seat(
+        &self,
+        seat: &str,
+        channel_keys: &[String],
+        event_keys: &[String],
+        base_headers: &reqwest::header::HeaderMap,
+    ) -> Result<bool> {
+        let hold_token = self
+            .webook_hold_token
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
+
+        let request_body = json!({
+            "events": event_keys,
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat}],
+            "channelKeys": channel_keys,
+            "validateEventsLinkedToSameChart": true
+        });
+
+        let request_body_str = request_body.to_string();
+        let signature = self.generate_signature(&request_body_str).await?;
+
+        let mut headers = base_headers.clone();
+        headers.insert("x-signature", signature.parse()?);
+
+        let url = format!(
+            "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
+            WORKSPACE_KEY
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .headers(headers)
+            .body(request_body_str)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let success = status == 200 || status == 204; // Only these are success
+
+        if success {
+            self.held_seats.lock().push(seat.to_string());
+            println!(
+                "✓ User {}: Successfully took seat {} (Status: {})",
+                self.email, seat, status
+            );
+        } else {
+            println!(
+                "✗ User {}: Failed to take seat {} - Status: {}",
+                self.email, seat, status
+            );
+        }
+
+        Ok(success)
+    }
+
+    async fn get_webook_hold_token(&self) -> Result<()> {
         let token_data = self
             .token_manager
             .get_valid_token(&self.email)
-            .ok_or_else(|| anyhow::anyhow!("No valid token for {}", self.email))?;
+            .ok_or_else(|| anyhow::anyhow!("No valid token"))?;
 
-        let url = "https://api.webook.com/api/v2/update-profile?lang=en";
+        let shared_data = self.shared_data.read().await;
+        let event_id = shared_data
+            .event_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Event ID not available"))?;
+        println!("get_webook_hold_token for {}", self.email);
+
+        let url = "https://api.webook.com/api/v2/seats/hold-token?lang=en";
         let payload = json!({
-            "favorite_team": favorite_team_id
+            "event_id": event_id,
+            "lang": "en"
         });
 
         let response = self
             .client
             .post(url)
-            .header("accept", "application/json")
             .header(
-                "authorization",
+                "Authorization",
                 format!("Bearer {}", token_data.access_token),
             )
-            .header("content-type", "application/json")
-            .header("token", token_data.token)
+            .header("token", &token_data.token)
+            .header("Content-Type", "application/json")
             .json(&payload)
             .send()
             .await?;
 
-        Ok(response.status().is_success())
+        if response.status().is_success() {
+            let data: Value = response.json().await?;
+            println!("{:?}", data);
+            if let Some(token) = data
+                .get("data")
+                .and_then(|d| d.get("token"))
+                .and_then(|t| t.as_str())
+            {
+                *self.webook_hold_token.lock() = Some(token.to_string());
+                info!("Webook hold token received: {}", token);
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_expire_time(&self) -> Result<()> {
+        let hold_token = self
+            .webook_hold_token
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Hold token not available"))?;
+        println!("Getting expire time for {}: {}", self.email, hold_token);
+
+        let signature = self.generate_signature("").await?;
+        let browser_id = self
+            .browser_id
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Browser ID not generated"))?;
+        println!("{:?}", browser_id);
+        let url = format!(
+            "https://cdn-eu.seatsio.net/system/public/{}/hold-tokens/{}",
+            WORKSPACE_KEY, hold_token
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("x-browser-id", browser_id)
+            .header("x-client-tool", "Renderer")
+            .header("x-signature", signature)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let data: Value = response.json().await?;
+            println!("{:?}", data);
+            if let Some(expire_time) = data.get("expiresInSeconds").and_then(|v| v.as_u64()) {
+                self.expire_time
+                    .store(expire_time as usize, Ordering::Relaxed);
+            }
+        } else {
+            println!("Error response: {:?}", response);
+        }
+
+        Ok(())
+    }
+
+    fn generate_browser_id(&self) {
+        let mut browser_id = self.browser_id.lock();
+        if browser_id.is_none() {
+            let id = format!("{:016x}", rand::random::<u64>());
+            *browser_id = Some(id);
+        }
+    }
+
+    async fn generate_signature(&self, request_body: &str) -> Result<String> {
+        let shared_data = self.shared_data.read().await;
+        let chart_token = shared_data
+            .chart_token
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("chartToken required for signature"))?;
+
+        let reversed_token: String = chart_token.chars().rev().collect();
+        let data_to_hash = format!("{}{}", reversed_token, request_body);
+
+        let mut hasher = Sha256::new();
+        hasher.update(data_to_hash.as_bytes());
+        let result = hasher.finalize();
+
+        Ok(hex::encode(result))
+    }
+}
+
+fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
+    let parsed = Url::parse(event_url)?;
+    let segments: Vec<&str> = parsed
+        .path_segments()
+        .ok_or_else(|| anyhow::anyhow!("Invalid URL path"))?
+        .collect();
+
+    if segments.len() < 2 {
+        anyhow::bail!("Not enough URL segments");
+    }
+
+    Ok(segments[segments.len() - 2].to_string())
+}
+
+impl BotManager {
+    async fn new(
+        users_data: Vec<(String, String)>,
+        event_url: String,
+        shared_data: Arc<RwLock<SharedData>>,
+    ) -> Result<Self> {
+        let mut token_manager = TokenManager::new();
+        if let Err(e) = token_manager.load_from_file("tokens.json") {
+            println!("Warning: Could not load tokens.json: {}", e);
+            // Continue without tokens file
+        }
+        let token_manager = Arc::new(token_manager);
+
+        let mut users = Vec::new();
+        for (email, proxy) in users_data {
+            let user = BotUser::new(email, proxy, shared_data.clone(), token_manager.clone())?;
+            users.push(user);
+        }
+
+        Ok(Self {
+            shared_data,
+            token_manager,
+            users,
+            event_url,
+        })
     }
 
     async fn extract_seatsio_chart_data(&self) -> Result<()> {
         let url = "https://cdn-eu.seatsio.net/chart.js";
-        let response = self.client.get(url).send().await?;
+        let client = &self.users[0].client; // Use first user's client
+        let response = client.get(url).send().await?;
         let content = response.text().await?;
 
         let chart_token_regex = Regex::new(r#"seatsio\.chartToken\s*=\s*["']([^"']+)["']"#)?;
@@ -308,28 +828,26 @@ impl WebookBot {
             shared_data.commit_hash = Some(caps[1].to_string());
             info!("Found commitHash: {}", &caps[1]);
         }
-        println!("{:?}", shared_data);
+        println!("Chart data extracted: {:?}", shared_data);
         Ok(())
     }
 
     async fn send_event_detail_request(&self, event_id: &str) -> Result<()> {
         println!("send_event_detail_request");
 
-        //println!("Getting token for email: {}", self.email);
+        let first_user = &self.users[0]; // Use first user
         let token_data = self
             .token_manager
-            .get_valid_token(&self.email)
+            .get_valid_token(&first_user.email)
             .ok_or_else(|| anyhow::anyhow!("No valid token"))?;
-        //println!("Token data: {:?}", token_data);
 
         let url = format!("https://api.webook.com/api/v2/event-detail/{}", event_id);
-        //println!("Making request to: {}", url);
 
-        let response = self
+        let response = first_user
             .client
             .get(&url)
             .query(&[("lang", "en"), ("visible_in", "rs")])
-            .header("token", token_data.token)
+            .header("token", &token_data.token)
             .header("Accept", "application/json")
             .header("Origin", "https://webook.com")
             .send()
@@ -337,7 +855,6 @@ impl WebookBot {
 
         println!("Got response with status: {}", response.status());
         let data: Value = response.json().await?;
-        println!("Response data: {:?}", data);
 
         let mut shared_data = self.shared_data.write().await;
 
@@ -363,26 +880,22 @@ impl WebookBot {
                             .collect()
                     });
 
-                shared_data.channel_key = serde_json::from_value(channel_keys.clone()).ok();
+                shared_data.channel_key = Some(channel_keys.clone());
             }
 
             shared_data.event_id = event_data
                 .get("_id")
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            shared_data.home_team = event_data
-                .get("home_team")
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
-            shared_data.away_team = event_data
-                .get("away_team")
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
+            shared_data.home_team = event_data.get("home_team").cloned();
+            shared_data.away_team = event_data.get("away_team").cloned();
         }
-        //println!("{:?}", shared_data);
         Ok(())
     }
 
     async fn get_rendering_info(&self) -> Result<()> {
-        self.generate_browser_id();
+        let first_user = &self.users[0];
+        //first_user.generate_browser_id();
         println!("get_rendering_info");
 
         let shared_data = self.shared_data.read().await;
@@ -396,9 +909,9 @@ impl WebookBot {
             WORKSPACE_KEY
         );
 
-        let signature = self.generate_signature("").await?;
+        let signature = first_user.generate_signature("").await?;
 
-        let response = self
+        let response = first_user
             .client
             .get(&url)
             .query(&[("event_key", event_key)])
@@ -434,489 +947,1676 @@ impl WebookBot {
             }
         }
         shared_data.channels = Some(all_objects);
-        println!("{:?}", shared_data);
+        println!("Rendering info: {:?}", shared_data);
         Ok(())
     }
+    async fn start_bot(&self, status_sender: mpsc::UnboundedSender<String>) -> Result<()> {
+        status_sender.send("Starting bot...".to_string()).ok();
 
-    fn generate_browser_id(&self) {
-        let mut browser_id = self.browser_id.lock();
-        if browser_id.is_none() {
-            let id = format!("{:016x}", rand::random::<u64>());
-            *browser_id = Some(id);
-        }
-    }
+        // Extract event ID from URL
+        let event_id = extract_event_key(&self.event_url)?;
 
-    async fn generate_signature(&self, request_body: &str) -> Result<String> {
-        let shared_data = self.shared_data.read().await;
-        let chart_token = shared_data
-            .chart_token
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("chartToken required for signature"))?;
+        // Step 1: Extract seatsio chart data (shared)
+        status_sender
+            .send("Extracting chart data...".to_string())
+            .ok();
 
-        let reversed_token: String = chart_token.chars().rev().collect();
-        let data_to_hash = format!("{}{}", reversed_token, request_body);
+        self.extract_seatsio_chart_data().await?;
 
-        let mut hasher = Sha256::new();
-        hasher.update(data_to_hash.as_bytes());
-        let result = hasher.finalize();
+        // Step 2: Get event details (shared)
+        status_sender
+            .send("Getting event details...".to_string())
+            .ok();
+        self.send_event_detail_request(&event_id).await?;
 
-        Ok(hex::encode(result))
-    }
+        // Step 3: Get rendering info (shared)
+        status_sender
+            .send("Getting rendering info...".to_string())
+            .ok();
+        self.get_rendering_info().await?;
 
-    
-    async fn get_webook_hold_token(&self) -> Result<()> {
-        let token_data = self
-            .token_manager
-            .get_valid_token(&self.email)
-            .ok_or_else(|| anyhow::anyhow!("No valid token"))?;
-        
-        let shared_data = self.shared_data.read().await;
-        let event_id = shared_data
-            .event_id
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Event ID not available"))?;
-        println!("get_webook_hold_token");
+        // Step 4: Get individual user data (parallel)
+        status_sender
+            .send("Getting user tokens...".to_string())
+            .ok();
+        // Replace with:
+        // In BotManager::start_bot method, replace the user loop:
+        for user in &self.users {
+            // Generate browser ID for this user if they don't have one
+            user.generate_browser_id(); // This will create unique ID only if None
 
-        let url = "https://api.webook.com/api/v2/seats/hold-token?lang=en";
-        let payload = json!({
-            "event_id": event_id,
-            "lang": "en"
-        });
-
-        let response = self
-            .client
-            .post(url)
-            .header(
-                "Authorization",
-                format!("Bearer {}", token_data.access_token),
-            )
-            .header("token", token_data.token)
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            let data: Value = response.json().await?;
-            println!("{:?}", data);
-            if let Some(token) = data
-                .get("data")
-                .and_then(|d| d.get("token"))
-                .and_then(|t| t.as_str())
-            {
-                *self.webook_hold_token.lock() = Some(token.to_string());
-                info!("Webook hold token received: {}", token);
-            }
-        }
-        println!("get_webook_hold_token2");
-        Ok(())
-    }
-
-    async fn get_expire_time(&self) -> Result<()> {
-        let hold_token = self
-            .webook_hold_token
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Hold token not available"))?;
-        println!("{:?}", hold_token);
-
-        let signature = self.generate_signature("").await?;
-        let browser_id = self
-            .browser_id
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Browser ID not generated"))?;
-
-        let url = format!(
-            "https://cdn-eu.seatsio.net/system/public/{}/hold-tokens/{}",
-            WORKSPACE_KEY, hold_token
-        );
-
-        let response = self
-            .client
-            .get(&url)
-            .header("x-browser-id", browser_id)
-            .header("x-client-tool", "Renderer")
-            .header("x-signature", signature)
-            .send()
-            .await?;
-
-        if response.status().is_success() {
-            let data: Value = response.json().await?;
-            println!("{:?}", data);
-            if let Some(expire_time) = data.get("expiresInSeconds").and_then(|v| v.as_u64()) {
-                self.expire_time
-                    .store(expire_time as usize, Ordering::Relaxed);
-            }
-        } else {
-            println!("{:?}", response)
-        }
-
-        Ok(())
-    }
-
-    async fn take_seat(&self, seat_id: &str, channel_keys: Vec<String>) -> Result<bool> {
-        let shared_data = self.shared_data.read().await;
-        let event_key = shared_data
-            .event_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Event key not available"))?;
-
-        let hold_token = self
-            .webook_hold_token
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Hold token not available"))?;
-
-        let request_body = json!({
-            "events": [event_key],
-            "holdToken": hold_token,
-            "objects": [{"objectId": seat_id}],
-            "channelKeys": channel_keys,
-            "validateEventsLinkedToSameChart": true
-        });
-
-        let request_body_str = serde_json::to_string(&request_body)?;
-        let signature = self.generate_signature(&request_body_str).await?;
-        let browser_id = self
-            .browser_id
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Browser ID not generated"))?;
-
-        let url = format!(
-            "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
-            WORKSPACE_KEY
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("x-browser-id", browser_id)
-            .header("x-client-tool", "Renderer")
-            .header("x-signature", signature)
-            .body(request_body_str)
-            .send()
-            .await?;
-
-        Ok(response.status().is_success())
-    }
-
-    async fn release_seat(&self, seat_id: &str) -> Result<bool> {
-        let shared_data = self.shared_data.read().await;
-        let event_key = shared_data
-            .event_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Event key not available"))?;
-
-        let hold_token = self
-            .webook_hold_token
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Hold token not available"))?;
-
-        let request_body = json!({
-            "events": [event_key],
-            "holdToken": hold_token,
-            "objects": [{"objectId": seat_id}],
-            "validateEventsLinkedToSameChart": true
-        });
-
-        let request_body_str = serde_json::to_string(&request_body)?;
-        let signature = self.generate_signature(&request_body_str).await?;
-        let browser_id = self
-            .browser_id
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Browser ID not generated"))?;
-
-        let url = format!(
-            "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/release-held-objects",
-            WORKSPACE_KEY
-        );
-
-        let response = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("x-browser-id", browser_id)
-            .header("x-client-tool", "Renderer")
-            .header("x-signature", signature)
-            .body(request_body_str)
-            .send()
-            .await?;
-
-        Ok(response.status().is_success())
-    }
-
-    /* async fn login_with_browser(&self) -> Result<TokenData> {
-        // Check for existing valid token
-        if let Some(token) = self.token_manager.get_valid_token(&self.email) {
-            info!("Using existing valid token for {}", self.email);
-            return Ok(token);
-        }
-
-        info!("Starting browser login for {}", self.email);
-
-        let mut config = BrowserConfig::builder();
-        if !self.headless {
-            // Correction: Check for !self.headless to show browser
-            config = config.with_head();
-        }
-
-        if let Some(proxy_url) = &self.proxy {
-            // FIX 1: The method is `arg`, not `proxy_server`.
-            config = config.arg(format!("--proxy-server={}", proxy_url));
-        }
-
-        let (browser, mut handler) =
-            Browser::launch(config.build().map_err(|e| anyhow::anyhow!(e))?).await?;
-
-        tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                if let Err(e) = event {
-                    error!("Browser event error: {}", e);
+            for attempt in 1..=3 {
+                status_sender
+                    .send(format!(
+                        "User {}: Attempt {} - Getting hold token",
+                        user.email, attempt
+                    ))
+                    .ok();
+                match user.get_webook_hold_token().await {
+                    Ok(_) => {
+                        status_sender
+                            .send(format!("User {}: Getting expire time", user.email))
+                            .ok();
+                        if let Err(e) = user.get_expire_time().await {
+                            status_sender
+                                .send(format!(
+                                    "User {}: Error getting expire time: {}",
+                                    user.email, e
+                                ))
+                                .ok();
+                            println!("Expire time error for {}: {}", user.email, e);
+                        } else {
+                            status_sender
+                                .send(format!("User {}: Success", user.email))
+                                .ok();
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        status_sender
+                            .send(format!(
+                                "User {}: Attempt {} failed: {}",
+                                user.email, attempt, e
+                            ))
+                            .ok();
+                        if attempt == 3 {
+                            status_sender
+                                .send(format!("User {}: All attempts failed", user.email))
+                                .ok();
+                        }
+                    }
                 }
             }
+        }
+        status_sender
+            .send("Bot initialization complete!".to_string())
+            .ok();
+        Ok(())
+    }
+}
+
+impl WebbookBot {
+    pub fn new() -> Self {
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+
+        let mut app = Self {
+            event_url: "https://webook.com/en/events/spl-25-26-al-fateh".to_string(),
+            seats: "1".to_string(),
+            d_seats: "1".to_string(),
+            favorite_team: "home".to_string(),
+            sections_status: "Waiting for event data...".to_string(),
+            bot_running: false,
+            teams: vec![
+                "home".to_string(),
+                "away".to_string(),
+                "neutral".to_string(),
+            ],
+            users: vec![User {
+                email: "alzeen.42@outlook.com".to_string(),
+                user_type: "*".to_string(),
+                password: "Bb654321@".to_string(),
+                proxy: "http://spurs72ctg:5kolK...".to_string(),
+                ..Default::default()
+            }],
+            proxies: vec![],
+            rt: Some(rt),
+            bot_manager: None,
+            status_receiver: None,
+            selected_sections: HashMap::new(),
+            shared_data: None, // ADD THIS LINE
+            bot_manager_receiver: None,
+            expire_receiver: None,         // This exists
+            assigned_seats_receiver: None, // This exists
+            ctx: None,           
+            scanner_running: false,
+            reserved_seats_map: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            ready_star_users: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            next_user_index: Arc::new(AtomicUsize::new(0)),
+            ws_connection: None,
+            show_transfer_modal: false,
+            transfer_from_user: String::new(),
+            transfer_to_user: String::new(),
+            show_logs_modal: false,
+            selected_user_logs: Vec::new(),
+            selected_user_email: String::new(),
+            telegram_bot: None,
+            captcha_solver: None,
+            recaptcha_site_key: None,
+            payment_links: HashMap::new(),
+            show_payment_modal: false,
+            selected_payment_user: String::new(),
+            payment_url: String::new(),
+        };
+                // Initialize services
+        if let Err(e) = app.init_telegram() {
+            println!("Failed to initialize Telegram: {}", e);
+        }
+        app.init_captcha_solver();
+        app
+    }
+    async fn log_scanner_stats(&mut self) {
+        let ready_count = self.ready_star_users.lock().await.len();
+        let reserved_tokens = self.reserved_seats_map.lock().await.len();
+        let total_reserved_seats: usize = self.reserved_seats_map.lock().await
+            .values()
+            .map(|seats| seats.len())
+            .sum();
+        
+        if ready_count > 0 || reserved_tokens > 0 {
+            println!("📊 Scanner Stats - Ready Users: {}, Reserved Tokens: {}, Reserved Seats: {}", 
+                ready_count, reserved_tokens, total_reserved_seats);
+        }
+    }
+    fn add_detailed_log(&mut self, user_index: usize, log_type: &str, message: &str) {
+        let formatted_message = match log_type {
+            "success" => format!("✅ {}", message),
+            "error" => format!("❌ {}", message),
+            "warning" => format!("⚠️ {}", message),
+            "info" => format!("ℹ️ {}", message),
+            "rocket" => format!("🚀 {}", message),
+            "transfer" => format!("🔄 {}", message),
+            "scanner" => format!("📡 {}", message),
+            "payment" => format!("💳 {}", message),
+            "captcha" => format!("🤖 {}", message),
+            _ => message.to_string(),
+        };
+        
+        self.add_log(user_index, &formatted_message);
+    }
+
+    fn log_bot_start(&mut self, user_index: usize) {
+        self.add_detailed_log(user_index, "rocket", "Bot started");
+    }
+
+    fn log_seat_success(&mut self, user_index: usize, seat_id: &str) {
+        self.add_detailed_log(user_index, "success", &format!("SEAT: {}", seat_id));
+    }
+
+    fn log_scanner_success(&mut self, user_index: usize, seat_id: &str) {
+        self.add_detailed_log(user_index, "scanner", &format!("Booked {}", seat_id));
+    }
+
+    fn log_transfer_start(&mut self, user_index: usize, seat_count: usize) {
+        self.add_detailed_log(user_index, "transfer", &format!("Starting ULTRA-FAST seat transfer: {} seats", seat_count));
+    }
+    fn init_telegram(&mut self) -> Result<()> {
+        let telegram_bot = TelegramBot {
+            token: "YOUR_BOT_TOKEN".to_string(), // Replace with actual token
+            chat_id: -4952333786, // Your group ID
+            client: Client::new(),
+        };
+        self.telegram_bot = Some(telegram_bot);
+        Ok(())
+    }
+
+    async fn send_telegram_notification(&self, message: &str) -> Result<()> {
+        if let Some(bot) = &self.telegram_bot {
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", bot.token);
+            let payload = json!({
+                "chat_id": bot.chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            });
+
+            let _response = bot.client
+                .post(&url)
+                .json(&payload)
+                .send()
+                .await?;
+            
+            println!("📱 Telegram notification sent");
+        }
+        Ok(())
+    }
+
+    async fn notify_transfer_complete(&self, from_email: &str, to_email: &str, count: usize) {
+        let message = format!(
+            "🔄 <b>SEAT TRANSFER</b>\n\
+             ━━━━━━━━━━━━━━━━\n\
+             From: {}\n\
+             To: {}\n\
+             Seats Transferred: {}\n\
+             ━━━━━━━━━━━━━━━━",
+            from_email, to_email, count
+        );
+        
+        if let Err(e) = self.send_telegram_notification(&message).await {
+            println!("Failed to send transfer notification: {}", e);
+        }
+    }
+
+    async fn notify_expiry_warning(&self, email: &str, seats_held: usize) {
+        let message = format!(
+            "⚠️ <b>EXPIRY WARNING</b>\n\
+             ━━━━━━━━━━━━━━━━\n\
+             🔧 Account: {}\n\
+             💺 Seats Held: {}\n\
+             ⏰ Time Left: <100 seconds\n\
+             ━━━━━━━━━━━━━━━━",
+            email, seats_held
+        );
+        
+        if let Err(e) = self.send_telegram_notification(&message).await {
+            println!("Failed to send expiry warning: {}", e);
+        }
+    }
+
+    async fn notify_seats_taken(&self, email: &str, seats_count: usize, success: bool, total_held: usize, max_seats: usize) {
+        let status = if success { "✅ SUCCESS" } else { "❌ FAILED" };
+        
+        let message = format!(
+            "🎫 <b>SEAT TAKING {}</b>\n\
+             ━━━━━━━━━━━━━━━━\n\
+             🔧 Account: {}\n\
+             💺 Seats Taken: {}\n\
+             📊 Total Held: {}/{}\n\
+             ━━━━━━━━━━━━━━━━",
+            status, email, seats_count, total_held, max_seats
+        );
+        
+        if let Err(e) = self.send_telegram_notification(&message).await {
+            println!("Failed to send seats notification: {}", e);
+        }
+    }
+
+    async fn notify_payment_link(&self, email: &str, seats_held: usize, link: &str) {
+        let message = format!(
+            "💳 <b>PAYMENT LINK GENERATED</b>\n\
+             ━━━━━━━━━━━━━━━━\n\
+             🔧 User: {}\n\
+             🎫 Seats: {}\n\
+             🔗 Link: {}\n\
+             ━━━━━━━━━━━━━━━━",
+            email, seats_held, link
+        );
+        
+        if let Err(e) = self.send_telegram_notification(&message).await {
+            println!("Failed to send payment notification: {}", e);
+        }
+    }
+    fn init_captcha_solver(&mut self) {
+        self.captcha_solver = Some(CaptchaSolver {
+            api_key: "103557152daa870999b42554fa1f2967".to_string(), // Your 2captcha key
+            client: Client::new(),
         });
+    }
 
-        let page = browser.new_page("https://webook.com/en/login").await?;
+    async fn extract_recaptcha_site_key(&self) -> Result<String> {
+        let client = Client::new();
+        let response = client
+            .get("http://localhost:3000/extractcaptcha")
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await?;
 
-        // Wait for page load
-        page.wait_for_navigation().await?;
-        sleep(StdDuration::from_secs(2)).await;
+        let result: serde_json::Value = response.json().await?;
+        
+        if let Some(site_key) = result.get("siteKey").and_then(|v| v.as_str()) {
+            println!("🔑 reCAPTCHA site key extracted: {}", site_key);
+            Ok(site_key.to_string())
+        } else {
+            Err(anyhow::anyhow!("Failed to extract site key"))
+        }
+    }
 
-        // Handle cookie consent
-        if let Ok(cookie_button) = page.find_element("button:has-text('Accept all')").await {
-            cookie_button.click().await?;
-            sleep(StdDuration::from_millis(1000)).await;
+    async fn solve_captcha(&self, website_url: &str, site_key: &str) -> Result<String> {
+        if let Some(solver) = &self.captcha_solver {
+            println!("🤖 Solving captcha...");
+            
+            // Create task
+            let task_payload = json!({
+                "clientKey": solver.api_key,
+                "task": {
+                    "type": "RecaptchaV2TaskProxyless",
+                    "websiteURL": website_url,
+                    "websiteKey": site_key,
+                    "isInvisible": true
+                }
+            });
+
+            let create_response: CaptchaTaskResponse = solver.client
+                .post("https://api.2captcha.com/createTask")
+                .json(&task_payload)
+                .send()
+                .await?
+                .json()
+                .await?;
+
+            if create_response.error_id != 0 {
+                return Err(anyhow::anyhow!("Captcha task creation failed"));
+            }
+
+            let task_id = create_response.task_id.ok_or_else(|| anyhow::anyhow!("No task ID"))?;
+            println!("📝 Captcha task created: {}", task_id);
+
+            // Poll for result
+            for _ in 0..30 { // 30 attempts, 5 seconds each = 2.5 minutes max
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                let result_payload = json!({
+                    "clientKey": solver.api_key,
+                    "taskId": task_id
+                });
+
+                let result_response: CaptchaResultResponse = solver.client
+                    .post("https://api.2captcha.com/getTaskResult")
+                    .json(&result_payload)
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+
+                match result_response.status.as_str() {
+                    "ready" => {
+                        if let Some(solution) = result_response.solution {
+                            println!("✅ Captcha solved successfully!");
+                            return Ok(solution.g_recaptcha_response);
+                        }
+                    },
+                    "processing" => {
+                        println!("⏳ Captcha still processing...");
+                        continue;
+                    },
+                    _ => return Err(anyhow::anyhow!("Captcha solving failed"))
+                }
+            }
+
+            Err(anyhow::anyhow!("Captcha solving timeout"))
+        } else {
+            Err(anyhow::anyhow!("Captcha solver not initialized"))
+        }
+    }
+    async fn generate_payment_link(&mut self, user_index: usize) -> Result<String> {
+        if user_index >= self.users.len() {
+            return Err(anyhow::anyhow!("Invalid user index"));
         }
 
-        // Fill login form
-        let email_input = page
-            .find_element("input[data-testid='auth_login_email_input']")
-            .await?;
-        email_input.click().await?;
-        email_input.type_str(&self.email).await?;
+        let user_email = self.users[user_index].email.clone();
+        let held_seats = self.users[user_index].held_seats.clone();
 
-        sleep(StdDuration::from_millis(500)).await;
+        if held_seats.is_empty() {
+            return Err(anyhow::anyhow!("User has no seats to pay for"));
+        }
 
-        let password_input = page
-            .find_element("input[data-testid='auth_login_password_input']")
-            .await?;
-        password_input.click().await?;
-        password_input.type_str(&self.password).await?;
-
-        sleep(StdDuration::from_millis(500)).await;
-
-        // Submit login
-        let login_button = page
-            .find_element("button[data-testid='auth_login_submit_button']")
-            .await?;
-        login_button.click().await?;
-
-        // Wait for navigation
-        page.wait_for_navigation().await?;
-        sleep(StdDuration::from_secs(3)).await;
-
-        // FIX 2 & 3: Correctly extract tokens from localStorage
-        let token = page
-            .evaluate("localStorage.getItem('token')")
-            .await?
-            .into_value::<Option<String>>()?
-            .unwrap_or_default();
-
-        let access_token = page
-            .evaluate("localStorage.getItem('access_token')")
-            .await?
-            .into_value::<Option<String>>()?
-            .unwrap_or_default();
-
-        // browser.close().await?;
-
-        let token_data = TokenData {
-            access_token,
-            refresh_token: None,
-            token,
-            expires_at: Utc::now() + Duration::days(7),
-            user_id: None,
-            created_at: Utc::now(),
+        // Get captcha solution
+        let site_key = if let Some(key) = &self.recaptcha_site_key {
+            key.clone()
+        } else {
+            let key = self.extract_recaptcha_site_key().await?;
+            self.recaptcha_site_key = Some(key.clone());
+            key
         };
 
-        self.token_manager
-            .tokens
-            .write()
-            .insert(self.email.clone(), token_data.clone());
-        self.token_manager.save_tokens()?;
+        let captcha_solution = self.solve_captcha("https://webook.com/", &site_key).await?;
 
-        Ok(token_data)
-    }*/
-}
+        // Build payment request (simplified - you'll need to adapt based on your backend)
+        let payment_payload = json!({
+            "user_email": user_email,
+            "held_seats": held_seats,
+            "captcha": captcha_solution,
+            "event_id": "your_event_id" // Get from shared_data
+        });
 
-// Seat Scanner
-struct SeatScanner {
-    workspace_key: String,
-    event_key: Arc<RwLock<Option<String>>>,
-    season_structure: Arc<RwLock<Option<String>>>,
-    is_running: Arc<AtomicBool>,
-    users: Arc<RwLock<Vec<Arc<User>>>>,
-    ready_user_queue: Arc<Mutex<VecDeque<PreparedRequest>>>,
-    selected_sections: Arc<RwLock<Vec<String>>>,
-    reserved_seats: Arc<DashMap<String, Vec<String>>>,
-}
+        let client = Client::new();
+        let response = client
+            .post("http://localhost:3000/generate-payment") // Your backend endpoint
+            .json(&payment_payload)
+            .send()
+            .await?;
 
-#[derive(Clone)]
-struct PreparedRequest {
-    user_email: String,
-    url: String,
-    headers: HashMap<String, String>,
-    body_template: Value,
-    chart_token: String,
-    client: Client,
-}
-
-impl SeatScanner {
-    fn new() -> Self {
-        Self {
-            workspace_key: WORKSPACE_KEY.to_string(),
-            event_key: Arc::new(RwLock::new(None)),
-            season_structure: Arc::new(RwLock::new(None)),
-            is_running: Arc::new(AtomicBool::new(false)),
-            users: Arc::new(RwLock::new(Vec::new())),
-            ready_user_queue: Arc::new(Mutex::new(VecDeque::new())),
-            selected_sections: Arc::new(RwLock::new(Vec::new())),
-            reserved_seats: Arc::new(DashMap::new()),
+        let result: serde_json::Value = response.json().await?;
+        
+        if let Some(payment_url) = result.get("payment_url").and_then(|v| v.as_str()) {
+            println!("💳 Payment link generated for {}: {}", user_email, payment_url);
+            
+            // Store payment link
+            self.payment_links.insert(user_email.clone(), payment_url.to_string());
+            
+            // Send notification
+            if let Some(rt) = &self.rt {
+                // Clone only what we need
+                let telegram_bot_clone = self.telegram_bot.clone();
+                let email_clone = user_email.clone();
+                let link_clone = payment_url.to_string();
+                let seats_count = held_seats.len();
+                
+                rt.spawn(async move {
+                    // Call the notification directly with the cloned telegram bot
+                    if let Some(bot) = &telegram_bot_clone {
+                        let message = format!(
+                            "💳 <b>PAYMENT LINK GENERATED</b>\n\
+                             ━━━━━━━━━━━━━━━━\n\
+                             🔧 User: {}\n\
+                             🎫 Seats: {}\n\
+                             🔗 Link: {}\n\
+                             ━━━━━━━━━━━━━━━━",
+                            email_clone, seats_count, link_clone
+                        );
+                        
+                        let url = format!("https://api.telegram.org/bot{}/sendMessage", bot.token);
+                        let payload = serde_json::json!({
+                            "chat_id": bot.chat_id,
+                            "text": message,
+                            "parse_mode": "HTML"
+                        });
+            
+                        if let Ok(_response) = bot.client
+                            .post(&url)
+                            .json(&payload)
+                            .send()
+                            .await 
+                        {
+                            println!("📱 Payment notification sent to Telegram");
+                        }
+                    }
+                });
+            }
+            
+            Ok(payment_url.to_string())
+        } else {
+            Err(anyhow::anyhow!("Failed to generate payment link"))
         }
     }
 
-    async fn set_event_key(&self, event_key: String, season_structure: Option<String>) {
-        *self.event_key.write() = Some(event_key);
-        *self.season_structure.write() = season_structure;
+    fn show_payment_modal(&mut self, user_email: String) {
+        self.selected_payment_user = user_email;
+        self.show_payment_modal = true;
     }
 
-    async fn set_users(&self, users: Vec<Arc<User>>) {
-        *self.users.write() = users.clone();
+    fn render_payment_modal(&mut self, ctx: &egui::Context) {
+        let mut close_modal = false;
+        
+        egui::Window::new("Payment Link")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if self.payment_url.is_empty() {
+                    ui.label("Generating payment link...");
+                    ui.spinner();
+                    
+                    // Generate link asynchronously
+                    let user_index = self.users.iter().position(|u| u.email == self.selected_payment_user);
+                    if let Some(index) = user_index {
+                        if let Some(rt) = &self.rt {
+                            // This is tricky in egui - you'd need a channel to communicate back
+                            // For now, just show loading
+                        }
+                    }
+                } else {
+                    ui.label("Payment Link Generated:");
+                    
+                    let mut payment_url = self.payment_url.clone();
+                    ui.add(egui::TextEdit::singleline(&mut payment_url).desired_width(400.0));
+                    
+                    if ui.button("Copy").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.payment_url.clone());
+                    }
+                    
+                    if ui.button("Open").clicked() {
+                        if let Err(e) = webbrowser::open(&self.payment_url) {
+                            println!("Failed to open browser: {}", e);
+                        }
+                    }
+                }
+                
+                if ui.button("Close").clicked() {
+                    close_modal = true;
+                }
+            });
+        
+        if close_modal {
+            self.show_payment_modal = false;
+            self.payment_url.clear();
+            self.selected_payment_user.clear();
+        }
+    }
+    fn add_log(&mut self, user_index: usize, message: &str) {
+        if user_index < self.users.len() {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            
+            let log_entry = format!("[{}] {}", 
+                Self::format_timestamp(timestamp), 
+                message
+            );
+            
+            self.users[user_index].logs.push(log_entry);
+        }
+    }
+    
+    fn format_timestamp(timestamp: u64) -> String {
+        // Simple time formatting - you can improve this
+        let hours = (timestamp / 3600) % 24;
+        let minutes = (timestamp / 60) % 60;
+        let seconds = timestamp % 60;
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
+    
+    fn show_logs_modal(&mut self, ctx: &egui::Context) {
+        let mut close_modal = false;
+        
+        egui::Window::new(&format!("Logs for {}", self.selected_user_email))
+            .default_size([800.0, 600.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.selected_user_logs.is_empty() {
+                            ui.label("No logs available");
+                        } else {
+                            for log_entry in &self.selected_user_logs {
+                                ui.label(log_entry);
+                            }
+                        }
+                    });
+                
+                ui.separator();
+                
+                if ui.button("Close").clicked() {
+                    close_modal = true;
+                }
+            });
+        
+        if close_modal {
+            self.show_logs_modal = false;
+            self.selected_user_logs.clear();
+            self.selected_user_email.clear();
+        }
+    }
+    fn show_transfer_modal(&mut self, ctx: &egui::Context) {
+        let mut close_modal = false;
+    
+            egui::Window::new("Transfer Seats")
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| { 
+                ui.vertical(|ui| {
+                    // Get users by type
+                    let star_users: Vec<String> = self.users.iter()
+                        .filter(|u| u.user_type == "*")
+                        .map(|u| u.email.clone())
+                        .collect();
+    
+                    let plus_users: Vec<String> = self.users.iter()
+                        .filter(|u| u.user_type == "+")
+                        .map(|u| u.email.clone())
+                        .collect();
+    
+                    // From user (*)
+                    ui.horizontal(|ui| {
+                        ui.label("From (*) user:");
+                        egui::ComboBox::from_id_source("from_user")
+                            .selected_text(&self.transfer_from_user)
+                            .show_ui(ui, |ui| {
+                                for user in &star_users {
+                                    ui.selectable_value(&mut self.transfer_from_user, user.clone(), user);
+                                }
+                            });
+                    });
+    
+                    // To user (+)
+                    ui.horizontal(|ui| {
+                        ui.label("To (+) user:");
+                        egui::ComboBox::from_id_source("to_user")
+                            .selected_text(&self.transfer_to_user)
+                            .show_ui(ui, |ui| {
+                                for user in &plus_users {
+                                    ui.selectable_value(&mut self.transfer_to_user, user.clone(), user);
+                                }
+                            });
+                    });
+    
+                    ui.separator();
+    
+                    // Validation and info
+                    let from_user_seats = self.users.iter()
+                        .find(|u| u.email == self.transfer_from_user)
+                        .map(|u| u.held_seats.len())
+                        .unwrap_or(0);
+    
+                    let to_user_seats = self.users.iter()
+                        .find(|u| u.email == self.transfer_to_user)
+                        .map(|u| u.held_seats.len())
+                        .unwrap_or(0);
+    
+                    let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+    
+                    ui.label(format!("From user has {} seats", from_user_seats));
+                    ui.label(format!("To user has {}/{} seats", to_user_seats, d_seats_limit));
+    
+                    ui.separator();
+    
+                    // Buttons
+                    ui.horizontal(|ui| {
+                        let can_transfer = !self.transfer_from_user.is_empty() 
+                            && !self.transfer_to_user.is_empty()
+                            && from_user_seats > 0
+                            && (d_seats_limit == 0 || to_user_seats < d_seats_limit);
+    
+                        if ui.add_enabled(can_transfer, egui::Button::new("Transfer")).clicked() {
+                            // Find user indices
+                            let from_index = self.users.iter().position(|u| u.email == self.transfer_from_user);
+                            let to_index = self.users.iter().position(|u| u.email == self.transfer_to_user);
+    
+                            if let (Some(from_idx), Some(to_idx)) = (from_index, to_index) {
+                                self.execute_transfer(from_idx, to_idx);
+                            }
+                            close_modal = true;
+                        }
+    
+                        if ui.button("Cancel").clicked() {
+                            close_modal = true;
+                        }
+                    });
+                });
+            });
+    
+        if close_modal {
+            self.show_transfer_modal = false;
+            self.transfer_from_user.clear();
+            self.transfer_to_user.clear();
+        }
+    }  
+    fn execute_transfer(&mut self, from_user_index: usize, to_user_index: usize) {
+        // Extract data before borrowing to avoid borrow conflicts
+        let seats_count = if from_user_index < self.users.len() {
+            self.users[from_user_index].held_seats.len()
+        } else {
+            0
+        };
+        let from_user_email = if from_user_index < self.users.len() {
+            self.users[from_user_index].email.clone()
+        } else {
+            "Unknown".to_string()
+        };
+        
+        // Add logs first, outside the borrow
+        self.add_log(from_user_index, &format!("📤 Transfer starting: {} seats", seats_count));
+        self.add_log(to_user_index, &format!("📥 Receiving transfer from {}", from_user_email));
+        
+        // Clone what we need to avoid borrow conflicts
+        let bot_manager = if let Some(manager) = &self.bot_manager {
+            manager.clone()
+        } else {
+            return;
+        };
+        
+        let rt = if let Some(runtime) = &self.rt {
+            runtime
+        } else {
+            return;
+        };
+        
+        let from_user = bot_manager.users[from_user_index].clone();
+        let to_user = bot_manager.users[to_user_index].clone();
+        
+        // Get seats to transfer
+        let seats_to_transfer = from_user.held_seats.lock().clone();
+        let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+    
+        println!("Starting transfer: {} seats from {} to {}", 
+            seats_to_transfer.len(), from_user.email, to_user.email);
+    
+        rt.spawn(async move {
+            let channel_keys = vec!["NO_CHANNEL".to_string()]; // Simplified
+            let event_keys = if let Ok(data) = from_user.shared_data.try_read() {
+                if let Some(event_key) = &data.event_key {
+                    vec![event_key.clone()]
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            };
+    
+            let mut successful_transfers = 0;
+    
+            for seat_id in seats_to_transfer {
+                // Check if to_user is at limit
+                let to_user_seat_count = to_user.held_seats.lock().len();
+                if d_seats_limit > 0 && to_user_seat_count >= d_seats_limit {
+                    println!("Target user reached seat limit, stopping transfer");
+                    break;
+                }
+    
+                // Perform atomic transfer
+                match Self::atomic_transfer_seat(&from_user, &to_user, &seat_id, &channel_keys, &event_keys).await {
+                    Ok(true) => {
+                        successful_transfers += 1;
+                        println!("Successfully transferred seat: {}", seat_id);
+                    }
+                    Ok(false) => {
+                        println!("Failed to transfer seat: {}", seat_id);
+                        break; // Stop on first failure
+                    }
+                    Err(e) => {
+                        println!("Transfer error for seat {}: {}", seat_id, e);
+                        break;
+                    }
+                }
+            }
+    
+            println!("Transfer complete: {} seats transferred successfully", successful_transfers);
+        });
+    }
+    
+    async fn atomic_transfer_seat(
+        from_user: &BotUser,
+        to_user: &BotUser, 
+        seat_id: &str,
+        channel_keys: &[String],
+        event_keys: &[String]
+    ) -> Result<bool> {
+        // Step 1: Pre-build the take request for target user
+        let (take_url, take_headers, take_body) = to_user.prepare_take_request(
+            seat_id, 
+            channel_keys, 
+            event_keys
+        ).await?;
+    
+        // Step 2: Release seat from source user
+        if !from_user.release_seat(seat_id, event_keys).await? {
+            return Ok(false);
+        }
+    
+        // Step 3: IMMEDIATELY fire the pre-built take request (NO DELAY)
+        let response = to_user.client
+            .post(&take_url)
+            .headers(take_headers)
+            .body(take_body)
+            .send()
+            .await?;
+    
+        let success = response.status() == 200 || response.status() == 204;
+    
+        if success {
+            // Update target user's held seats
+            to_user.held_seats.lock().push(seat_id.to_string());
+            println!("Atomic transfer SUCCESS: {}", seat_id);
+        } else {
+            // Try to restore seat to original user if take failed
+            let restore_channel_keys = vec!["NO_CHANNEL".to_string()];
+            if let Ok((restore_url, restore_headers, restore_body)) = from_user.prepare_take_request(
+                seat_id, 
+                &restore_channel_keys, 
+                event_keys
+            ).await {
+                let _ = from_user.client
+                    .post(&restore_url)
+                    .headers(restore_headers)
+                    .body(restore_body)
+                    .send()
+                    .await;
+            }
+        }
+    
+        Ok(success)
+    }
+    fn build_channel_keys(&self) -> Vec<String> {
+        let mut channel_keys = vec!["NO_CHANNEL".to_string()];
 
-        let mut queue = self.ready_user_queue.lock();
-        queue.clear();
+        if let Some(shared_data_arc) = &self.shared_data {
+            if let Ok(shared_data) = shared_data_arc.try_read() {
+                // Add common channel keys
+                if let Some(common_keys) = &shared_data.channel_key_common {
+                    channel_keys.extend(common_keys.clone());
+                }
 
-        for user in users {
-            if user.user_type == "*" || user.user_type == "+" {
-                if let Some(bot) = &user.bot_instance {
-                    if let Ok(prepared) = self.prepare_booking_request(bot, &user.email).await {
-                        queue.push_back(prepared);
+                // Add team-specific keys based on favorite team
+                if let Some(channel_key_obj) = &shared_data.channel_key {
+                    let team_to_use = match self.favorite_team.as_str() {
+                        "home" => &shared_data.home_team,
+                        "away" => &shared_data.away_team,
+                        _ => &shared_data.home_team, // Default to home
+                    };
+
+                    if let Some(team) = team_to_use {
+                        if let Some(team_id) = team.get("_id").and_then(|v| v.as_str()) {
+                            if let Some(team_keys) =
+                                channel_key_obj.get(team_id).and_then(|v| v.as_array())
+                            {
+                                for key in team_keys {
+                                    if let Some(key_str) = key.as_str() {
+                                        channel_keys.push(key_str.to_string());
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        info!("🚀 {} users ready in high-speed queue", queue.len());
+        channel_keys
     }
-
-    async fn prepare_booking_request(
-        &self,
-        bot: &Arc<WebookBot>,
-        email: &str,
-    ) -> Result<PreparedRequest> {
-        let shared_data = bot.shared_data.read().await;
-        let chart_token = shared_data
-            .chart_token
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Missing chart token"))?;
-        let event_key = shared_data
-            .event_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Missing event key"))?;
-
-        bot.generate_browser_id();
-        let browser_id = bot
-            .browser_id
-            .lock()
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Browser ID not generated"))?;
-
-        let body_template = json!({
-            "events": [event_key],
-            "holdToken": bot.webook_hold_token.lock().clone(),
-            "objects": [{"objectId": "{SEAT_ID}"}],
-            "channelKeys": ["NO_CHANNEL"],
-            "validateEventsLinkedToSameChart": true
-        });
-
-        let mut headers = HashMap::new();
-        headers.insert("accept".to_string(), "*/*".to_string());
-        headers.insert("content-type".to_string(), "application/json".to_string());
-        headers.insert("x-browser-id".to_string(), browser_id);
-        headers.insert("x-client-tool".to_string(), "Renderer".to_string());
-
-        Ok(PreparedRequest {
-            user_email: email.to_string(),
-            url: format!(
-                "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
-                self.workspace_key
-            ),
-            headers,
-            body_template,
-            chart_token: chart_token.clone(),
-            client: bot.client.clone(),
-        })
-    }
-
-    async fn start_scanning(&self) {
-        if self.is_running.load(Ordering::Relaxed) {
-            info!("Scanner already running");
+    fn fill_seats(&mut self) {
+        if !self.bot_running {
+            println!("Please start the bot first");
             return;
         }
 
-        self.is_running.store(true, Ordering::Relaxed);
-        info!("Starting seat scanner...");
+        // Wait a moment for bot_manager to be available
+        if self.bot_manager.is_none() {
+            println!("Bot manager not ready yet, please wait a few seconds and try again");
+            return;
+        }
 
-        let scanner = self.clone();
-        tokio::spawn(async move {
-            scanner.run_websocket().await;
-        });
-    }
+                // Clone bot_manager first to avoid borrow conflicts  
+        let bot_manager = if let Some(manager) = &self.bot_manager {
+            manager.clone()
+        } else {
+            return;
+        };
 
-    async fn stop_scanning(&self) {
-        self.is_running.store(false, Ordering::Relaxed);
-        info!("Scanner stopped");
-    }
-
-    async fn run_websocket(&self) {
-        while self.is_running.load(Ordering::Relaxed) {
-            match self.connect_websocket().await {
-                Ok(_) => info!("WebSocket connection closed"),
-                Err(e) => error!("WebSocket error: {}", e),
+        let channel_keys = self.build_channel_keys();
+        let event_keys = if let Some(shared_data_arc) = &self.shared_data {
+            if let Ok(shared_data) = shared_data_arc.try_read() {
+                if let Some(event_key) = &shared_data.event_key {
+                    vec![event_key.clone()]
+                } else {
+                    println!("Event key not available");
+                    return;
+                }
+            } else {
+                return;
             }
+        } else {
+            return;
+        };
 
-            if self.is_running.load(Ordering::Relaxed) {
-                info!("Reconnecting in 5 seconds...");
-                sleep(StdDuration::from_secs(5)).await;
+        let (assigned_seats_sender, assigned_seats_receiver) = mpsc::unbounded_channel();
+        self.assigned_seats_receiver = Some(assigned_seats_receiver);
+
+        let user_data: Vec<(usize, String, usize)> = self.users.iter()
+            .enumerate()
+            .filter(|(_, user)| user.user_type == "*" && !user.target_seats.is_empty())
+            .map(|(i, user)| (i, user.email.clone(), user.target_seats.len()))
+            .collect();
+
+        // Add logs without borrowing conflicts - now bot_manager is cloned
+        for (user_index, _email, seat_count) in &user_data {
+            self.add_log(*user_index, &format!("🎯 Starting to take {} seats", seat_count));
+        }
+
+        if let Some(rt) = &self.rt {
+            for (i, user) in self.users.iter().enumerate() {
+                if user.user_type == "*" && !user.target_seats.is_empty() {
+                    if let Some(bot_user) = bot_manager.users.get(i) {  // Now using cloned bot_manager
+                        let bot_user_clone = bot_user.clone();
+                        let target_seats = user.target_seats.clone();
+                        let channel_keys_clone = channel_keys.clone();
+                        let event_keys_clone = event_keys.clone();
+                        let assigned_sender = assigned_seats_sender.clone();
+
+                        rt.spawn(async move {
+                            if let Err(e) = bot_user_clone
+                                .fill_assigned_seats(
+                                    target_seats,
+                                    channel_keys_clone,
+                                    event_keys_clone,
+                                    mpsc::unbounded_channel().0,
+                                    assigned_sender,
+                                    i,
+                                )
+                                .await
+                            {
+                                println!("User {}: Fill seats error: {}", bot_user_clone.email, e);
+                            }
+                        });
+                    }
+                }
+            }
+        }
+            
+    }
+    
+    
+    fn sync_expire_times(&mut self) {
+        if let Some(bot_manager) = &self.bot_manager {
+            for (i, bot_user) in bot_manager.users.iter().enumerate() {
+                let expire_time = bot_user.expire_time.load(Ordering::Relaxed);
+                self.users[i].expire = expire_time.to_string();
+            }
+        }
+    }
+    fn refresh_user_token(&mut self, user_index: usize) {
+        if let Some(rt) = &self.rt {
+            if let Some(bot_manager) = &self.bot_manager {
+                let user = bot_manager.users[user_index].clone();
+                self.users[user_index].status = "Refreshing".to_string();
+
+                rt.spawn(async move {
+                    if let Err(e) = user.get_webook_hold_token().await {
+                        println!("Failed to refresh token for {}: {}", user.email, e);
+                    } else if let Err(e) = user.get_expire_time().await {
+                        println!("Failed to get expire time for {}: {}", user.email, e);
+                    }
+                });
+            }
+        }
+    }
+    fn get_seats_from_selected_sections(&self) -> Vec<String> {
+        let mut all_seats = Vec::new();
+
+        if let Some(shared_data_arc) = &self.shared_data {
+            if let Ok(shared_data) = shared_data_arc.try_read() {
+                if let Some(channels) = &shared_data.channels {
+                    // Get selected section prefixes
+                    let selected_sections: Vec<String> = self
+                        .selected_sections
+                        .iter()
+                        .filter_map(|(section, &is_selected)| {
+                            if is_selected {
+                                Some(section.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+
+                    // Find all seats that start with selected sections
+                    for seat in channels {
+                        for selected_section in &selected_sections {
+                            if seat.starts_with(selected_section) {
+                                all_seats.push(seat.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        all_seats
+    }
+
+    fn distribute_seats_to_users(&mut self) {
+        let available_seats = self.get_seats_from_selected_sections();
+        let total_seats = available_seats.len();
+
+        let star_users: Vec<(usize, &mut User)> = self
+            .users
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, user)| user.user_type == "*")
+            .collect();
+
+        let user_count = star_users.len();
+
+        if total_seats == 0 || user_count == 0 {
+            println!("No seats available or no users with type '*'");
+            return;
+        }
+
+        let seats_per_user: usize = self.seats.parse().unwrap_or(1);
+        let actual_seats_per_user = if total_seats >= user_count * seats_per_user {
+            seats_per_user
+        } else {
+            total_seats / user_count
+        };
+
+        println!(
+            "Available seats: {}, Users with '*' type: {}, Each user gets: {}",
+            total_seats, user_count, actual_seats_per_user
+        );
+
+        // Set target seats (what they should attempt to take)
+        for (user_index, (_, user)) in star_users.into_iter().enumerate() {
+            let start_index = user_index * actual_seats_per_user;
+            let end_index =
+                std::cmp::min(start_index + actual_seats_per_user, available_seats.len());
+
+            if start_index < available_seats.len() {
+                let target_seats: Vec<String> = available_seats[start_index..end_index].to_vec();
+                user.target_seats = target_seats.clone();
+
+                println!(
+                    "User {}: will attempt {} seats",
+                    user.email,
+                    target_seats.len()
+                );
+            } else {
+                user.target_seats.clear();
+            }
+        }
+
+        // Reset for "+" type users
+        for user in self.users.iter_mut() {
+            if user.user_type == "+" {
+                user.target_seats.clear();
+            }
+        }
+    }
+    fn receive_bot_manager(&mut self) {
+        if let Some(receiver) = &mut self.bot_manager_receiver {
+            if let Ok(bot_manager_arc) = receiver.try_recv() {
+                self.bot_manager = Some(bot_manager_arc);
+                println!("Bot manager received and stored!");
+            }
+        }
+    }
+    fn update_countdowns(&mut self) {
+        // Receive expire time updates from the async task
+        if let Some(receiver) = &mut self.expire_receiver {
+            while let Ok((user_index, expire_time)) = receiver.try_recv() {
+                if user_index < self.users.len() {
+                    self.users[user_index].expire = expire_time.to_string();
+
+                    // Update status based on expire time
+                    if expire_time == 0 {
+                        self.users[user_index].status = "Expired".to_string();
+                    } else if expire_time < 30 {
+                        self.users[user_index].status = "Expiring Soon".to_string();
+                    } else {
+                        self.users[user_index].status = "Active".to_string();
+                    }
+                }
+            }
+        }
+    }
+    fn update_assigned_seats(&mut self) {
+        if let Some(receiver) = &mut self.assigned_seats_receiver {
+            while let Ok((user_index, seat)) = receiver.try_recv() {
+                if user_index < self.users.len() {
+                    if seat.is_empty() {
+                        // Clear seats signal
+                        self.users[user_index].assigned_seats.clear();
+                        self.users[user_index].seats = "0".to_string();
+                    } else {
+                        // Add seat
+                        self.users[user_index].assigned_seats.push(seat);
+                        self.users[user_index].seats = self.users[user_index].assigned_seats.len().to_string();
+                    }
+                }
             }
         }
     }
 
-    async fn connect_websocket(&self) -> Result<()> {
-        let url = "wss://messaging-eu.seatsio.net/ws";
-        let (ws_stream, _) = connect_async(url).await?;
-        let (write, mut read) = ws_stream.split();
-        let write = Arc::new(tokio::sync::Mutex::new(write));
+    fn load_users_csv(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV files", &["csv"])
+            .pick_file()
+        {
+            match fs::read_to_string(&path) {
+                Ok(contents) => {
+                    let mut reader = csv::Reader::from_reader(contents.as_bytes());
+                    let mut new_users = Vec::new();
 
-        info!("✓ WebSocket connected");
+                    for result in reader.deserialize() {
+                        match result {
+                            Ok(mut user) => {
+                                let mut user: User = user;
+                                user.proxy = if !self.proxies.is_empty() {
+                                    self.proxies[new_users.len() % self.proxies.len()].clone()
+                                } else {
+                                    "No proxy".to_string()
+                                };
+                                user.status = "Ready".to_string();
+                                user.expire = "0".to_string();
+                                user.seats = "0".to_string();
+                                user.last_update = "10:37:47".to_string();
+                                user.pay_status = "Pay".to_string();
+                                new_users.push(user);
+                            }
+                            Err(e) => println!("Error parsing user: {}", e),
+                        }
+                    }
 
-        // Subscribe to channels
-        self.subscribe_to_channels(&write).await?;
+                    self.users = new_users;
+                    println!("Loaded {} users from CSV", self.users.len());
+                }
+                Err(e) => println!("Error reading file: {}", e),
+            }
+        }
+    }
 
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    if let Ok(data) = serde_json::from_str::<Value>(&text) {
-                        self.process_message(data).await;
+    fn load_proxies(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Text files", &["txt"])
+            .pick_file()
+        {
+            match fs::read_to_string(&path) {
+                Ok(contents) => {
+                    self.proxies = contents
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(|line| line.trim().to_string())
+                        .collect();
+
+                    // Update user proxies
+                    for (i, user) in self.users.iter_mut().enumerate() {
+                        if !self.proxies.is_empty() {
+                            user.proxy = self.proxies[i % self.proxies.len()].clone();
+                        }
+                    }
+
+                    println!("Loaded {} proxies", self.proxies.len());
+                }
+                Err(e) => println!("Error reading proxies file: {}", e),
+            }
+        }
+    }
+
+    fn start_bot(&mut self) {
+        if self.users.is_empty() || self.proxies.is_empty() {
+            println!("Please load users and proxies first");
+            return;
+        }
+        let users_data: Vec<(String, String)> = self
+            .users
+            .iter()
+            .map(|u| (u.email.clone(), u.proxy.clone()))
+            .collect();
+        let event_url = self.event_url.clone();
+        let (status_sender, status_receiver) = mpsc::unbounded_channel();
+        let (expire_sender, expire_receiver) = mpsc::unbounded_channel::<(usize, usize)>();
+
+        self.status_receiver = Some(status_receiver);
+        self.expire_receiver = Some(expire_receiver);
+
+        if let Some(rt) = &self.rt {
+            let shared_data = Arc::new(RwLock::new(SharedData::default()));
+            self.shared_data = Some(shared_data.clone());
+
+            // ADD THESE TWO LINES HERE:
+            let (bot_sender, bot_receiver) = mpsc::unbounded_channel();
+            self.bot_manager_receiver = Some(bot_receiver);
+
+            rt.spawn(async move {
+                match BotManager::new(users_data, event_url, shared_data).await {
+                    Ok(bot_manager) => {
+                        let bot_manager_arc = Arc::new(bot_manager);
+
+                        // Send it back to main thread
+                        bot_sender.send(bot_manager_arc.clone()).ok();
+
+                        let status_sender_clone = status_sender.clone();
+
+                        if let Err(e) = bot_manager_arc.start_bot(status_sender).await {
+                            println!("Bot error: {}", e);
+                        }
+
+                        // Expire time loop
+                        // Replace the existing expire time loop with:
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            for (i, user) in bot_manager_arc.users.iter().enumerate() {
+                                let expire_time = user.expire_time.load(Ordering::Relaxed);
+                                status_sender_clone.send(format!("User {}: Bot started", user.email)).ok();
+                                if expire_time > 0 {
+                                    let remaining = expire_time.saturating_sub(1);
+                                    user.expire_time.store(remaining, Ordering::Relaxed);
+                                    expire_sender.send((i, remaining)).ok();
+                                } else if expire_time == 0 {
+                                    // Clear held seats immediately when expired
+                                    status_sender_clone.send(format!("User {}: 🚀 Bot started", user.email)).ok();
+                                    let previously_held = {
+                                        let mut held = user.held_seats.lock();
+                                        let seats = held.clone();
+                                        held.clear(); // Clear immediately
+                                        seats
+                                    };
+                                    
+                                    // Send 0 seats count to UI
+                                    expire_sender.send((i, 0)).ok();
+                                    
+                                    status_sender_clone
+                                        .send(format!("User {}: Token expired, lost {} seats, refreshing...", user.email, previously_held.len()))
+                                        .ok();
+                                    
+                                    // Get new token
+                                    if let Ok(_) = user.get_webook_hold_token().await {
+                                        if let Ok(_) = user.get_expire_time().await {
+                                            status_sender_clone
+                                                .send(format!("User {}: Token refreshed, attempting to retake {} seats", user.email, previously_held.len()))
+                                                .ok();
+                                            
+                                            // Immediately try to retake the same seats
+                                            let channel_keys = build_channel_keys_for_user(&bot_manager_arc.shared_data).await;
+                                            let event_keys = if let Some(event_key) = bot_manager_arc.shared_data.read().await.event_key.as_ref() {
+                                                vec![event_key.clone()]
+                                            } else {
+                                                continue;
+                                            };
+                                            
+                                            // Spawn immediate retake task
+                                            // Immediate retake with same concurrency as Fill Seats
+                                            let user_clone = user.clone();
+                                            let previously_held_clone = previously_held;
+                                            let channel_keys_clone = channel_keys;
+                                            let event_keys_clone = event_keys;
+
+                                            // Direct call - retake_seats handles its own concurrency
+                                            if let Err(e) = user_clone.retake_seats(previously_held_clone, channel_keys_clone, event_keys_clone).await {
+                                                println!("User {}: Failed to retake seats: {}", user_clone.email, e);
+                                            }
+                                        }
+                                    }
+                                }
+                            
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("Failed to create bot manager: {}", e);
                     }
                 }
-                Err(e) => {
-                    error!("WebSocket message error: {}", e);
+            });
+        }
+
+        self.bot_running = true;
+    }
+
+    fn render_top_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            // File loading buttons
+            if ui.button("Load Users CSV").clicked() {
+                self.load_users_csv();
+            }
+
+            if ui.button("Load Proxies").clicked() {
+                self.load_proxies();
+            }
+
+            ui.separator();
+
+            // Event URL
+            ui.label("Event URL:");
+            ui.add(egui::TextEdit::singleline(&mut self.event_url).desired_width(300.0));
+
+            ui.separator();
+
+            // Seats
+            ui.label("Seats:");
+            ui.add(egui::TextEdit::singleline(&mut self.seats).desired_width(40.0));
+
+            ui.label("DSeats:");
+            ui.add(egui::TextEdit::singleline(&mut self.d_seats).desired_width(40.0));
+
+            ui.separator();
+
+            // Control buttons
+            let bot_button_text = if self.bot_running {
+                "Stop Bot"
+            } else {
+                "Start Bot"
+            };
+            if ui.button(bot_button_text).clicked() {
+                if self.bot_running {
+                    self.bot_running = false;
+                } else {
+                    self.start_bot();
+                }
+            }
+
+            if ui.button("Fill Seats").clicked() {
+                self.fill_seats(); // ← Correct!
+            }
+            if ui.button("Transfer Seat").clicked() {
+                self.show_transfer_modal = true;
+            }
+        });
+
+        ui.separator();
+
+        ui.separator();
+
+        // Second row
+        ui.horizontal(|ui| {
+            ui.label("Favorite Team:");
+            egui::ComboBox::from_label("")
+                .selected_text(&self.favorite_team)
+                .show_ui(ui, |ui| {
+                    for team in &self.teams.clone() {
+                        ui.selectable_value(&mut self.favorite_team, team.clone(), team);
+                    }
+                });
+        });
+
+        ui.separator();
+
+        // In render_top_panel, replace the sections checkbox part:
+        ui.vertical(|ui| {
+            ui.label("Sections:");
+
+            if let Some(shared_data_arc) = &self.shared_data {
+                if let Ok(shared_data) = shared_data_arc.try_read() {
+                    if let Some(channels) = &shared_data.channels {
+                        // Only update sections when channels data changes
+                        if self.selected_sections.is_empty() {
+                            let mut unique_sections = std::collections::HashSet::new();
+                            for seat in channels {
+                                if let Some(prefix) = seat.split('-').next() {
+                                    unique_sections.insert(prefix.to_string());
+                                }
+                            }
+
+                            // Initialize checkboxes only once
+                            for section in unique_sections {
+                                self.selected_sections.insert(section, false);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Display checkboxes - 10 per line
+            // Display checkboxes in scrollable area
+            
+            let mut sections_to_display: Vec<String> =
+            self.selected_sections.keys().cloned().collect();
+            sections_to_display.sort();
+
+            let mut selection_changed = false;
+            ui.horizontal(|ui| {
+                if ui.button("Select All").clicked() {
+                    for (_, is_selected) in self.selected_sections.iter_mut() {
+                        *is_selected = true;
+                    }
+                    selection_changed = true;
+                }
+                if ui.button("Clear All").clicked() {
+                    for (_, is_selected) in self.selected_sections.iter_mut() {
+                        *is_selected = false;
+                    }
+                    selection_changed = true;
+                }
+            });
+            let selected_count = self.selected_sections.values().filter(|&&v| v).count();
+            ui.label(format!("Sections: {} selected", selected_count));
+            // Create scrollable area with fixed height
+            egui::ScrollArea::both()
+            .id_source("sections_scroll")  // ADD THIS LINE - unique ID
+            .max_height(200.0)
+            .show(ui, |ui| {
+                // Use a grid for better layout control
+                egui::Grid::new("sections_grid")
+                    .num_columns(10)
+                    .spacing([5.0, 5.0])
+                    .show(ui, |ui| {
+                        for (index, section) in sections_to_display.iter().enumerate() {
+                            if let Some(is_selected) = self.selected_sections.get_mut(section) {
+                                if ui.checkbox(is_selected, section).changed() {
+                                    selection_changed = true;
+                                }
+                            }
+                            
+                            // End row after 10 items
+                            if (index + 1) % 10 == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+
+            // If selection changed, redistribute seats
+            // If selection changed, redistribute seats AND start scanner
+            if selection_changed {
+                println!("selection succed");
+                self.distribute_seats_to_users();
+                
+                // Start scanner when first checkbox is selected
+                let has_selected = self.selected_sections.values().any(|&selected| selected);
+                if has_selected && !self.scanner_running && self.bot_running {
+                    self.start_scanner();
+                }else if !has_selected && self.scanner_running {
+                    self.scanner_running = false; // Stop if no sections selected
+                }
+            }
+        });
+
+        ui.separator();
+    }
+    async fn update_ready_star_users_atomic(&self) {  // Remove async
+        let mut users = self.ready_star_users.lock().await;  // Remove .await and if let Some
+        users.clear();
+        
+        for (i, user) in self.users.iter().enumerate() {
+            if user.user_type == "*" && user.status == "Active" {
+                users.push(i);
+            }
+        }
+    }
+    fn render_user_table(&mut self, ui: &mut egui::Ui) {
+        use egui_extras::{Column, TableBuilder};
+
+        TableBuilder::new(ui)
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(200.0).resizable(true)) // Email
+            .column(Column::initial(50.0).resizable(true)) // Type
+            .column(Column::initial(180.0).resizable(true)) // Proxy
+            .column(Column::initial(80.0).resizable(true)) // Status
+            .column(Column::initial(60.0).resizable(true)) // Expire
+            .column(Column::initial(60.0).resizable(true)) // Seats
+            .column(Column::initial(90.0).resizable(true)) // Last Update
+            .column(Column::initial(60.0).resizable(true)) // Pay
+            .header(25.0, |mut header| {
+                header.col(|ui| {
+                    ui.heading("Email");
+                });
+                header.col(|ui| {
+                    ui.heading("Type");
+                });
+                header.col(|ui| {
+                    ui.heading("Proxy");
+                });
+                header.col(|ui| {
+                    ui.heading("Status");
+                });
+                header.col(|ui| {
+                    ui.heading("Expire");
+                });
+                header.col(|ui| {
+                    ui.heading("Seats");
+                });
+                header.col(|ui| {
+                    ui.heading("Last Update");
+                });
+                header.col(|ui| {
+                    ui.heading("Pay");
+                });
+            })
+            .body(|mut body| {
+                let mut clicked_user: Option<(String, Vec<String>)> = None;
+                let mut clicked_payment_user: Option<String> = None;
+            
+                for (user_index, user) in self.users.iter().enumerate() { 
+                    body.row(25.0, |mut row| {
+                        row.col(|ui| {
+                            if ui.button(&user.email).clicked() {
+                                clicked_user = Some((user.email.clone(), user.logs.clone()));
+                            }
+                        });
+            
+                        row.col(|ui| {
+                            ui.label(&user.user_type);
+                        });
+                        
+                        row.col(|ui| {
+                            ui.label(&user.proxy);
+                        });
+                        
+                        row.col(|ui| {
+                            let color = match user.status.as_str() {
+                                "Ready" => egui::Color32::GREEN,
+                                "Error" => egui::Color32::RED,
+                                "Running" => egui::Color32::YELLOW,
+                                "Active" => egui::Color32::BLUE,
+                                _ => egui::Color32::GRAY,
+                            };
+                            ui.colored_label(color, &user.status);
+                        });
+                        
+                        row.col(|ui| {
+                            ui.label(&user.expire);
+                        });
+                        
+                        row.col(|ui| {
+                            ui.label(&user.seats);
+                        });
+                        
+                        row.col(|ui| {
+                            ui.label(&user.last_update);
+                        });
+                        
+                        row.col(|ui| {
+                            if ui.button(&user.pay_status).clicked() {
+                                clicked_payment_user = Some(user.email.clone());
+                            }
+                        });
+                    });
+                }
+            
+                // Handle clicks AFTER the table
+                if let Some((email, logs)) = clicked_user {
+                    self.selected_user_email = email;
+                    self.selected_user_logs = logs;
+                    self.show_logs_modal = true;
+                }
+                
+                if let Some(email) = clicked_payment_user {
+                    self.show_payment_modal(email);
+                }
+            });
+    }
+
+    fn render_status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+
+        // Check for status updates
+        if let Some(receiver) = &mut self.status_receiver {
+            while let Ok(status) = receiver.try_recv() {
+                self.sections_status = status;
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(format!("Users: {} |", self.users.len()));
+            ui.label(format!("Proxies: {} |", self.proxies.len()));
+            ui.label(format!(
+                "Bot: {}",
+                if self.bot_running {
+                    "Running"
+                } else {
+                    "Stopped"
+                }
+            ));
+        });
+    }
+    async fn start_scanner(&mut self) {
+        if self.scanner_running || !self.bot_running || self.shared_data.is_none() {
+            return;
+        }
+
+        let selected_channels = self.get_selected_channels();
+        if selected_channels.is_empty() {
+            return;
+        }
+
+        self.scanner_running = true;
+        
+        // 🔄 CLEAR RESERVED SEATS MAP
+        self.reserved_seats_map.lock().await.clear();
+        
+        // 🎯 UPDATE READY USERS FOR ROUND-ROBIN
+        self.update_ready_star_users_sophisticated();
+
+        println!("📡 Scanner started - monitoring {} channels with {} ready users", 
+            selected_channels.len(), self.ready_star_users.lock().await.len());
+
+        if let Some(rt) = &self.rt {
+            let shared_data = self.shared_data.clone().unwrap();
+            let bot_manager = self.bot_manager.clone();
+            let selected_channels_clone = selected_channels;
+            let reserved_seats_map_clone = self.reserved_seats_map.clone();
+            let ready_star_users_clone = self.ready_star_users.clone();
+            let next_user_index_clone = self.next_user_index.clone();
+
+            rt.spawn(async move {
+                if let Err(e) = Self::run_websocket_scanner_advanced(
+                    shared_data,
+                    bot_manager,
+                    selected_channels_clone,
+                    reserved_seats_map_clone,
+                    ready_star_users_clone,
+                    next_user_index_clone,
+                ).await {
+                    println!("Scanner error: {}", e);
+                }
+            });
+        }
+    }
+    async fn run_websocket_scanner_advanced(
+        shared_data: Arc<RwLock<SharedData>>,
+        bot_manager: Option<Arc<BotManager>>,
+        selected_channels: Vec<String>,
+        reserved_seats_map: Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+        ready_star_users: Arc<tokio::sync::Mutex<Vec<usize>>>,
+        next_user_index: Arc<AtomicUsize>,
+    ) -> Result<()> {
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+        use futures_util::{SinkExt, StreamExt};
+
+        let ws_url = "wss://messaging-eu.seatsio.net/ws";
+        let (ws_stream, _) = connect_async(ws_url).await?;
+        let (mut write, mut read) = ws_stream.split();
+
+        // Subscribe to workspace channel
+        let workspace_sub = serde_json::json!({
+            "type": "SUBSCRIBE",
+            "data": {
+                "channel": WORKSPACE_KEY
+            }
+        });
+        write.send(Message::Text(workspace_sub.to_string())).await?;
+
+        // Subscribe to event and season channels
+        let data = shared_data.read().await;
+        if let Some(event_key) = &data.event_key {
+            let event_channel = format!("{}-{}", WORKSPACE_KEY, event_key);
+            let event_sub = serde_json::json!({
+                "type": "SUBSCRIBE",
+                "data": {
+                    "channel": event_channel
+                }
+            });
+            println!("{:?}",event_sub);
+            write.send(Message::Text(event_sub.to_string())).await?;
+        }
+
+        if let Some(season_structure) = &data.season_structure {
+            let season_channel = format!("{}-{}", WORKSPACE_KEY, season_structure);
+            let season_sub = serde_json::json!({
+                "type": "SUBSCRIBE",
+                "data": {
+                    "channel": season_channel
+                }
+            });
+            println!("{:?}",season_sub);
+            write.send(Message::Text(season_sub.to_string())).await?;
+        }
+        drop(data);
+
+        println!("📡 Advanced scanner connected with reserved seats tracking");
+
+        // Listen for messages with sophisticated processing
+        while let Some(msg) = read.next().await {
+            match msg? {
+                Message::Text(text) => {
+                    Self::process_websocket_message_advanced(
+                        &text,
+                        &selected_channels,
+                        &bot_manager,
+                        &reserved_seats_map,
+                        &ready_star_users,
+                        &next_user_index,
+                    ).await;
+                }
+                Message::Close(_) => {
+                    println!("📡 Scanner connection closed");
                     break;
                 }
                 _ => {}
@@ -926,956 +2626,649 @@ impl SeatScanner {
         Ok(())
     }
 
-    // FIX 4: Correct the `Send` error by releasing the read lock before an `.await`
-    async fn subscribe_to_channels(
-        &self,
-        write: &Arc<
-            tokio::sync::Mutex<
-                futures_util::stream::SplitSink<
-                    tokio_tungstenite::WebSocketStream<
-                        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-                    >,
-                    Message,
-                >,
-            >,
-        >,
-    ) -> Result<()> {
-        let workspace_sub = json!({
-            "type": "SUBSCRIBE",
-            "data": {"channel": self.workspace_key}
-        });
-
-        write
-            .lock()
-            .await
-            .send(Message::Text(serde_json::to_string(&workspace_sub)?))
-            .await?;
-        info!("📡 Subscribed to workspace channel");
-
-        // Read the event key into a local variable to release the lock before .await
-        let event_key_clone = { self.event_key.read().clone() };
-
-        if let Some(event_key) = event_key_clone {
-            let event_channel = format!("{}-{}", self.workspace_key, event_key);
-            let event_sub = json!({
-                "type": "SUBSCRIBE",
-                "data": {"channel": event_channel}
-            });
-
-            // Now the await call happens without holding the lock
-            write
-                .lock()
-                .await
-                .send(Message::Text(serde_json::to_string(&event_sub)?))
-                .await?;
-            info!("📡 Subscribed to event channel: {}", event_channel);
-        }
-
-        Ok(())
+    fn get_selected_channels(&self) -> Vec<String> {
+        self.selected_sections
+            .iter()
+            .filter_map(|(section, &is_selected)| {
+                if is_selected {
+                    Some(section.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
-    async fn process_message(&self, msg: Value) {
-        if msg.get("type").and_then(|v| v.as_str()) != Some("MESSAGE_PUBLISHED") {
-            return;
-        }
+    async fn update_ready_star_users(&mut self) {
+        let new_users: Vec<usize> = self
+            .users
+            .iter()
+            .enumerate()
+            .filter(|(_, user)| user.user_type == "*" && user.status == "Active")
+            .map(|(i, _)| i)
+            .collect();
+        
+        let mut ready_users = self.ready_star_users.lock().await;
+        ready_users.clear();
+        ready_users.extend(new_users);
+    }
 
-        if let Some(message) = msg.get("message") {
-            if let Some(body) = message.get("body") {
-                if let Some(status) = body.get("status").and_then(|v| v.as_str()) {
-                    if let Some(seat_id) = body.get("objectLabelOrUuid").and_then(|v| v.as_str()) {
-                        if status == "free" {
-                            self.handle_seat_free(seat_id).await;
-                        }
-                    }
+    async fn run_websocket_scanner(
+        shared_data: Arc<RwLock<SharedData>>,
+        bot_manager: Option<Arc<BotManager>>,
+        selected_channels: Vec<String>,
+        users_data: Vec<User>,
+    ) -> Result<()> {
+        use tokio_tungstenite::{connect_async, tungstenite::Message};
+        use futures_util::{SinkExt, StreamExt};
+    
+        let ws_url = "wss://messaging-eu.seatsio.net/ws";
+        let (ws_stream, _) = connect_async(ws_url).await?;
+        let (mut write, mut read) = ws_stream.split();
+    
+        // Subscribe to workspace channel
+        let workspace_sub = serde_json::json!({
+            "type": "SUBSCRIBE",
+            "data": {
+                "channel": WORKSPACE_KEY
+            }
+        });
+        write.send(Message::Text(workspace_sub.to_string())).await?;
+    
+        // Subscribe to event channel
+        let data = shared_data.read().await;
+        if let Some(event_key) = &data.event_key {
+            let event_channel = format!("{}-{}", WORKSPACE_KEY, event_key);
+            println!("{:?}",event_channel);
+            let event_sub = serde_json::json!({
+                "type": "SUBSCRIBE",
+                "data": {
+                    "channel": event_channel
+                }
+            });
+            write.send(Message::Text(event_sub.to_string())).await?;
+        }
+        if let Some(season_structure) = &data.season_structure {
+            let season_channel = format!("{}-{}", WORKSPACE_KEY, season_structure);
+            println!("{:?}",season_channel);
+            let season_sub = serde_json::json!({
+                "type": "SUBSCRIBE", 
+                "data": {
+                    "channel": season_channel
+                }
+            });
+            write.send(Message::Text(season_sub.to_string())).await?;
+        }
+        drop(data);
+    
+        println!("Scanner connected and subscribed to channels");
+    
+        // Listen for messages
+        while let Some(msg) = read.next().await {
+            match msg? {
+                Message::Text(text) => {
+                    Self::process_websocket_message_simple(
+                        &text,
+                        &selected_channels,
+                        &bot_manager,
+                        &users_data,
+                    ).await;
+                }
+                Message::Close(_) => {
+                    println!("WebSocket connection closed");
+                    break;
+                }
+                _ => {}
+            }
+        }
+    
+        Ok(())
+    }
+    async fn process_websocket_message_simple(
+        msg_text: &str,
+        selected_channels: &[String],
+        bot_manager: &Option<Arc<BotManager>>,
+        users_data: &[User],
+    ) {
+        println!("{:?}",msg_text);
+        let messages: Vec<ScannerMessage> = if let Ok(msgs) = serde_json::from_str(msg_text) {
+            msgs
+        } else if let Ok(single_msg) = serde_json::from_str::<ScannerMessage>(msg_text) {
+            vec![single_msg]
+        } else {
+            return;
+        };
+        //println!("{:?}", messages);
+    
+        for message in messages {
+            if message.message_type != "MESSAGE_PUBLISHED" {
+                continue;
+            }
+    
+            let body = &message.message.body;
+    
+            // Handle seat becoming free - Simple version
+            if let (Some(status), Some(object_label)) = (&body.status, &body.object_label) {
+                if status == "free" && !object_label.is_empty() {
+                    Self::handle_seat_free(object_label, selected_channels, bot_manager, &Arc::new(RwLock::new(SharedData::default())), users_data).await;
                 }
             }
         }
     }
+    async fn process_websocket_message_advanced(
+        msg_text: &str,
+        selected_channels: &[String],
+        bot_manager: &Option<Arc<BotManager>>,
+        reserved_seats_map: &Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+        ready_star_users: &Arc<tokio::sync::Mutex<Vec<usize>>>,
+        next_user_index: &Arc<AtomicUsize>,
+    ) {
+        let messages: Vec<ScannerMessage> = if let Ok(msgs) = serde_json::from_str(msg_text) {
+            msgs
+        } else if let Ok(single_msg) = serde_json::from_str::<ScannerMessage>(msg_text) {
+            vec![single_msg]
+        } else {
+            return;
+        };
+        println!("{:?}",messages);
+        for message in messages {
+            if message.message_type != "MESSAGE_PUBLISHED" {
+                continue;
+            }
 
-    async fn handle_seat_free(&self, seat_id: &str) {
-        if !self.is_seat_in_selected_sections(seat_id).await {
+            let body = &message.message.body;
+
+            // Handle seat becoming free - ROCKET LOGIC with round-robin
+            if let (Some(status), Some(object_label)) = (&body.status, &body.object_label) {
+                if status == "free" && !object_label.is_empty() {
+                    Self::handle_seat_free_rocket(
+                        object_label,
+                        selected_channels,
+                        bot_manager,
+                        ready_star_users,
+                        next_user_index,
+                    ).await;
+                }
+            }
+
+            // Handle seat reserved tracking with hold token hash
+            if let (Some(status), Some(hold_token_hash), Some(object_label)) = (
+                &body.status,
+                &body.hold_token_hash,
+                &body.object_label,
+            ) {
+                if status == "reservedByToken" && !hold_token_hash.is_empty() {
+                    let mut map = reserved_seats_map.lock().await;
+                    map.entry(hold_token_hash.clone())
+                        .or_insert_with(Vec::new)
+                        .push(object_label.clone());
+                    
+                    println!("📝 Seat {} reserved by token hash {}", object_label, hold_token_hash);
+                }
+            }
+
+            // Handle token expired - SOPHISTICATED LOGIC
+            if let (Some(message_type), Some(hold_token)) = (&body.message_type, &body.hold_token) {
+                if message_type == "HOLD_TOKEN_EXPIRED" && !hold_token.is_empty() {
+                    Self::handle_token_expired_advanced(
+                        hold_token,
+                        selected_channels,
+                        bot_manager,
+                        reserved_seats_map,
+                        ready_star_users,
+                        next_user_index,
+                    ).await;
+                }
+            }
+        }
+    }
+    async fn handle_token_expired_advanced(
+        hold_token: &str,
+        selected_channels: &[String],
+        bot_manager: &Option<Arc<BotManager>>,
+        reserved_seats_map: &Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+        ready_star_users: &Arc<tokio::sync::Mutex<Vec<usize>>>,
+        next_user_index: &Arc<AtomicUsize>,
+    ) {
+        use sha1::{Digest, Sha1};
+        
+        // 🔐 GENERATE SHA1 HASH (same as Go logic)
+        let mut hasher = Sha1::new();
+        hasher.update(hold_token.as_bytes());
+        let hold_token_hash = hex::encode(hasher.finalize());
+
+        // Get and remove expired seats from tracking
+        let expired_seats = {
+            let mut map = reserved_seats_map.lock().await;
+            map.remove(&hold_token_hash).unwrap_or_default()
+        };
+
+        if expired_seats.is_empty() {
             return;
         }
 
-        let mut queue = self.ready_user_queue.lock();
-        if let Some(prepared_request) = queue.pop_front() {
-            let seat_id = seat_id.to_string();
-            let mut request_for_task = prepared_request.clone(); // Clone the request for the task
+        println!("⏰ TOKEN EXPIRED: {} seats available from hash {}", 
+            expired_seats.len(), &hold_token_hash[..8]);
 
-            tokio::spawn(async move {
-                if let Err(e) = Self::fire_prepared_request(&mut request_for_task, &seat_id).await {
-                    warn!("Failed to book seat {}: {}", seat_id, e);
+        // Process each expired seat with sophisticated logic
+        for seat_id in expired_seats {
+            // Check if seat matches selected channels
+            let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
+            if !matches_prefix {
+                continue;
+            }
+
+            if let Some(manager) = bot_manager {
+                let users = ready_star_users.lock().await;
+                if users.is_empty() {
+                    continue;
                 }
-            });
 
-            queue.push_back(prepared_request); // Push the original request back
+                // 🎯 ATTEMPT WITH ALL READY USERS (Go-style concurrent attempts)
+                for &user_index in users.iter() {
+                    if let Some(bot_user) = manager.users.get(user_index) {
+                        let user_clone = bot_user.clone();
+                        let seat_clone = seat_id.clone();
+                        
+                        tokio::spawn(async move {
+                            match Self::take_seat_ultra_fast(&user_clone, &seat_clone).await {
+                                Ok(_) => {
+                                    println!("🎯 TOKEN EXPIRED BOOKING: {} booked by {}", 
+                                        seat_clone, user_clone.email);
+                                }
+                                Err(_) => {
+                                    // Multiple users competing, failures are expected
+                                }
+                            }
+                        });
+                    }
+                }
+                
+                // Small delay to prevent overwhelming the server
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
         }
     }
-
-    async fn is_seat_in_selected_sections(&self, seat_id: &str) -> bool {
-        let sections = self.selected_sections.read();
-        sections.iter().any(|prefix| seat_id.starts_with(prefix))
+    async fn update_ready_star_users_sophisticated(&mut self) {
+        let new_ready_users: Vec<usize> = self
+            .users
+            .iter()
+            .enumerate()
+            .filter(|(_, user)| {
+                user.user_type == "*" && 
+                (user.status == "Active" || user.status == "✅ Ready")
+            })
+            .map(|(i, _)| i)
+            .collect();
+        
+        let mut ready_users = self.ready_star_users.lock().await;
+        let previous_count = ready_users.len();
+        ready_users.clear();
+        ready_users.extend(new_ready_users.clone());
+        
+        if ready_users.len() != previous_count {
+            println!("🎯 Updated ready star users: {} users ready for round-robin", ready_users.len());
+            
+            // Reset round-robin counter when user list changes
+            self.next_user_index.store(0, Ordering::Relaxed);
+        }
     }
-
-    async fn fire_prepared_request(prepared: &mut PreparedRequest, seat_id: &str) -> Result<()> {
-        let mut body = prepared.body_template.clone();
-        body["objects"][0]["objectId"] = json!(seat_id);
-
-        let body_str = serde_json::to_string(&body)?;
-
-        // Generate signature
-        let reversed_token: String = prepared.chart_token.chars().rev().collect();
-        let data_to_hash = format!("{}{}", reversed_token, body_str);
-        let mut hasher = Sha256::new();
-        hasher.update(data_to_hash.as_bytes());
-        let signature = hex::encode(hasher.finalize());
-
-        let mut headers = prepared.headers.clone();
-        headers.insert("x-signature".to_string(), signature);
-
-        let mut request = prepared.client.post(&prepared.url);
-        for (key, value) in headers {
-            request = request.header(key, value);
+    async fn process_websocket_message(
+        msg_text: &str,
+        selected_channels: &[String], 
+        bot_manager: &Option<Arc<BotManager>>,
+        shared_data: &Arc<RwLock<SharedData>>,
+        users_data: &[User],
+        reserved_seats_map: &Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+        ready_star_users: &Arc<tokio::sync::Mutex<Vec<usize>>>,
+        next_user_index: &Arc<AtomicUsize>,
+    ) {
+        let messages: Vec<ScannerMessage> = if let Ok(msgs) = serde_json::from_str(msg_text) {
+            msgs
+        } else if let Ok(single_msg) = serde_json::from_str::<ScannerMessage>(msg_text) {
+            vec![single_msg]
+        } else {
+            return;
+        };
+    
+        for message in messages {
+            if message.message_type != "MESSAGE_PUBLISHED" {
+                continue;
+            }
+    
+            let body = &message.message.body;
+    
+            // Handle seat becoming free - ROCKET LOGIC
+            if let (Some(status), Some(object_label)) = (&body.status, &body.object_label) {
+                if status == "free" && !object_label.is_empty() {
+                    Self::handle_seat_free_rocket(object_label, selected_channels, bot_manager, ready_star_users, next_user_index).await;
+                }
+            }
+    
+            // Handle seat reserved tracking
+            if let (Some(status), Some(hold_token_hash), Some(object_label)) = (&body.status, &body.hold_token_hash, &body.object_label) {
+                if status == "reservedByToken" && !hold_token_hash.is_empty() {
+                    let mut map = reserved_seats_map.lock().await;
+                    map.entry(hold_token_hash.clone()).or_insert_with(Vec::new).push(object_label.clone());
+                }
+            }
+    
+            // Handle token expired
+            if let (Some(message_type), Some(hold_token)) = (&body.message_type, &body.hold_token) {
+                if message_type == "HOLD_TOKEN_EXPIRED" && !hold_token.is_empty() {
+                    Self::handle_token_expired(hold_token, selected_channels, bot_manager, reserved_seats_map).await;
+                }
+            }
+        }
+    }
+    async fn handle_token_expired(
+        hold_token: &str,
+        selected_channels: &[String],
+        bot_manager: &Option<Arc<BotManager>>,
+        reserved_seats_map: &Arc<tokio::sync::Mutex<HashMap<String, Vec<String>>>>,
+    ) {
+        // Generate SHA1 hash of hold token
+        use sha1::{Digest, Sha1};
+        let mut hasher = Sha1::new();
+        hasher.update(hold_token.as_bytes());
+        let hold_token_hash = hex::encode(hasher.finalize());
+    
+        // Get and remove expired seats
+        let expired_seats = {
+            let mut map = reserved_seats_map.lock().await;
+            map.remove(&hold_token_hash).unwrap_or_default()
+        };
+    
+        if expired_seats.is_empty() {
+            return;
+        }
+    
+        println!("⏰ TOKEN EXPIRED: {} seats available", expired_seats.len());
+    
+        // Process each expired seat
+        for seat_id in expired_seats {
+            // Check if seat matches selected channels
+            let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
+            if !matches_prefix {
+                continue;
+            }
+    
+            // Attempt booking with all ready star users
+            if let Some(manager) = bot_manager {
+                for (i, bot_user) in manager.users.iter().enumerate() {
+                    // Launch concurrent attempts (don't wait)
+                    let user_clone = bot_user.clone();
+                    let seat_clone = seat_id.clone();
+                    
+                    tokio::spawn(async move {
+                        if let Ok(_) = Self::take_seat_ultra_fast(&user_clone, &seat_clone).await {
+                            println!("🎯 TOKEN EXPIRED BOOKING: {} booked by {}", seat_clone, user_clone.email);
+                        }
+                    });
+                }
+            }
+        }
+    }
+    async fn handle_seat_free_rocket(
+        seat_id: &str,
+        selected_channels: &[String],
+        bot_manager: &Option<Arc<BotManager>>,
+        ready_star_users: &Arc<tokio::sync::Mutex<Vec<usize>>>,
+        next_user_index: &Arc<AtomicUsize>,
+    ) {
+        // Check if seat matches selected channels
+        let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
+        if !matches_prefix {
+            return;
         }
 
-        let response = request
-            .body(body_str)
-            .timeout(StdDuration::from_secs(2))
+        if let Some(manager) = bot_manager {
+            let users = ready_star_users.lock().await;
+            if users.is_empty() {
+                println!("🚫 No ready star users available");
+                return;
+            }
+
+            // 🎯 ROUND-ROBIN ASSIGNMENT LOGIC (same as Go)
+            let current_index = next_user_index.load(Ordering::Relaxed);
+            let user_array_index = current_index % users.len();
+            let user_index = users[user_array_index];
+            
+            // Update for next time
+            next_user_index.store(current_index + 1, Ordering::Relaxed);
+            
+            if let Some(bot_user) = manager.users.get(user_index) {
+                println!("🟢 SEAT FREE: {}. Assigning sniper shot to {} (round-robin: {}/{})", 
+                    seat_id, bot_user.email, user_array_index + 1, users.len());
+                
+                let user_clone = bot_user.clone();
+                let seat_clone = seat_id.to_string();
+                
+                tokio::spawn(async move {
+                    match Self::take_seat_ultra_fast(&user_clone, &seat_clone).await {
+                        Ok(_) => {
+                            println!("🚀 ROCKET SUCCESS: {} booked by {}", seat_clone, user_clone.email);
+                        }
+                        Err(_) => {
+                            // Don't log failures for performance
+                        }
+                    }
+                });
+            }
+        }
+    }
+    
+    async fn take_seat_ultra_fast(
+        user: &BotUser,
+        seat_id: &str,
+    ) -> Result<()> {
+        // Ultra-fast implementation with minimal overhead
+        let hold_token = user.webook_hold_token.lock().clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token"))?;
+    
+        let request_body = json!({
+            "events": [user.shared_data.read().await.event_key],
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat_id}],
+            "channelKeys": ["NO_CHANNEL"],
+            "validateEventsLinkedToSameChart": true
+        });
+    
+        let signature = user.generate_signature(&request_body.to_string()).await?;
+        
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "*/*".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
+        headers.insert("x-client-tool", "Renderer".parse()?);
+        headers.insert("x-signature", signature.parse()?);
+        
+        if let Some(browser_id) = user.browser_id.lock().as_ref() {
+            headers.insert("x-browser-id", browser_id.parse()?);
+        }
+    
+        let response = user.client
+            .post(&format!("https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects", WORKSPACE_KEY))
+            .headers(headers)
+            .body(request_body.to_string())
             .send()
             .await?;
+    
+        if response.status() == 200 || response.status() == 204 {
+            user.held_seats.lock().push(seat_id.to_string());
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Seat take failed"))
+        }
+    }
 
-        if response.status().is_success() {
-            info!("✅ SUCCESS [{}] booked {}", prepared.user_email, seat_id);
+    async fn handle_seat_free(
+        seat_id: &str,
+        selected_channels: &[String],
+        bot_manager: &Option<Arc<BotManager>>,
+        shared_data: &Arc<RwLock<SharedData>>,
+        users_data: &[User], // Add this parameter
+    ) {
+        // Check if seat matches selected channels
+        let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
+        if !matches_prefix {
+            return;
+        }
+    
+        if let Some(manager) = bot_manager {
+            // Find first ready star user
+            for (i, bot_user) in manager.users.iter().enumerate() {
+                // Check if this is a star user and is ready
+                if i < users_data.len() && 
+                   users_data[i].user_type == "*" && 
+                   users_data[i].status == "Active" {
+                    
+                    println!("SEAT FREE: {}. Assigning to {}", seat_id, bot_user.email);
+                    
+                    // Clone what we need for the async task
+                    let user_clone = bot_user.clone();
+                    let seat_clone = seat_id.to_string();
+                    let shared_data_clone = shared_data.clone();
+                    
+                    tokio::spawn(async move {
+                        if let Err(e) = Self::take_seat_fast(&user_clone, &seat_clone, &shared_data_clone).await {
+                            println!("Scanner seat take failed: {}", e);
+                        } else {
+                            println!("Scanner SUCCESS: {} booked by {}", seat_clone, user_clone.email);
+                        }
+                    });
+                    
+                    break; // Stop after first user
+                }
+            }
+        }
+    }
+
+    async fn take_seat_fast(
+        user: &BotUser,
+        seat_id: &str,
+        shared_data: &Arc<RwLock<SharedData>>,
+    ) -> Result<()> {
+        // Build channel keys quickly
+        let channel_keys = vec!["NO_CHANNEL".to_string()]; // Simplified for speed
+        
+        let event_keys = if let Ok(data) = shared_data.try_read() {
+            if let Some(event_key) = &data.event_key {
+                vec![event_key.clone()]
+            } else {
+                return Err(anyhow::anyhow!("No event key"));
+            }
+        } else {
+            return Err(anyhow::anyhow!("Cannot read shared data"));
+        };
+
+        // Prepare headers quickly
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "*/*".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
+        headers.insert("origin", "https://cdn-eu.seatsio.net".parse()?);
+
+        if let Some(browser_id) = user.browser_id.lock().as_ref() {
+            headers.insert("x-browser-id", browser_id.parse()?);
+        }
+        headers.insert("x-client-tool", "Renderer".parse()?);
+
+        // Take the seat
+        let success = user.take_single_seat(seat_id, &channel_keys, &event_keys, &headers).await?;
+        
+        if success {
+            user.held_seats.lock().push(seat_id.to_string());
+            println!("🚀 SCANNER SUCCESS: {} booked by {}", seat_id, user.email);
         }
 
         Ok(())
     }
-
-    fn clone(&self) -> Self {
-        Self {
-            workspace_key: self.workspace_key.clone(),
-            event_key: self.event_key.clone(),
-            season_structure: self.season_structure.clone(),
-            is_running: self.is_running.clone(),
-            users: self.users.clone(),
-            ready_user_queue: self.ready_user_queue.clone(),
-            selected_sections: self.selected_sections.clone(),
-            reserved_seats: self.reserved_seats.clone(),
-        }
-    }
 }
 
-// GUI Application
-struct BotApp {
-    users: Arc<RwLock<Vec<Arc<User>>>>,
-    proxies: Vec<String>,
-    event_url: String,
-    seats: String,
-    dseats: String,
-    selected_team: String,
-    selected_sections: Arc<RwLock<Vec<String>>>,
-    shared_event_data: Arc<TokioRwLock<SharedEventData>>,
-    scanner: Arc<SeatScanner>,
-    runtime: Arc<tokio::runtime::Runtime>,
-    ui_receiver: Receiver<UiMessage>,
-    ui_sender: Sender<UiMessage>,
-    bot_running: Arc<AtomicBool>,
-    browser_semaphore: Arc<Semaphore>,
-    cached_sections: Arc<RwLock<Vec<String>>>, // Add this line
-    bot_instances: Arc<RwLock<HashMap<usize, Arc<WebookBot>>>>,
-}
-
-#[derive(Debug, Clone)]
-enum UiMessage {
-    UpdateUser {
-        index: usize,
-        field: String,
-        value: String,
-    },
-    UpdateStatus(String),
-    RefreshTable,
-}
-
-impl BotApp {
-    fn new() -> Self {
-        let (tx, rx) = unbounded();
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(16)
-                .enable_all()
-                .build()
-                .unwrap(),
-        );
-
-        let app = Self {
-            users: Arc::new(RwLock::new(Vec::new())),
-            proxies: Vec::new(),
-            event_url: String::new(),
-            seats: "1".to_string(),
-            dseats: "1".to_string(),
-            selected_team: "home".to_string(),
-            selected_sections: Arc::new(RwLock::new(Vec::new())),
-            shared_event_data: Arc::new(TokioRwLock::new(SharedEventData {
-                chart_key: None,
-                event_key: None,
-                channel_key_common: None,
-                channel_key: None,
-                event_id: None,
-                home_team: None,
-                away_team: None,
-                channels: None,
-                season_structure: None,
-                chart_token: None,
-                commit_hash: None,
-            })),
-            scanner: Arc::new(SeatScanner::new()),
-            cached_sections: Arc::new(RwLock::new(Vec::new())),
-            runtime: runtime.clone(),
-            ui_receiver: rx,
-            ui_sender: tx.clone(),
-            bot_running: Arc::new(AtomicBool::new(false)),
-            browser_semaphore: Arc::new(Semaphore::new(1)),
-            bot_instances: Arc::new(RwLock::new(HashMap::new())),
-        };
-        
-        // Start countdown timer after creating app
-        app.start_countdown_timer();
-        app
-    }
-    fn load_users(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("CSV files", &["csv"])
-            .pick_file()
-        {
-            match self.read_users_csv(path) {
-                Ok(users) => {
-                    *self.users.write() = users.into_iter().map(Arc::new).collect();
-                    self.assign_proxies();
-                    self.ui_sender.send(UiMessage::RefreshTable).unwrap();
-                    info!("Loaded {} users", self.users.read().len());
-                }
-                Err(e) => error!("Failed to load users: {}", e),
-            }
-        }
-    }
-
-    fn read_users_csv(&self, path: PathBuf) -> Result<Vec<User>> {
-        let mut users = Vec::new();
-        let mut reader = csv::Reader::from_path(path)?;
-
-        for result in reader.deserialize() {
-            let record: HashMap<String, String> = result?;
-
-            let user = User {
-                email: record.get("email").cloned().unwrap_or_default(),
-                password: record.get("password").cloned().unwrap_or_default(),
-                user_type: record.get("type").cloned().unwrap_or("*".to_string()),
-                proxy: None,
-                status: "Ready".to_string(),
-                expire_time: Arc::new(AtomicUsize::new(0)), // Initialize with AtomicUsize
-                seats_booked: 0,
-                last_update: Utc::now().format("%H:%M:%S").to_string(),
-                logs: Vec::new(),
-                bot_instance: None,
-                assigned_seats: Vec::new(),
-                save_seat_assignment: Vec::new(),
-            };
-
-            if !user.email.is_empty() && !user.password.is_empty() {
-                users.push(user);
-            }
-        }
-
-        Ok(users)
-    }
-
-    fn load_proxies(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Text files", &["txt"])
-            .pick_file()
-        {
-            match fs::read_to_string(path) {
-                Ok(content) => {
-                    self.proxies = content
-                        .lines()
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    self.assign_proxies();
-                    info!("Loaded {} proxies", self.proxies.len());
-                }
-                Err(e) => error!("Failed to load proxies: {}", e),
-            }
-        }
-    }
-
-    fn assign_proxies(&mut self) {
-        if self.proxies.is_empty() {
-            return;
-        }
-
-        let mut users = self.users.write();
-        for (i, user) in users.iter_mut().enumerate() {
-            if let Some(user) = Arc::get_mut(user) {
-                user.proxy = Some(self.proxies[i % self.proxies.len()].clone());
-            }
-        }
-    }
-    // NEW, CORRECT VERSION
-    fn start_countdown_timer(&self) {
-        let ui_sender = self.ui_sender.clone();
-        let users = self.users.clone();
-
-        std::thread::spawn(move || {
-            loop {
-                // Wait for one second at the start of the loop
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                
-                let mut needs_repaint = false;
-                { // Scoped to release the read lock quickly
-                    let users_guard = users.read();
-                    for user in users_guard.iter() {
-                        // Load the current time
-                        let current_expire = user.expire_time.load(Ordering::Relaxed);
-                        // If it's greater than 0, decrement it
-                        if current_expire > 0 {
-                            user.expire_time.store(current_expire - 1, Ordering::Relaxed);
-                            needs_repaint = true;
-                        }
-                    }
-                } // users_guard lock is released here
-
-                // If any timer was updated, send ONE message to the UI to refresh
-                if needs_repaint {
-                    let _ = ui_sender.send(UiMessage::RefreshTable);
-                }
-            }
-        });
-    }
-    
-    fn start_bot(&self) {
-        if self.bot_running.load(Ordering::Relaxed) {
-            return;
-        }
-    
-        self.bot_running.store(true, Ordering::Relaxed);
-        
-        let users = self.users.clone();
-        let event_url = self.event_url.clone();
-        let seats = self.seats.parse::<usize>().unwrap_or(1);
-        let dseats = self.dseats.parse::<usize>().unwrap_or(1);
-        let shared_data = self.shared_event_data.clone();
-        let scanner = self.scanner.clone();
-        let ui_sender = self.ui_sender.clone();
-        let browser_semaphore = self.browser_semaphore.clone();
-        let bot_instances = self.bot_instances.clone(); // Add this line
-        let runtime = self.runtime.clone();
-        let cached_sections = self.cached_sections.clone();
-    
-        std::thread::spawn(move || {
-            runtime.block_on(async {
-                let users_read = users.read();
-                let mut handles = Vec::new();
-    
-                for (i, user) in users_read.iter().enumerate() {
-                    let user = user.clone();
-                    let event_url = event_url.clone();
-                    let shared_data = shared_data.clone();
-                    let scanner = scanner.clone();
-                    let ui_sender = ui_sender.clone();
-                    let browser_semaphore = browser_semaphore.clone();
-                    let bot_instances = bot_instances.clone(); // Add this line
-                    let cached_sections = cached_sections.clone();
-                    let handle = tokio::spawn(async move {
-                        Self::worker_thread(
-                            i,
-                            user,
-                            event_url,
-                            seats,
-                            dseats,
-                            shared_data,
-                            scanner,
-                            ui_sender,
-                            browser_semaphore,
-                            bot_instances, // Add this parameter
-                            cached_sections
-                        ).await;
-                    });
-    
-                    handles.push(handle);
-                }
-    
-                tokio::time::sleep(StdDuration::from_secs(5)).await;
-                
-                let shared_data = shared_data.read().await;
-                if let Some(event_key) = &shared_data.event_key {
-                    scanner.set_event_key(event_key.clone(), shared_data.season_structure.clone()).await;
-                    scanner.start_scanning().await;
-                }
-            });
-        });
-    }
-
-    async fn worker_thread(
-        index: usize,
-        user: Arc<User>,
-        event_url: String,
-        _seats: usize,
-        _dseats: usize,
-        shared_data: Arc<TokioRwLock<SharedEventData>>,
-        scanner: Arc<SeatScanner>,
-        ui_sender: Sender<UiMessage>,
-        browser_semaphore: Arc<Semaphore>,
-        bot_instances: Arc<RwLock<HashMap<usize, Arc<WebookBot>>>>,
-        cached_sections: Arc<RwLock<Vec<String>>>, // <-- Add this parameter
-    ) {
-        let _permit = browser_semaphore.acquire().await.unwrap();
-
-        ui_sender.send(UiMessage::UpdateUser {
-            index,
-            field: "status".to_string(),
-            value: "Logging in...".to_string(),
-        }).unwrap();
-    
-        let bot = Arc::new(
-            WebookBot::new(
-                user.email.clone(),
-                user.password.clone(),
-                true,
-                user.proxy.clone(),
-                shared_data.clone(),
-            )
-            .unwrap(),
-        );
-        {
-            let mut bots = bot_instances.write();
-            bots.insert(index, bot.clone());
-        }
-
-        ui_sender
-        .send(UiMessage::UpdateUser {
-            index,
-            field: "status".to_string(),
-            value: "Login successful".to_string(),
-        })
-        .unwrap();
-
-        drop(_permit);
-
-        // Initialize shared data ONLY ONCE, using a static flag
-        use std::sync::Once;
-        static INIT: Once = Once::new();
-        
-        let is_first_thread = INIT.is_completed(); // Check if it's already run
-    
-        INIT.call_once(|| {
-            let bot_clone = bot.clone();
-            let event_url_clone = event_url.clone();
-            let shared_data_clone = shared_data.clone();
-            let cached_sections_clone = cached_sections.clone(); // Clone for the task
-            let ui_sender_clone = ui_sender.clone(); // Clone for the task
-            
-            tokio::spawn(async move {
-                info!("First thread initializing shared data...");
-                // These can fail, so handle the results gracefully
-                if let Err(e) = bot_clone.extract_seatsio_chart_data().await {
-                    error!("Failed to extract chart data: {}", e); return;
-                }
-                if let Err(e) = bot_clone.send_event_detail_request(&extract_event_id(&event_url_clone)).await {
-                     error!("Failed to get event details: {}", e); return;
-                }
-                if let Err(e) = bot_clone.get_rendering_info().await {
-                     error!("Failed to get rendering info: {}", e); return;
-                }
-                
-                // --- THIS IS THE NEW PART ---
-                // Now that data is fetched, update the UI cache
-                let data = shared_data_clone.read().await;
-                if let Some(channels) = &data.channels {
-                    let mut prefixes: Vec<String> = channels
-                        .iter()
-                        .filter_map(|ch| ch.split('-').next().map(String::from))
-                        .collect::<std::collections::HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    prefixes.sort();
-                    
-                    // Write the processed sections to the cache
-                    *cached_sections_clone.write() = prefixes;
-                    
-                    // Tell the UI it needs to redraw itself
-                    let _ = ui_sender_clone.send(UiMessage::RefreshTable);
-                    info!("✅ Shared data initialized and UI cache populated.");
-                }
-            });
-        });
-    
-        // If another thread is already initializing, wait a bit for it to finish
-        if is_first_thread {
-            tokio::time::sleep(StdDuration::from_secs(5)).await;
-        }
-    
-        let _ = bot.get_webook_hold_token().await;
-        let _ = bot.get_expire_time().await;
-    
-        let expire_time = bot.expire_time.load(Ordering::Relaxed);
-        user.expire_time.store(expire_time, Ordering::Relaxed);
-        ui_sender.send(UiMessage::UpdateUser {
-            index,
-            field: "expire_time".to_string(),
-            value: expire_time.to_string(),
-        }).unwrap();
-    
-        ui_sender
-            .send(UiMessage::UpdateUser {
-                index,
-                field: "status".to_string(),
-                value: "Ready".to_string(),
-            })
-            .unwrap();
-    
-        println!("User {} is ready", index);
-    }
-    fn stop_bot(&self) {
-        self.bot_running.store(false, Ordering::Relaxed);
-        let scanner = self.scanner.clone();
-        self.runtime.spawn(async move {
-            scanner.stop_scanning().await;
-        });
-        info!("Stop signal sent to bot.");
-    }
-
-    fn fill_seats(&self) {
-        let seats_per_user = self.seats.parse::<usize>().unwrap_or(1);
-        let selected_sections = self.selected_sections.read().clone();
-    
-        let runtime = self.runtime.clone();
-        let users = self.users.clone();
-        let shared_data = self.shared_event_data.clone();
-        let bot_instances = self.bot_instances.clone(); // Add this
-    
-        runtime.spawn(async move {
-            let shared_data = shared_data.read().await;
-            let empty_vec = Vec::new();
-            let channels = shared_data.channels.as_ref().unwrap_or(&empty_vec);
-    
-            let available_seats: Vec<String> = channels
-                .iter()
-                .filter(|ch| {
-                    selected_sections
-                        .iter()
-                        .any(|prefix| ch.starts_with(prefix))
-                })
-                .cloned()
-                .collect();
-    
-            let mut seat_index = 0;
-    
-            // Get bot instances from HashMap instead of User struct
-            let assignments = {
-                let users_guard = users.read();
-                let bots_guard = bot_instances.read();
-                let mut collected = Vec::new();
-                
-                for (i, user) in users_guard.iter().enumerate() {
-                    if user.user_type == "*" {
-                        if let Some(bot) = bots_guard.get(&i) {
-                            let mut user_seats = Vec::new();
-                            for _ in 0..seats_per_user {
-                                if seat_index < available_seats.len() {
-                                    user_seats.push(available_seats[seat_index].clone());
-                                    seat_index += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                            if !user_seats.is_empty() {
-                                collected.push((bot.clone(), user_seats));
-                            }
-                        }
-                    }
-                }
-                collected
-            };
-    
-            for (bot, seats) in assignments {
-                for seat in seats {
-                    let _ = bot.take_seat(&seat, vec!["NO_CHANNEL".to_string()]).await;
-                }
-            }
-        });
-    }
-
-    fn create_section_checkboxes(&mut self, ui: &mut egui::Ui) {
-        let shared_data = self.runtime.block_on(async {
-            self.shared_event_data.read().await.clone()
-        });
-        
-        if let Some(channels) = &shared_data.channels {
-            // Extract unique prefixes
-            let mut prefixes: Vec<String> = channels
-                .iter()
-                .filter_map(|ch| ch.split('-').next().map(String::from))
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
-            prefixes.sort();
-            
-            ui.horizontal(|ui| {
-                ui.label("Sections:");
-                for prefix in prefixes {
-                    let mut selected = self.selected_sections.read().contains(&prefix);
-                    if ui.checkbox(&mut selected, &prefix).changed() {
-                        let mut sections = self.selected_sections.write();
-                        if selected {
-                            if !sections.contains(&prefix) {
-                                sections.push(prefix);
-                            }
-                        } else {
-                            sections.retain(|s| s != &prefix);
-                        }
-                    }
-                }
-            });
-        }
-    }
-}
-
-impl Default for BotApp {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn extract_event_id(url: &str) -> String {
-    if let Ok(parsed) = Url::parse(url) {
-        let path_segments: Vec<&str> = parsed
-            .path_segments()
-            .map(|segments| segments.collect())
-            .unwrap_or_default();
-
-        if let Some(pos) = path_segments.iter().position(|&s| s == "events") {
-            if pos + 1 < path_segments.len() {
-                return path_segments[pos + 1].to_string();
-            }
-        }
-    }
-    "unknown-event-id".to_string()
-}
-
-impl eframe::App for BotApp {
+impl eframe::App for WebbookBot {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Process UI messages
-        while let Ok(msg) = self.ui_receiver.try_recv() {
-            match msg {
-                UiMessage::UpdateUser { index, field, value } => {
-                    if let Some(user) = self.users.read().get(index) {
-                        match field.as_str() {
-                            "status" => {
-                                if let Some(user) = Arc::get_mut(&mut self.users.write()[index]) {
-                                    user.status = value;
-                                }
-                            }
-                            "expire_time" => {
-                                let expire_val = value.parse().unwrap_or(0);
-                                user.expire_time.store(expire_val, Ordering::Relaxed);
-                            }
-                            "seats_booked" => {
-                                if let Some(user) = Arc::get_mut(&mut self.users.write()[index]) {
-                                    user.seats_booked = value.parse().unwrap_or(0);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                UiMessage::UpdateStatus(status) => {
-                    info!("{}", status);
-                }
-                UiMessage::RefreshTable => {
-                    ctx.request_repaint();
-                }
-            }
-        }
-
-        // Top panel with controls
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if ui.button("Load Users CSV").clicked() {
-                    self.load_users();
-                }
-
-                if ui.button("Load Proxies").clicked() {
-                    self.load_proxies();
-                }
-
-                ui.separator();
-
-                ui.label("Event URL:");
-                ui.text_edit_singleline(&mut self.event_url);
-
-                ui.label("Seats:");
-                ui.add(egui::TextEdit::singleline(&mut self.seats).desired_width(50.0));
-
-                ui.label("DSeats:");
-                ui.add(egui::TextEdit::singleline(&mut self.dseats).desired_width(50.0));
-
-                ui.separator();
-
-                if !self.bot_running.load(Ordering::Relaxed) {
-                    if ui.button("Start Bot").clicked() {
-                        self.start_bot();
-                    }
-                } else {
-                    if ui.button("Stop Bot").clicked() {
-                        self.stop_bot();
-                    }
-                }
-
-                if ui.button("Fill Seats").clicked() {
-                    self.fill_seats();
-                }
-            });
-        });
-
-        // Team selection
-        egui::TopBottomPanel::top("team_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Favorite Team:");
-                egui::ComboBox::from_label("")
-                    .selected_text(&self.selected_team)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.selected_team,
-                            "home".to_string(),
-                            "Home Team",
-                        );
-                        ui.selectable_value(
-                            &mut self.selected_team,
-                            "away".to_string(),
-                            "Away Team",
-                        );
-                    });
-            });
-        });
-
-        // Section checkboxes
-        // In eframe::App for BotApp, under "Section checkboxes"
-        // OLD, BLOCKING CODE
-        // In eframe::App for BotApp, under "Section checkboxes"
-        // NEW, NON-BLOCKING CODE
-        egui::TopBottomPanel::top("sections_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Sections:");
-                
-                // Read from the non-blocking cache. This is very fast.
-                let cached_sections = self.cached_sections.read();
-                
-                if cached_sections.is_empty() {
-                    ui.label("Waiting for event data...");
-                } else {
-                    let mut selected_sections = self.selected_sections.write();
-                    for prefix in cached_sections.iter() {
-                        let mut is_selected = selected_sections.contains(prefix);
-                        if ui.checkbox(&mut is_selected, prefix).changed() {
-                            if is_selected {
-                                if !selected_sections.contains(prefix) {
-                                    selected_sections.push(prefix.clone());
-                                }
-                            } else {
-                                selected_sections.retain(|s| s != prefix);
-                            }
-                        }
-                    }
-                }
-            });
-        });
-
-        // Main content - Users table
+        // Set dark theme
+        ctx.set_visuals(egui::Visuals::light());
+        self.ctx = Some(ctx.clone());
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::both().show(ui, |ui| {
-                use egui_extras::{Column, TableBuilder};
+            ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
 
-                let table = TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .column(Column::initial(200.0).clip(true)) // Email
-                    .column(Column::initial(60.0)) // Type
-                    .column(Column::initial(150.0).clip(true)) // Proxy
-                    .column(Column::initial(100.0)) // Status
-                    .column(Column::initial(80.0)) // Expire
-                    .column(Column::initial(80.0)) // Seats
-                    .column(Column::initial(100.0)) // Last Update
-                    .column(Column::initial(60.0)) // Pay
-                    .min_scrolled_height(0.0);
+            // Top panel with controls
+            self.render_top_panel(ui);
 
-                table
-                    .header(20.0, |mut header| {
-                        header.col(|ui| {
-                            ui.strong("Email");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Type");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Proxy");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Status");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Expire");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Seats");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Last Update");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Pay");
-                        });
-                    })
-                    .body(|body| {
-                        let users = self.users.read();
-                        body.rows(25.0, users.len(), |mut row| {
-                            let row_index = row.index();
-                            if let Some(user) = users.get(row_index) {
-                                row.col(|ui| {
-                                    ui.label(&user.email);
-                                });
-                                row.col(|ui| {
-                                    ui.label(&user.user_type);
-                                });
-                                row.col(|ui| {
-                                    ui.label(user.proxy.as_deref().unwrap_or("None"));
-                                });
-                                row.col(|ui| {
-                                    ui.label(&user.status);
-                                });
-                                // In the users table body where you display expire time:
-                                row.col(|ui| { 
-                                    ui.label(format!("{}", user.expire_time.load(Ordering::Relaxed))); 
-                                });
-                                row.col(|ui| {
-                                    ui.label(format!("{}", user.seats_booked));
-                                });
-                                row.col(|ui| {
-                                    ui.label(&user.last_update);
-                                });
-                                row.col(|ui| {
-                                    if ui.button("Pay").clicked() {
-                                        self.handle_payment(row_index);
-                                    }
-                                });
-                            }
-                        });
-                    });
-            });
-        });
+            ui.add_space(10.0);
 
-        // Status bar
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "Users: {} | Proxies: {} | Bot: {}",
-                    self.users.read().len(),
-                    self.proxies.len(),
-                    if self.bot_running.load(Ordering::Relaxed) {
-                        "Running"
-                    } else {
-                        "Stopped"
-                    }
-                ));
-            });
-        });
-
-        // Auto-refresh
-        ctx.request_repaint_after(StdDuration::from_millis(100));
-    }
-}
-
-impl BotApp {
-    fn handle_payment(&self, user_index: usize) {
-        let users = self.users.clone();
-        let event_url = self.event_url.clone();
-        let runtime = self.runtime.clone();
-        let ui_sender = self.ui_sender.clone();
-
-        // REPLACE the entire tokio::spawn block in handle_payment with this:
-        runtime.spawn(async move {
-            // Extract the data needed first to release the lock
-            let user_data = {
-                users.read().get(user_index).map(|u| {
-                    (
-                        u.email.clone(),
-                        u.password.clone(),
-                        event_url.clone(),
-                        u.proxy.clone(),
-                    )
-                })
-            }; // Lock on `users` is released here
-
-            if let Some((email, password, event_url, proxy)) = user_data {
-                let payload = json!({
-                    "email": email,
-                    "password": password,
-                    "eventsUrl": event_url,
-                    "proxyUrl": proxy.as_deref().unwrap_or("")
+            // Main table
+            egui::ScrollArea::both()
+                .auto_shrink([false, true])
+                .id_source("table_scroll")  // ADD THIS LINE - unique ID
+                .max_height(400.0)
+                .max_width(800.0)
+                .show(ui, |ui| {
+                    self.render_user_table(ui);
                 });
 
-                let client = Client::new();
-                match client
-                    .post("http://localhost:3000/getPayment")
-                    .json(&payload)
-                    .timeout(StdDuration::from_secs(30))
-                    .send()
-                    .await
-                {
-                    Ok(response) => {
-                        let status = if response.status().is_success() {
-                            "Payment completed"
-                        } else {
-                            "Payment failed"
-                        };
-
-                        let _ = ui_sender.send(UiMessage::UpdateUser {
-                            index: user_index,
-                            field: "status".to_string(),
-                            value: status.to_string(),
-                        });
-                    }
-                    Err(e) => {
-                        let _ = ui_sender.send(UiMessage::UpdateUser {
-                            index: user_index,
-                            field: "status".to_string(),
-                            value: format!("Payment error: {}", e),
-                        });
-                    }
+            // Status bar at bottom
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                self.render_status_bar(ui);
+            });
+        });
+        // In the update method, add this before update_countdowns():
+        /*if let Some(receiver) = &mut self.bot_manager_receiver {
+            if let Ok(bot_manager) = receiver.try_recv() {
+                self.bot_manager = Some(bot_manager);
+                println!("Bot manager stored and ready for Fill Seats!");
+            }
+        }*/
+        // ADD THIS BLOCK HERE:
+        if self.bot_running {
+            self.receive_bot_manager(); // ADD THIS LINE
+            self.update_countdowns();
+            self.update_assigned_seats();
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        if self.show_transfer_modal {
+            self.show_transfer_modal(ctx);  // Pass ctx, not ui
+        }
+        // Show logs modal if requested
+        if self.show_logs_modal {
+            self.show_logs_modal(ctx);
+        }
+        if self.show_payment_modal {
+            self.render_payment_modal(ctx);
+        }
+        if self.recaptcha_site_key.is_none() && self.bot_running {
+            if self.recaptcha_site_key.is_none() && self.bot_running {
+                if let Some(rt) = &self.rt {
+                    rt.spawn(async move {
+                        let client = reqwest::Client::new();
+                        if let Ok(response) = client.get("http://localhost:3000/extractcaptcha").send().await {
+                            if let Ok(result) = response.json::<serde_json::Value>().await {
+                                if let Some(site_key) = result.get("siteKey").and_then(|v| v.as_str()) {
+                                    println!("🔑 reCAPTCHA site key extracted: {}", site_key);
+                                    // You can store it later when needed
+                                }
+                            }
+                        }
+                    });
                 }
             }
-        });
+        }
     }
-
 }
 
-fn main() -> Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+fn main() -> Result<(), eframe::Error> {
+    env_logger::init();
 
-    // Run the GUI application
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1700.0, 800.0])
-            .with_title("Webook Bot - Rust Edition"),
+            .with_inner_size([1200.0, 700.0])
+            .with_title("Webbook Bot - Rust Edition"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Webook Bot",
+        "Webbook Bot",
         options,
-        Box::new(|_cc| Ok(Box::new(BotApp::new()))),
+        Box::new(|_cc| Box::new(WebbookBot::new())),
     )
-    .map_err(|e| anyhow::anyhow!("Failed to run application: {}", e))
 }
