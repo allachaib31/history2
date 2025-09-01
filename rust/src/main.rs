@@ -145,7 +145,7 @@ struct MessageData {
 
 #[derive(Debug, Deserialize)]
 struct MessageBody {
-    #[serde(rename = "objectLabel")]
+    #[serde(rename = "objectLabelOrUuid")]
     object_label: Option<String>,
     status: Option<String>,
     #[serde(rename = "holdTokenHash")]
@@ -538,7 +538,7 @@ impl BotUser {
             "channelKeys": channel_keys,
             "validateEventsLinkedToSameChart": true
         });
-
+        println!("{:?}",request_body);
         let request_body_str = request_body.to_string();
         let signature = self.generate_signature(&request_body_str).await?;
 
@@ -557,8 +557,9 @@ impl BotUser {
             .body(request_body_str)
             .send()
             .await?;
-
         let status = response.status();
+        let response_text = response.text().await?;
+        println!("Response status: {:?}", response_text);
         let success = status == 200 || status == 204; // Only these are success
 
         if success {
@@ -2127,7 +2128,7 @@ impl WebbookBot {
         bot_manager: &Option<Arc<BotManager>>,
         users_data: &[User],
     ) {
-        println!("{:?}",msg_text);
+        //println!("{:?}",msg_text);
         let messages: Vec<ScannerMessage> = if let Ok(msgs) = serde_json::from_str(msg_text) {
             msgs
         } else if let Ok(single_msg) = serde_json::from_str::<ScannerMessage>(msg_text) {
@@ -2143,11 +2144,14 @@ impl WebbookBot {
             }
     
             let body = &message.message.body;
-    
+
+            //println!("{:?}",body);
             // Handle seat becoming free - Simple version
             if let (Some(status), Some(object_label)) = (&body.status, &body.object_label) {
+                println!("free1");
                 if status == "free" && !object_label.is_empty() {
-                    Self::handle_seat_free(object_label, selected_channels, bot_manager, &Arc::new(RwLock::new(SharedData::default())), users_data).await;
+                    println!("free2");
+                    Self::handle_seat_free(object_label, selected_channels, bot_manager, users_data).await;
                 }
             }
         }
@@ -2334,10 +2338,9 @@ impl WebbookBot {
 
     async fn handle_seat_free(
         seat_id: &str,
-        selected_channels: &[String],
+        selected_channels: &[String], 
         bot_manager: &Option<Arc<BotManager>>,
-        shared_data: &Arc<RwLock<SharedData>>,
-        users_data: &[User], // Add this parameter
+        users_data: &[User],
     ) {
         // Check if seat matches selected channels
         let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
@@ -2346,20 +2349,19 @@ impl WebbookBot {
         }
     
         if let Some(manager) = bot_manager {
+            // Get the real shared_data from bot_manager
+            let shared_data = &manager.shared_data;  // ← This contains the actual event data
             // Find first ready star user
             for (i, bot_user) in manager.users.iter().enumerate() {
-                // Check if this is a star user and is ready
                 if i < users_data.len() && 
                    users_data[i].user_type == "*" && 
                    users_data[i].status == "Active" {
                     
                     println!("SEAT FREE: {}. Assigning to {}", seat_id, bot_user.email);
                     
-                    // Clone what we need for the async task
                     let user_clone = bot_user.clone();
                     let seat_clone = seat_id.to_string();
                     let shared_data_clone = shared_data.clone();
-                    
                     tokio::spawn(async move {
                         if let Err(e) = Self::take_seat_fast(&user_clone, &seat_clone, &shared_data_clone).await {
                             println!("Scanner seat take failed: {}", e);
@@ -2368,7 +2370,7 @@ impl WebbookBot {
                         }
                     });
                     
-                    break; // Stop after first user
+                    break;
                 }
             }
         }
@@ -2380,8 +2382,43 @@ impl WebbookBot {
         shared_data: &Arc<RwLock<SharedData>>,
     ) -> Result<()> {
         // Build channel keys quickly
-        let channel_keys = vec!["NO_CHANNEL".to_string()]; // Simplified for speed
-        
+        let channel_keys = if let Ok(data) = shared_data.try_read() {
+            let mut keys = vec!["NO_CHANNEL".to_string()];
+            
+            if let Some(common_keys) = &data.channel_key_common {
+                keys.extend(common_keys.clone());
+            }
+            
+            if let Some(channel_key_obj) = &data.channel_key {
+                if let Some(home_team) = &data.home_team {
+                    if let Some(team_id) = home_team.get("_id").and_then(|v| v.as_str()) {
+                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
+                            for key in team_keys {
+                                if let Some(key_str) = key.as_str() {
+                                    keys.push(key_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                if let Some(away_team) = &data.away_team {
+                    if let Some(team_id) = away_team.get("_id").and_then(|v| v.as_str()) {
+                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
+                            for key in team_keys {
+                                if let Some(key_str) = key.as_str() {
+                                    keys.push(key_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            keys
+        } else {
+            vec!["NO_CHANNEL".to_string()]
+        };
         let event_keys = if let Ok(data) = shared_data.try_read() {
             if let Some(event_key) = &data.event_key {
                 vec![event_key.clone()]
