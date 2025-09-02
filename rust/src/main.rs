@@ -15,7 +15,13 @@ use tokio::sync::{mpsc, RwLock};
 use url::Url;
 
 const WORKSPACE_KEY: &str = "3d443a0c-83b8-4a11-8c57-3db9d116ef76";
-
+#[derive(Clone)] // <-- ADD THIS LINE
+struct PreparedSeatRequest {
+    url: String,
+    json_payload_template: String, 
+    headers: reqwest::header::HeaderMap,
+    client: reqwest::Client,
+}
 #[derive(Default)]
 pub struct WebbookBot {
     // Form fields
@@ -57,6 +63,7 @@ pub struct WebbookBot {
     show_logs_modal: bool,
     selected_user_logs: Vec<String>,
     selected_user_email: String,
+    ready_receiver: Option<mpsc::UnboundedReceiver<usize>>, // ADD THIS LINE
 }
 
 #[derive(Clone, Deserialize)]
@@ -129,6 +136,8 @@ struct BotUser {
     expire_time: Arc<AtomicUsize>,
     browser_id: Arc<Mutex<Option<String>>>,
     held_seats: Arc<Mutex<Vec<String>>>,
+    prepared_request: Arc<Mutex<Option<PreparedSeatRequest>>>, // ADD THIS
+
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,7 +198,7 @@ async fn build_channel_keys_for_user(shared_data: &Arc<RwLock<SharedData>>) -> V
             channel_keys.extend(common_keys.clone());
         }
     }
-    
+    channel_keys.push("b3928bdf-1ed8-f080-ffa0-c20560318dea".to_string());
     channel_keys
 }
 impl TokenManager {
@@ -224,7 +233,13 @@ impl BotUser {
         token_manager: Arc<TokenManager>,
     ) -> Result<Self> {
         let proxy = Proxy::all(&proxy_url)?;
-        let client = Client::builder().proxy(proxy).build()?;
+        let client = Client::builder()
+        .proxy(proxy)
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(30)))
+        .pool_max_idle_per_host(10) // Keep connections alive
+        .timeout(std::time::Duration::from_secs(5)) // Fast timeout
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .build()?;
 
         Ok(Self {
             email,
@@ -236,8 +251,66 @@ impl BotUser {
             expire_time: Arc::new(AtomicUsize::new(0)),
             browser_id: Arc::new(Mutex::new(None)),
             held_seats: Arc::new(Mutex::new(Vec::new())),
+            prepared_request: Arc::new(Mutex::new(None)),
         })
     }
+    // In impl BotUser
+
+    // NEW FUNCTION: Pre-builds everything except the seat ID.
+    // Call this function once after the user's hold token is acquired.
+    async fn prepare_request_template(&self) -> Result<PreparedSeatRequest> {
+        let hold_token = self.webook_hold_token.lock().clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token"))?;
+
+        let shared_data = self.shared_data.read().await;
+        let event_keys = if let Some(event_key) = &shared_data.event_key {
+            vec![event_key.clone()]
+        } else {
+            return Err(anyhow::anyhow!("No event key available"));
+        };
+
+        let channel_keys = build_channel_keys_for_user(&self.shared_data).await;
+
+        // IMPORTANT: Use a placeholder for the seat ID!
+        let request_body_template = json!({
+            "events": event_keys,
+            "holdToken": hold_token,
+            "objects": [{"objectId": "__SEAT_ID_PLACEHOLDER__"}], // The magic placeholder
+            "channelKeys": channel_keys,
+            "validateEventsLinkedToSameChart": true
+        });
+
+        // Store it as a string
+        let json_payload_template = request_body_template.to_string();
+        
+        // We can't pre-calculate the signature because it depends on the final payload.
+        // We will calculate it just-in-time, which is extremely fast (CPU-bound).
+
+        // Pre-build headers
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "*/*".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
+        headers.insert("x-client-tool", "Renderer".parse()?);
+        if let Some(browser_id) = self.browser_id.lock().as_ref() {
+            headers.insert("x-browser-id", browser_id.parse()?);
+        }
+        
+        // We will add the x-signature header later.
+
+        Ok(PreparedSeatRequest {
+            url: format!(
+                "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
+                WORKSPACE_KEY
+            ),
+            json_payload_template,
+            headers,
+            client: self.client.clone(),
+        })
+    }
+
+    // ULTRA-FAST execution - no building, just fire!
+    
+
     async fn release_seat(&self, seat_id: &str, event_keys: &[String]) -> Result<bool> {
         let hold_token = self.webook_hold_token.lock().clone()
             .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
@@ -294,52 +367,7 @@ impl BotUser {
     
         Ok(success)
     }
-    async fn prepare_take_request(
-        &self,
-        seat_id: &str,
-        channel_keys: &[String],
-        event_keys: &[String]
-    ) -> Result<(String, reqwest::header::HeaderMap, String)> {
-        let hold_token = self.webook_hold_token.lock().clone()
-            .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
     
-        let request_body = json!({
-            "events": event_keys,
-            "holdToken": hold_token,
-            "objects": [{"objectId": seat_id}],
-            "channelKeys": channel_keys,
-            "validateEventsLinkedToSameChart": true
-        });
-    
-        let request_body_str = request_body.to_string();
-        let signature = self.generate_signature(&request_body_str).await?;
-    
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("accept", "*/*".parse()?);
-        headers.insert("content-type", "application/json".parse()?);
-        headers.insert("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?);
-        headers.insert("x-client-tool", "Renderer".parse()?);
-        headers.insert("x-signature", signature.parse()?);
-    
-        if let Some(browser_id) = self.browser_id.lock().as_ref() {
-            headers.insert("x-browser-id", browser_id.parse()?);
-        }
-    
-        if let Some(commit_hash) = &self.shared_data.read().await.commit_hash {
-            let referer = format!(
-                "https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={}",
-                commit_hash
-            );
-            headers.insert("referer", referer.parse()?);
-        }
-    
-        let url = format!(
-            "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
-            WORKSPACE_KEY
-        );
-    
-        Ok((url, headers, request_body_str))
-    }
     async fn retake_seats(
         &self,
         seats_to_retake: Vec<String>,
@@ -538,7 +566,7 @@ impl BotUser {
             "channelKeys": channel_keys,
             "validateEventsLinkedToSameChart": true
         });
-        println!("{:?}",request_body);
+        //println!("{:?}",request_body);
         let request_body_str = request_body.to_string();
         let signature = self.generate_signature(&request_body_str).await?;
 
@@ -558,8 +586,8 @@ impl BotUser {
             .send()
             .await?;
         let status = response.status();
-        let response_text = response.text().await?;
-        println!("Response status: {:?}", response_text);
+        //let response_text = response.text().await?;
+        //println!("Response status: {:?}", response_text);
         let success = status == 200 || status == 204; // Only these are success
 
         if success {
@@ -694,6 +722,42 @@ impl BotUser {
     }
 }
 
+async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<()> {
+    // 1. Get the pre-built template. This lock is extremely short.
+    let prepared = bot_user.prepared_request.lock().clone()
+        .ok_or_else(|| anyhow::anyhow!("Request template not ready"))?;
+
+    // 2. Create the final payload with a fast string replacement. NO JSON serialization.
+    let final_payload = prepared.json_payload_template.replace("__SEAT_ID_PLACEHOLDER__", seat_id);
+    println!("{:?}",final_payload);
+    // 3. Generate signature (very fast CPU-bound task).
+    let signature = bot_user.generate_signature(&final_payload).await?;
+    println!("{:?}",signature);
+    // 4. Clone headers and add the final signature.
+    let mut headers = prepared.headers.clone();
+    headers.insert("x-signature", signature.parse()?);
+
+    // 5. FIRE THE REQUEST!
+    let response = prepared.client
+        .post(&prepared.url)
+        .headers(headers)
+        .body(final_payload) // Use the final string payload
+        .send()
+        .await?;
+
+    // 6. Check status ONLY. Do not wait for `.json()`.
+    let status = response.status();
+    let data: Value = response.json().await?;
+    println!("{:?}",data);
+
+    if status == 200 || status == 204 {
+        bot_user.held_seats.lock().push(seat_id.to_string());
+        Ok(())
+    } else {
+        // The request failed, return an error.
+        Err(anyhow::anyhow!("Seat take failed with status: {}", status))
+    }
+}
 fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
     let parsed = Url::parse(event_url)?;
     let segments: Vec<&str> = parsed
@@ -879,7 +943,6 @@ impl BotManager {
     }
     async fn start_bot(&self, status_sender: mpsc::UnboundedSender<String>) -> Result<()> {
         status_sender.send("Starting bot...".to_string()).ok();
-
         // Extract event ID from URL
         let event_id = extract_event_key(&self.event_url)?;
 
@@ -908,53 +971,72 @@ impl BotManager {
             .ok();
         // Replace with:
         // In BotManager::start_bot method, replace the user loop:
-        for user in &self.users {
-            // Generate browser ID for this user if they don't have one
-            user.generate_browser_id(); // This will create unique ID only if None
+        let mut user_tasks = Vec::new();
 
-            for attempt in 1..=3 {
-                status_sender
-                    .send(format!(
-                        "User {}: Attempt {} - Getting hold token",
-                        user.email, attempt
-                    ))
-                    .ok();
-                match user.get_webook_hold_token().await {
-                    Ok(_) => {
-                        status_sender
-                            .send(format!("User {}: Getting expire time", user.email))
-                            .ok();
-                        if let Err(e) = user.get_expire_time().await {
-                            status_sender
-                                .send(format!(
-                                    "User {}: Error getting expire time: {}",
-                                    user.email, e
-                                ))
+        for (user_index, user) in self.users.iter().enumerate() {
+            user.generate_browser_id();
+            
+            let user_clone = user.clone();
+            let status_sender_clone = status_sender.clone();
+            
+            // Spawn individual task for each user
+            // In WebbookBot::start_bot, inside the tokio::spawn loop
+
+            // ... inside the for loop for each user ...
+            let task = tokio::spawn(async move {
+                for attempt in 1..=3 {
+                    status_sender_clone
+                        .send(format!("User {}: Attempt {} - Getting hold token", user_clone.email, attempt))
+                        .ok();
+                        
+                    match user_clone.get_webook_hold_token().await {
+                        Ok(_) => {
+                            status_sender_clone
+                                .send(format!("User {}: Getting expire time", user_clone.email))
                                 .ok();
-                            println!("Expire time error for {}: {}", user.email, e);
-                        } else {
-                            status_sender
-                                .send(format!("User {}: Success", user.email))
-                                .ok();
-                            break;
+                                
+                            if let Err(e) = user_clone.get_expire_time().await {
+                                status_sender_clone
+                                    .send(format!("User {}: Error getting expire time: {}", user_clone.email, e))
+                                    .ok();
+                            } else {
+
+                                // ---> ADD THIS BLOCK HERE <---
+                                // Now that the user is ready, prepare the request template.
+                                match user_clone.prepare_request_template().await {
+                                    Ok(template) => {
+                                        *user_clone.prepared_request.lock() = Some(template);
+                                        status_sender_clone
+                                            .send(format!("User {}: Request template prepared", user_clone.email))
+                                            .ok();
+                                    },
+                                    Err(e) => {
+                                        status_sender_clone
+                                            .send(format!("User {}: FAILED to prepare template: {}", user_clone.email, e))
+                                            .ok();
+                                    }
+                                }
+                                // ---> END OF ADDED BLOCK <---
+
+                                // USER IS READY - Send ready signal immediately
+                                status_sender_clone
+                                    .send(format!("USER_READY:{}", user_index))
+                                    .ok();
+                                break;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        status_sender
-                            .send(format!(
-                                "User {}: Attempt {} failed: {}",
-                                user.email, attempt, e
-                            ))
-                            .ok();
-                        if attempt == 3 {
-                            status_sender
-                                .send(format!("User {}: All attempts failed", user.email))
+                        Err(e) => {
+                            status_sender_clone
+                                .send(format!("User {}: Attempt {} failed: {}", user_clone.email, attempt, e))
                                 .ok();
                         }
                     }
                 }
-            }
+            });
+            user_tasks.push(task);
+            // ...
         }
+        
         status_sender
             .send("Bot initialization complete!".to_string())
             .ok();
@@ -994,6 +1076,7 @@ impl WebbookBot {
             bot_manager_receiver: None,
             expire_receiver: None,         // This exists
             assigned_seats_receiver: None, // This exists
+            ready_receiver: None,
             ctx: None,           
             scanner_running: false,
             reserved_seats_map: Arc::new(Mutex::new(HashMap::new())),
@@ -1194,7 +1277,7 @@ impl WebbookBot {
                     }
     
                     // Perform atomic transfer
-                    match Self::atomic_transfer_seat(&from_user, &to_user, &seat_id, &channel_keys, &event_keys).await {
+                    /*match Self::atomic_transfer_seat(&from_user, &to_user, &seat_id, &channel_keys, &event_keys).await {
                         Ok(true) => {
                             successful_transfers += 1;
                             println!("Successfully transferred seat: {}", seat_id);
@@ -1207,14 +1290,14 @@ impl WebbookBot {
                             println!("Transfer error for seat {}: {}", seat_id, e);
                             break;
                         }
-                    }
+                    }*/
                 }
     
                 println!("Transfer complete: {} seats transferred successfully", successful_transfers);
             });
         }
     }
-    async fn atomic_transfer_seat(
+    /*async fn atomic_transfer_seat(
         from_user: &BotUser,
         to_user: &BotUser, 
         seat_id: &str,
@@ -1265,7 +1348,8 @@ impl WebbookBot {
         }
     
         Ok(success)
-    }
+    }*/
+    
     fn build_channel_keys(&self) -> Vec<String> {
         let mut channel_keys = vec!["NO_CHANNEL".to_string()];
 
@@ -1369,30 +1453,7 @@ impl WebbookBot {
             }
         }
     }
-    fn sync_expire_times(&mut self) {
-        if let Some(bot_manager) = &self.bot_manager {
-            for (i, bot_user) in bot_manager.users.iter().enumerate() {
-                let expire_time = bot_user.expire_time.load(Ordering::Relaxed);
-                self.users[i].expire = expire_time.to_string();
-            }
-        }
-    }
-    fn refresh_user_token(&mut self, user_index: usize) {
-        if let Some(rt) = &self.rt {
-            if let Some(bot_manager) = &self.bot_manager {
-                let user = bot_manager.users[user_index].clone();
-                self.users[user_index].status = "Refreshing".to_string();
-
-                rt.spawn(async move {
-                    if let Err(e) = user.get_webook_hold_token().await {
-                        println!("Failed to refresh token for {}: {}", user.email, e);
-                    } else if let Err(e) = user.get_expire_time().await {
-                        println!("Failed to get expire time for {}: {}", user.email, e);
-                    }
-                });
-            }
-        }
-    }
+    
     fn get_seats_from_selected_sections(&self) -> Vec<String> {
         let mut all_seats = Vec::new();
 
@@ -1607,18 +1668,23 @@ impl WebbookBot {
         let event_url = self.event_url.clone();
         let (status_sender, status_receiver) = mpsc::unbounded_channel();
         let (expire_sender, expire_receiver) = mpsc::unbounded_channel::<(usize, usize)>();
-
+    
         self.status_receiver = Some(status_receiver);
         self.expire_receiver = Some(expire_receiver);
-
+    
         if let Some(rt) = &self.rt {
             let shared_data = Arc::new(RwLock::new(SharedData::default()));
             self.shared_data = Some(shared_data.clone());
-
+    
             // ADD THESE TWO LINES HERE:
             let (bot_sender, bot_receiver) = mpsc::unbounded_channel();
             self.bot_manager_receiver = Some(bot_receiver);
-
+    
+            // ADD THESE TWO LINES RIGHT HERE: ⬇️⬇️⬇️
+            let (ready_sender, ready_receiver) = mpsc::unbounded_channel::<usize>();
+            self.ready_receiver = Some(ready_receiver);
+            // ⬆️⬆️⬆️ ADD THESE TWO LINES RIGHT HERE
+    
             rt.spawn(async move {
                 match BotManager::new(users_data, event_url, shared_data).await {
                     Ok(bot_manager) => {
@@ -1969,14 +2035,36 @@ impl WebbookBot {
 
     fn render_status_bar(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-
-        // Check for status updates
+    
+        // Collect all status messages first to avoid borrow conflicts
+        let mut status_messages = Vec::new();
         if let Some(receiver) = &mut self.status_receiver {
             while let Ok(status) = receiver.try_recv() {
+                status_messages.push(status);
+            }
+        }
+    
+        // Now process the collected messages without borrowing conflicts
+        for status in status_messages {
+            // Handle special ready messages
+            if status.starts_with("USER_READY:") {
+                if let Ok(user_index) = status[11..].parse::<usize>() {
+                    if user_index < self.users.len() {
+                        self.users[user_index].status = "Active".to_string();
+                        self.update_ready_star_users_atomic();
+                        
+                        // Start scanner if conditions met
+                        let has_selected_sections = self.selected_sections.values().any(|&selected| selected);
+                        if has_selected_sections && !self.scanner_running {
+                            self.start_scanner();
+                        }
+                    }
+                }
+            } else {
                 self.sections_status = status;
             }
         }
-
+    
         ui.horizontal(|ui| {
             ui.label(format!("Users: {} |", self.users.len()));
             ui.label(format!("Proxies: {} |", self.proxies.len()));
@@ -1994,29 +2082,46 @@ impl WebbookBot {
         if self.scanner_running || !self.bot_running || self.shared_data.is_none() {
             return;
         }
-
+    
         let selected_channels = self.get_selected_channels();
         if selected_channels.is_empty() {
             return;
         }
-
+    
         self.scanner_running = true;
         self.reserved_seats_map.lock().clear();
         self.update_ready_star_users();
-
+    
+        // ADD THIS: Create or reuse assigned_seats_sender
+        let assigned_seats_sender = if let Some(_sender) = &self.assigned_seats_receiver {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            self.assigned_seats_receiver = Some(receiver);
+            sender
+        } else {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            self.assigned_seats_receiver = Some(receiver);
+            sender
+        };
+    
         if let Some(rt) = &self.rt {
             let shared_data = self.shared_data.clone().unwrap();
             let bot_manager = self.bot_manager.clone();
             let selected_channels_clone = selected_channels.clone();
-
-            let users_data_clone = self.users.clone(); // Add this line
-
+            let users_data_clone = self.users.clone();
+            
+            // FIX: Clone the Arc values BEFORE the async block
+            let ready_star_users_clone = self.ready_star_users.clone();
+            let next_user_index_clone = self.next_user_index.clone();
+            
             rt.spawn(async move {
                 if let Err(e) = Self::run_websocket_scanner(
                     shared_data, 
                     bot_manager, 
                     selected_channels_clone,
-                    users_data_clone // Add this parameter
+                    users_data_clone,
+                    assigned_seats_sender,
+                    ready_star_users_clone,    // Use the cloned values
+                    next_user_index_clone,     // Use the cloned values
                 ).await {
                     println!("Scanner error: {}", e);
                 }
@@ -2056,6 +2161,54 @@ impl WebbookBot {
         bot_manager: Option<Arc<BotManager>>,
         selected_channels: Vec<String>,
         users_data: Vec<User>,
+        assigned_seats_sender: mpsc::UnboundedSender<(usize, String)>,
+        ready_star_users: Arc<Mutex<Vec<usize>>>,
+        next_user_index: Arc<AtomicUsize>,
+    ) -> Result<()> {
+        let mut reconnect_attempts = 0;
+        const MAX_RECONNECT_ATTEMPTS: usize = 200;
+        
+        loop {
+            match Self::connect_and_listen(
+                &shared_data,
+                &bot_manager,
+                &selected_channels,
+                &users_data,
+                &assigned_seats_sender,
+                &ready_star_users,
+                &next_user_index,
+            ).await {
+                Ok(_) => {
+                    println!("WebSocket connection ended normally");
+                    break;
+                }
+                Err(e) => {
+                    reconnect_attempts += 1;
+                    println!("Scanner error (attempt {}): {}", reconnect_attempts, e);
+                    
+                    if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                        println!("Max reconnection attempts reached, stopping scanner");
+                        break;
+                    }
+                    
+                    // Wait before reconnecting (exponential backoff)
+                    let wait_time = std::cmp::min(2_u64.pow(reconnect_attempts as u32), 60);
+                    println!("Reconnecting in {} seconds...", wait_time);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(wait_time)).await;
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    async fn connect_and_listen(
+        shared_data: &Arc<RwLock<SharedData>>,
+        bot_manager: &Option<Arc<BotManager>>,
+        selected_channels: &[String],
+        users_data: &[User],
+        assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
+        ready_star_users: &Arc<Mutex<Vec<usize>>>,
+        next_user_index: &Arc<AtomicUsize>,
     ) -> Result<()> {
         use tokio_tungstenite::{connect_async, tungstenite::Message};
         use futures_util::{SinkExt, StreamExt};
@@ -2105,351 +2258,88 @@ impl WebbookBot {
         while let Some(msg) = read.next().await {
             match msg? {
                 Message::Text(text) => {
-                    Self::process_websocket_message_simple(
+                    // 🚀 DIRECT PROCESSING - NO CHANNELS, NO ASYNC SPAWN
+                    Self::process_message_ultra_fast(
                         &text,
                         &selected_channels,
                         &bot_manager,
-                        &users_data,
+                        &ready_star_users,
+                        &next_user_index,
+                        &assigned_seats_sender,
                     ).await;
                 }
-                Message::Close(_) => {
-                    println!("WebSocket connection closed");
-                    break;
-                }
+                Message::Close(_) => break,
                 _ => {}
             }
         }
     
         Ok(())
     }
-    async fn process_websocket_message_simple(
-        msg_text: &str,
-        selected_channels: &[String],
-        bot_manager: &Option<Arc<BotManager>>,
-        users_data: &[User],
-    ) {
-        //println!("{:?}",msg_text);
-        let messages: Vec<ScannerMessage> = if let Ok(msgs) = serde_json::from_str(msg_text) {
-            msgs
-        } else if let Ok(single_msg) = serde_json::from_str::<ScannerMessage>(msg_text) {
-            vec![single_msg]
-        } else {
-            return;
-        };
-        //println!("{:?}", messages);
-    
-        for message in messages {
-            if message.message_type != "MESSAGE_PUBLISHED" {
-                continue;
-            }
-    
-            let body = &message.message.body;
+    // In impl WebbookBot
 
-            //println!("{:?}",body);
-            // Handle seat becoming free - Simple version
-            if let (Some(status), Some(object_label)) = (&body.status, &body.object_label) {
-                println!("free1");
-                if status == "free" && !object_label.is_empty() {
-                    println!("free2");
-                    Self::handle_seat_free(object_label, selected_channels, bot_manager, users_data).await;
-                }
-            }
-        }
-    }
-    async fn process_websocket_message(
+    // This function is now just for dispatching, not doing the work.
+    async fn process_message_ultra_fast(
         msg_text: &str,
-        selected_channels: &[String], 
-        bot_manager: &Option<Arc<BotManager>>,
-        shared_data: &Arc<RwLock<SharedData>>,
-        users_data: &[User],
-        reserved_seats_map: &Arc<Mutex<HashMap<String, Vec<String>>>>,
-        ready_star_users: &Arc<Mutex<Vec<usize>>>,
-        next_user_index: &Arc<AtomicUsize>,
-    ) {
-        let messages: Vec<ScannerMessage> = if let Ok(msgs) = serde_json::from_str(msg_text) {
-            msgs
-        } else if let Ok(single_msg) = serde_json::from_str::<ScannerMessage>(msg_text) {
-            vec![single_msg]
-        } else {
-            return;
-        };
-    
-        for message in messages {
-            if message.message_type != "MESSAGE_PUBLISHED" {
-                continue;
-            }
-    
-            let body = &message.message.body;
-    
-            // Handle seat becoming free - ROCKET LOGIC
-            if let (Some(status), Some(object_label)) = (&body.status, &body.object_label) {
-                if status == "free" && !object_label.is_empty() {
-                    Self::handle_seat_free_rocket(object_label, selected_channels, bot_manager, ready_star_users, next_user_index).await;
-                }
-            }
-    
-            // Handle seat reserved tracking
-            if let (Some(status), Some(hold_token_hash), Some(object_label)) = (&body.status, &body.hold_token_hash, &body.object_label) {
-                if status == "reservedByToken" && !hold_token_hash.is_empty() {
-                    let mut map = reserved_seats_map.lock();
-                    map.entry(hold_token_hash.clone()).or_insert_with(Vec::new).push(object_label.clone());
-                }
-            }
-    
-            // Handle token expired
-            if let (Some(message_type), Some(hold_token)) = (&body.message_type, &body.hold_token) {
-                if message_type == "HOLD_TOKEN_EXPIRED" && !hold_token.is_empty() {
-                    Self::handle_token_expired(hold_token, selected_channels, bot_manager, reserved_seats_map).await;
-                }
-            }
-        }
-    }
-    async fn handle_token_expired(
-        hold_token: &str,
         selected_channels: &[String],
         bot_manager: &Option<Arc<BotManager>>,
-        reserved_seats_map: &Arc<Mutex<HashMap<String, Vec<String>>>>,
-    ) {
-        // Generate SHA1 hash of hold token
-        use sha1::{Digest, Sha1};
-        let mut hasher = Sha1::new();
-        hasher.update(hold_token.as_bytes());
-        let hold_token_hash = hex::encode(hasher.finalize());
-    
-        // Get and remove expired seats
-        let expired_seats = {
-            let mut map = reserved_seats_map.lock();
-            map.remove(&hold_token_hash).unwrap_or_default()
-        };
-    
-        if expired_seats.is_empty() {
-            return;
-        }
-    
-        println!("⏰ TOKEN EXPIRED: {} seats available", expired_seats.len());
-    
-        // Process each expired seat
-        for seat_id in expired_seats {
-            // Check if seat matches selected channels
-            let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
-            if !matches_prefix {
-                continue;
-            }
-    
-            // Attempt booking with all ready star users
-            if let Some(manager) = bot_manager {
-                for (i, bot_user) in manager.users.iter().enumerate() {
-                    // Launch concurrent attempts (don't wait)
-                    let user_clone = bot_user.clone();
-                    let seat_clone = seat_id.clone();
-                    
-                    tokio::spawn(async move {
-                        if let Ok(_) = Self::take_seat_ultra_fast(&user_clone, &seat_clone).await {
-                            println!("🎯 TOKEN EXPIRED BOOKING: {} booked by {}", seat_clone, user_clone.email);
-                        }
-                    });
-                }
-            }
-        }
-    }
-    async fn handle_seat_free_rocket(
-        seat_id: &str,
-        selected_channels: &[String], 
-        bot_manager: &Option<Arc<BotManager>>,
         ready_star_users: &Arc<Mutex<Vec<usize>>>,
         next_user_index: &Arc<AtomicUsize>,
+        assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
     ) {
-        // Check prefix match
-        let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
-        if !matches_prefix {
+        if !msg_text.contains("\"status\":\"free\"") {
             return;
         }
-    
-        if let Some(manager) = bot_manager {
-            let users = ready_star_users.lock();
-            if users.is_empty() {
+
+        if let Some(seat_id) = Self::extract_seat_id_fast(msg_text) {
+            if !selected_channels.iter().any(|prefix| seat_id.starts_with(prefix)) {
                 return;
             }
-    
-            // Round-robin selection
-            let current_index = next_user_index.load(Ordering::Relaxed);
-            let user_index = users[current_index % users.len()];
-            next_user_index.store((current_index + 1) % users.len(), Ordering::Relaxed);
-            
-            if let Some(bot_user) = manager.users.get(user_index) {
-                println!("🟢 SEAT FREE: {}. Assigning sniper shot to {}", seat_id, bot_user.email);
-                
-                let user_clone = bot_user.clone();
-                let seat_clone = seat_id.to_string();
-                
-                tokio::spawn(async move {
-                    // Direct fast take without waiting
-                    if let Err(e) = Self::take_seat_ultra_fast(&user_clone, &seat_clone).await {
-                        // Don't log failures to reduce overhead
+
+            if let Some(manager) = bot_manager {
+                // 🚀 GET USER (Your logic is already good and fast)
+                println!("{:?}",seat_id);
+                let (user_index, bot_user) = {
+                    let users = ready_star_users.lock();
+                    if users.is_empty() { return; }
+                    let current_index = next_user_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let user_array_index = users[current_index % users.len()];
+                    if let Some(bot_user) = manager.users.get(user_array_index) {
+                        (user_array_index, bot_user.clone())
                     } else {
-                        println!("🚀 ROCKET SUCCESS: {} booked by {}", seat_clone, user_clone.email);
+                        return;
+                    }
+                };
+                // **FIX:** Clone the sender to create an owned handle for the new task.
+                let sender_clone = assigned_seats_sender.clone();
+
+                // 🚀 FIRE AND FORGET - THIS IS THE GO PATTERN!
+                // Spawn a new task to handle the HTTP request without blocking the listener.
+                tokio::spawn(async move {
+                    if let Err(_e) = take_seat_direct_final(&bot_user, &seat_id).await {
+                        // Optional: log the error, but don't do heavy work here.
+                        // println!("Failed to take seat {}: {}", seat_id, e);
+                    } else {
+                        // On success, notify the UI using the owned clone.
+                        sender_clone.send((user_index, seat_id)).ok();
                     }
                 });
             }
         }
     }
-    async fn take_seat_ultra_fast(
-        user: &BotUser,
-        seat_id: &str,
-    ) -> Result<()> {
-        // Ultra-fast implementation with minimal overhead
-        let hold_token = user.webook_hold_token.lock().clone()
-            .ok_or_else(|| anyhow::anyhow!("No hold token"))?;
-    
-        let request_body = json!({
-            "events": [user.shared_data.read().await.event_key],
-            "holdToken": hold_token,
-            "objects": [{"objectId": seat_id}],
-            "channelKeys": ["NO_CHANNEL"],
-            "validateEventsLinkedToSameChart": true
-        });
-    
-        let signature = user.generate_signature(&request_body.to_string()).await?;
-        
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("accept", "*/*".parse()?);
-        headers.insert("content-type", "application/json".parse()?);
-        headers.insert("x-client-tool", "Renderer".parse()?);
-        headers.insert("x-signature", signature.parse()?);
-        
-        if let Some(browser_id) = user.browser_id.lock().as_ref() {
-            headers.insert("x-browser-id", browser_id.parse()?);
+        // This can be a new standalone async function.
+    // 🚀 FASTEST POSSIBLE SEAT ID EXTRACTION
+    fn extract_seat_id_fast(msg_text: &str) -> Option<String> {
+        // Use string operations instead of JSON parsing for speed
+        if let Some(start) = msg_text.find("\"objectLabelOrUuid\":\"") {
+            let start_pos = start + 21; // Length of "objectLabelOrUuid":"
+            if let Some(end) = msg_text[start_pos..].find("\"") {
+                return Some(msg_text[start_pos..start_pos + end].to_string());
+            }
         }
-    
-        let response = user.client
-            .post(&format!("https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects", WORKSPACE_KEY))
-            .headers(headers)
-            .body(request_body.to_string())
-            .send()
-            .await?;
-    
-        if response.status() == 200 || response.status() == 204 {
-            user.held_seats.lock().push(seat_id.to_string());
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Seat take failed"))
-        }
+        None
     }
 
-    async fn handle_seat_free(
-        seat_id: &str,
-        selected_channels: &[String], 
-        bot_manager: &Option<Arc<BotManager>>,
-        users_data: &[User],
-    ) {
-        // Check if seat matches selected channels
-        let matches_prefix = selected_channels.iter().any(|prefix| seat_id.starts_with(prefix));
-        if !matches_prefix {
-            return;
-        }
-    
-        if let Some(manager) = bot_manager {
-            // Get the real shared_data from bot_manager
-            let shared_data = &manager.shared_data;  // ← This contains the actual event data
-            // Find first ready star user
-            for (i, bot_user) in manager.users.iter().enumerate() {
-                if i < users_data.len() && 
-                   users_data[i].user_type == "*" && 
-                   users_data[i].status == "Active" {
-                    
-                    println!("SEAT FREE: {}. Assigning to {}", seat_id, bot_user.email);
-                    
-                    let user_clone = bot_user.clone();
-                    let seat_clone = seat_id.to_string();
-                    let shared_data_clone = shared_data.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = Self::take_seat_fast(&user_clone, &seat_clone, &shared_data_clone).await {
-                            println!("Scanner seat take failed: {}", e);
-                        } else {
-                            println!("Scanner SUCCESS: {} booked by {}", seat_clone, user_clone.email);
-                        }
-                    });
-                    
-                    break;
-                }
-            }
-        }
-    }
 
-    async fn take_seat_fast(
-        user: &BotUser,
-        seat_id: &str,
-        shared_data: &Arc<RwLock<SharedData>>,
-    ) -> Result<()> {
-        // Build channel keys quickly
-        let channel_keys = if let Ok(data) = shared_data.try_read() {
-            let mut keys = vec!["NO_CHANNEL".to_string()];
-            
-            if let Some(common_keys) = &data.channel_key_common {
-                keys.extend(common_keys.clone());
-            }
-            
-            if let Some(channel_key_obj) = &data.channel_key {
-                if let Some(home_team) = &data.home_team {
-                    if let Some(team_id) = home_team.get("_id").and_then(|v| v.as_str()) {
-                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
-                            for key in team_keys {
-                                if let Some(key_str) = key.as_str() {
-                                    keys.push(key_str.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                if let Some(away_team) = &data.away_team {
-                    if let Some(team_id) = away_team.get("_id").and_then(|v| v.as_str()) {
-                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
-                            for key in team_keys {
-                                if let Some(key_str) = key.as_str() {
-                                    keys.push(key_str.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            
-            keys
-        } else {
-            vec!["NO_CHANNEL".to_string()]
-        };
-        let event_keys = if let Ok(data) = shared_data.try_read() {
-            if let Some(event_key) = &data.event_key {
-                vec![event_key.clone()]
-            } else {
-                return Err(anyhow::anyhow!("No event key"));
-            }
-        } else {
-            return Err(anyhow::anyhow!("Cannot read shared data"));
-        };
-
-        // Prepare headers quickly
-        let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("accept", "*/*".parse()?);
-        headers.insert("content-type", "application/json".parse()?);
-        headers.insert("origin", "https://cdn-eu.seatsio.net".parse()?);
-
-        if let Some(browser_id) = user.browser_id.lock().as_ref() {
-            headers.insert("x-browser-id", browser_id.parse()?);
-        }
-        headers.insert("x-client-tool", "Renderer".parse()?);
-
-        // Take the seat
-        let success = user.take_single_seat(seat_id, &channel_keys, &event_keys, &headers).await?;
-        
-        if success {
-            user.held_seats.lock().push(seat_id.to_string());
-            println!("🚀 SCANNER SUCCESS: {} booked by {}", seat_id, user.email);
-        }
-
-        Ok(())
-    }
 }
 
 impl eframe::App for WebbookBot {
@@ -2459,12 +2349,12 @@ impl eframe::App for WebbookBot {
         self.ctx = Some(ctx.clone());
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
-
+    
             // Top panel with controls
             self.render_top_panel(ui);
-
+    
             ui.add_space(10.0);
-
+    
             // Main table
             egui::ScrollArea::both()
                 .auto_shrink([false, true])
@@ -2474,19 +2364,40 @@ impl eframe::App for WebbookBot {
                 .show(ui, |ui| {
                     self.render_user_table(ui);
                 });
-
+    
             // Status bar at bottom
             ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                 self.render_status_bar(ui);
             });
         });
-        // In the update method, add this before update_countdowns():
-        /*if let Some(receiver) = &mut self.bot_manager_receiver {
-            if let Ok(bot_manager) = receiver.try_recv() {
-                self.bot_manager = Some(bot_manager);
-                println!("Bot manager stored and ready for Fill Seats!");
+    
+        // ADD THIS BLOCK HERE - RIGHT AFTER THE EGUI PANEL: ⬇️⬇️⬇️
+        // Handle individual user ready signals
+        // Handle individual user ready signals - collect first, then process
+        let mut ready_user_indices = Vec::new();
+        if let Some(receiver) = &mut self.ready_receiver {
+            while let Ok(user_index) = receiver.try_recv() {
+                ready_user_indices.push(user_index);
             }
-        }*/
+        }
+
+        // Now process the collected indices without borrow conflicts
+        for user_index in ready_user_indices {
+            if user_index < self.users.len() {
+                self.users[user_index].status = "Active".to_string();
+                self.update_ready_star_users_atomic(); // ✅ No borrow conflict
+                
+                // Start scanner when FIRST user becomes ready
+                let has_ready_users = self.users.iter().any(|u| u.status == "Active");
+                let has_selected_sections = self.selected_sections.values().any(|&selected| selected);
+                
+                if has_ready_users && has_selected_sections && !self.scanner_running {
+                    self.start_scanner(); // ✅ No borrow conflict
+                }
+            }
+        }
+        // ⬆️⬆️⬆️ ADD THIS BLOCK RIGHT HERE
+    
         // ADD THIS BLOCK HERE:
         if self.bot_running {
             self.receive_bot_manager(); // ADD THIS LINE
@@ -2502,6 +2413,8 @@ impl eframe::App for WebbookBot {
             self.show_logs_modal(ctx);
         }
     }
+
+
 }
 
 fn main() -> Result<(), eframe::Error> {
