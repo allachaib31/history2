@@ -119,6 +119,7 @@ struct SharedData {
     season_structure: Option<String>,
     chart_token: Option<String>,
     commit_hash: Option<String>,
+    favorite_team: Option<String>, 
 }
 
 struct TokenManager {
@@ -190,17 +191,7 @@ impl Default for User {
         }
     }
 }
-async fn build_channel_keys_for_user(shared_data: &Arc<RwLock<SharedData>>) -> Vec<String> {
-    let mut channel_keys = vec!["NO_CHANNEL".to_string()];
-    
-    if let Ok(data) = shared_data.try_read() {
-        if let Some(common_keys) = &data.channel_key_common {
-            channel_keys.extend(common_keys.clone());
-        }
-    }
-    channel_keys.push("b3928bdf-1ed8-f080-ffa0-c20560318dea".to_string());
-    channel_keys
-}
+
 impl TokenManager {
     fn new() -> Self {
         Self {
@@ -237,7 +228,7 @@ impl BotUser {
         .proxy(proxy)
         .pool_idle_timeout(Some(std::time::Duration::from_secs(30)))
         .pool_max_idle_per_host(10) // Keep connections alive
-        .timeout(std::time::Duration::from_secs(5)) // Fast timeout
+        .timeout(std::time::Duration::from_secs(10)) // Fast timeout
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()?;
 
@@ -258,35 +249,59 @@ impl BotUser {
 
     // NEW FUNCTION: Pre-builds everything except the seat ID.
     // Call this function once after the user's hold token is acquired.
-    async fn prepare_request_template(&self) -> Result<PreparedSeatRequest> {
+    async fn prepare_request_template(&self, channel_keys: Vec<String>) -> Result<PreparedSeatRequest> {
         let hold_token = self.webook_hold_token.lock().clone()
-            .ok_or_else(|| anyhow::anyhow!("No hold token"))?;
+        .ok_or_else(|| anyhow::anyhow!("No hold token"))?;
 
         let shared_data = self.shared_data.read().await;
-        let event_keys = if let Some(event_key) = &shared_data.event_key {
-            vec![event_key.clone()]
-        } else {
-            return Err(anyhow::anyhow!("No event key available"));
-        };
-
-        let channel_keys = build_channel_keys_for_user(&self.shared_data).await;
-
-        // IMPORTANT: Use a placeholder for the seat ID!
+        
+        // BUILD CHANNEL KEYS PROPERLY HERE
+        let mut final_channel_keys = vec!["NO_CHANNEL".to_string()];
+        
+        // Add common channel keys
+        if let Some(common_keys) = &shared_data.channel_key_common {
+            final_channel_keys.extend(common_keys.clone());
+        }
+        
+        // Add team-specific keys based on favorite team
+        if let Some(favorite_team) = &shared_data.favorite_team {
+            if let Some(channel_key_obj) = &shared_data.channel_key {
+                let team_to_use = match favorite_team.as_str() {
+                    "home" => &shared_data.home_team,
+                    "away" => &shared_data.away_team,
+                    _ => &shared_data.home_team,
+                };
+                
+                if let Some(team) = team_to_use {
+                    if let Some(team_id) = team.get("_id").and_then(|v| v.as_str()) {
+                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
+                            for key in team_keys {
+                                if let Some(key_str) = key.as_str() {
+                                    final_channel_keys.push(key_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Use final_channel_keys instead of the parameter
         let request_body_template = json!({
-            "events": event_keys,
+            "events": if let Some(event_key) = &shared_data.event_key {
+                vec![event_key.clone()]
+            } else {
+                return Err(anyhow::anyhow!("No event key available"));
+            },
             "holdToken": hold_token,
-            "objects": [{"objectId": "__SEAT_ID_PLACEHOLDER__"}], // The magic placeholder
-            "channelKeys": channel_keys,
+            "objects": [{"objectId": "__SEAT_ID_PLACEHOLDER__"}],
+            "channelKeys": final_channel_keys,  // USE THE PROPERLY BUILT KEYS
             "validateEventsLinkedToSameChart": true
         });
-
-        // Store it as a string
+    
         let json_payload_template = request_body_template.to_string();
+        println!("{:?}",json_payload_template);
         
-        // We can't pre-calculate the signature because it depends on the final payload.
-        // We will calculate it just-in-time, which is extremely fast (CPU-bound).
-
-        // Pre-build headers
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("accept", "*/*".parse()?);
         headers.insert("content-type", "application/json".parse()?);
@@ -294,9 +309,7 @@ impl BotUser {
         if let Some(browser_id) = self.browser_id.lock().as_ref() {
             headers.insert("x-browser-id", browser_id.parse()?);
         }
-        
-        // We will add the x-signature header later.
-
+    
         Ok(PreparedSeatRequest {
             url: format!(
                 "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
@@ -549,21 +562,48 @@ impl BotUser {
     async fn take_single_seat(
         &self,
         seat: &str,
-        channel_keys: &[String],
+        channel_keys: &[String],  // This parameter can be ignored now
         event_keys: &[String],
         base_headers: &reqwest::header::HeaderMap,
     ) -> Result<bool> {
-        let hold_token = self
-            .webook_hold_token
-            .lock()
-            .clone()
+        let hold_token = self.webook_hold_token.lock().clone()
             .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
-
+    
+        // BUILD CHANNEL KEYS THE SAME WAY
+        let shared_data = self.shared_data.read().await;
+        let mut final_channel_keys = vec!["NO_CHANNEL".to_string()];
+        
+        if let Some(common_keys) = &shared_data.channel_key_common {
+            final_channel_keys.extend(common_keys.clone());
+        }
+        
+        if let Some(favorite_team) = &shared_data.favorite_team {
+            if let Some(channel_key_obj) = &shared_data.channel_key {
+                let team_to_use = match favorite_team.as_str() {
+                    "home" => &shared_data.home_team,
+                    "away" => &shared_data.away_team,
+                    _ => &shared_data.home_team,
+                };
+                
+                if let Some(team) = team_to_use {
+                    if let Some(team_id) = team.get("_id").and_then(|v| v.as_str()) {
+                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
+                            for key in team_keys {
+                                if let Some(key_str) = key.as_str() {
+                                    final_channel_keys.push(key_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    
         let request_body = json!({
             "events": event_keys,
             "holdToken": hold_token,
             "objects": [{"objectId": seat}],
-            "channelKeys": channel_keys,
+            "channelKeys": final_channel_keys,  // USE THE PROPERLY BUILT KEYS
             "validateEventsLinkedToSameChart": true
         });
         //println!("{:?}",request_body);
@@ -747,16 +787,20 @@ async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<()>
 
     // 6. Check status ONLY. Do not wait for `.json()`.
     let status = response.status();
-    let data: Value = response.json().await?;
-    println!("{:?}",data);
+    //let data: Value = response.json().await?;
+    //println!("{:?}",data);
 
     if status == 200 || status == 204 {
+        // Success! Don't parse the body, just update state.
         bot_user.held_seats.lock().push(seat_id.to_string());
         Ok(())
     } else {
-        // The request failed, return an error.
-        Err(anyhow::anyhow!("Seat take failed with status: {}", status))
+        // The request failed. Now it's safe to read the body for error details.
+        let error_body = response.text().await.unwrap_or_else(|_| "Could not read error body".to_string());
+        println!("Error Body: {}", error_body);
+        Err(anyhow::anyhow!("Seat take failed with status: {}. Body: {}", status, error_body))
     }
+
 }
 fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
     let parsed = Url::parse(event_url)?;
@@ -941,7 +985,7 @@ impl BotManager {
         println!("Rendering info: {:?}", shared_data);
         Ok(())
     }
-    async fn start_bot(&self, status_sender: mpsc::UnboundedSender<String>) -> Result<()> {
+    async fn start_bot(&self, status_sender: mpsc::UnboundedSender<String>, channel_keys: Vec<String>) -> Result<()> {
         status_sender.send("Starting bot...".to_string()).ok();
         // Extract event ID from URL
         let event_id = extract_event_key(&self.event_url)?;
@@ -978,11 +1022,8 @@ impl BotManager {
             
             let user_clone = user.clone();
             let status_sender_clone = status_sender.clone();
+            let channel_keys_clone = channel_keys.clone(); // ADD THIS LINE
             
-            // Spawn individual task for each user
-            // In WebbookBot::start_bot, inside the tokio::spawn loop
-
-            // ... inside the for loop for each user ...
             let task = tokio::spawn(async move {
                 for attempt in 1..=3 {
                     status_sender_clone
@@ -1000,10 +1041,8 @@ impl BotManager {
                                     .send(format!("User {}: Error getting expire time: {}", user_clone.email, e))
                                     .ok();
                             } else {
-
-                                // ---> ADD THIS BLOCK HERE <---
-                                // Now that the user is ready, prepare the request template.
-                                match user_clone.prepare_request_template().await {
+                                // Use the cloned channel_keys
+                                match user_clone.prepare_request_template(channel_keys_clone.clone()).await {
                                     Ok(template) => {
                                         *user_clone.prepared_request.lock() = Some(template);
                                         status_sender_clone
@@ -1016,9 +1055,7 @@ impl BotManager {
                                             .ok();
                                     }
                                 }
-                                // ---> END OF ADDED BLOCK <---
-
-                                // USER IS READY - Send ready signal immediately
+        
                                 status_sender_clone
                                     .send(format!("USER_READY:{}", user_index))
                                     .ok();
@@ -1034,9 +1071,8 @@ impl BotManager {
                 }
             });
             user_tasks.push(task);
-            // ...
         }
-        
+
         status_sender
             .send("Bot initialization complete!".to_string())
             .ok();
@@ -1577,12 +1613,13 @@ impl WebbookBot {
             while let Ok((user_index, seat)) = receiver.try_recv() {
                 if user_index < self.users.len() {
                     if seat.is_empty() {
-                        // Clear seats signal
                         self.users[user_index].assigned_seats.clear();
+                        self.users[user_index].held_seats.clear();  // ADD THIS
                         self.users[user_index].seats = "0".to_string();
                     } else {
-                        // Add seat
-                        self.users[user_index].assigned_seats.push(seat);
+                        // Add seat to both arrays
+                        self.users[user_index].assigned_seats.push(seat.clone());
+                        self.users[user_index].held_seats.push(seat);  // ADD THIS
                         self.users[user_index].seats = self.users[user_index].assigned_seats.len().to_string();
                     }
                 }
@@ -1654,7 +1691,6 @@ impl WebbookBot {
             }
         }
     }
-
     fn start_bot(&mut self) {
         if self.users.is_empty() || self.proxies.is_empty() {
             println!("Please load users and proxies first");
@@ -1675,7 +1711,13 @@ impl WebbookBot {
         if let Some(rt) = &self.rt {
             let shared_data = Arc::new(RwLock::new(SharedData::default()));
             self.shared_data = Some(shared_data.clone());
-    
+            let favorite_team = self.favorite_team.clone();
+            rt.spawn({
+                let shared_data = shared_data.clone();
+                async move {
+                    shared_data.write().await.favorite_team = Some(favorite_team);
+                }
+            });
             // ADD THESE TWO LINES HERE:
             let (bot_sender, bot_receiver) = mpsc::unbounded_channel();
             self.bot_manager_receiver = Some(bot_receiver);
@@ -1683,8 +1725,8 @@ impl WebbookBot {
             // ADD THESE TWO LINES RIGHT HERE: ⬇️⬇️⬇️
             let (ready_sender, ready_receiver) = mpsc::unbounded_channel::<usize>();
             self.ready_receiver = Some(ready_receiver);
+            let channel_keys = self.build_channel_keys();
             // ⬆️⬆️⬆️ ADD THESE TWO LINES RIGHT HERE
-    
             rt.spawn(async move {
                 match BotManager::new(users_data, event_url, shared_data).await {
                     Ok(bot_manager) => {
@@ -1695,7 +1737,7 @@ impl WebbookBot {
 
                         let status_sender_clone = status_sender.clone();
 
-                        if let Err(e) = bot_manager_arc.start_bot(status_sender).await {
+                        if let Err(e) = bot_manager_arc.start_bot(status_sender, channel_keys.clone()).await {
                             println!("Bot error: {}", e);
                         }
 
@@ -1732,9 +1774,24 @@ impl WebbookBot {
                                             status_sender_clone
                                                 .send(format!("User {}: Token refreshed, attempting to retake {} seats", user.email, previously_held.len()))
                                                 .ok();
-                                            
+                                            match user.prepare_request_template(channel_keys.clone()).await {
+                                                Ok(template) => {
+                                                    *user.prepared_request.lock() = Some(template);
+                                                    status_sender_clone
+                                                        .send(format!("User {}: Request template updated successfully.", user.email))
+                                                        .ok();
+                                                },
+                                                Err(e) => {
+                                                    status_sender_clone
+                                                        .send(format!("User {}: FAILED to rebuild request template: {}", user.email, e))
+                                                        .ok();
+                                                }
+                                            }
+                                            status_sender_clone
+                                                .send(format!("User {}: Attempting to retake {} seats", user.email, previously_held.len()))
+                                                .ok();
                                             // Immediately try to retake the same seats
-                                            let channel_keys = build_channel_keys_for_user(&bot_manager_arc.shared_data).await;
+                                            let channel_keys = channel_keys.clone();
                                             let event_keys = if let Some(event_key) = bot_manager_arc.shared_data.read().await.event_key.as_ref() {
                                                 vec![event_key.clone()]
                                             } else {
@@ -2143,13 +2200,12 @@ impl WebbookBot {
     }
 
     fn update_ready_star_users(&mut self) {
-        let new_users: Vec<usize> = self
-            .users
-            .iter()
-            .enumerate()
-            .filter(|(_, user)| user.user_type == "*" && user.status == "Active")
-            .map(|(i, _)| i)
-            .collect();
+        let new_users: Vec<usize> = self.users
+        .iter()
+        .enumerate()
+        .filter(|(_, user)| user.user_type == "*" && user.status == "Active")
+        .map(|(i, _)| i)  // This is the actual index in self.users
+        .collect();
         
         let mut ready_users = self.ready_star_users.lock();
         ready_users.clear();
@@ -2296,31 +2352,32 @@ impl WebbookBot {
             }
 
             if let Some(manager) = bot_manager {
-                // 🚀 GET USER (Your logic is already good and fast)
-                println!("{:?}",seat_id);
-                let (user_index, bot_user) = {
+                let (actual_user_index, bot_user) = {  // RENAME to actual_user_index for clarity
                     let users = ready_star_users.lock();
                     if users.is_empty() { return; }
                     let current_index = next_user_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let user_array_index = users[current_index % users.len()];
-                    if let Some(bot_user) = manager.users.get(user_array_index) {
-                        (user_array_index, bot_user.clone())
+                    let actual_user_index = users[current_index % users.len()];  // This IS the correct index
+                    if let Some(bot_user) = manager.users.get(actual_user_index) {
+                        (actual_user_index, bot_user.clone())  // Pass the actual index
                     } else {
                         return;
                     }
                 };
-                // **FIX:** Clone the sender to create an owned handle for the new task.
+                
                 let sender_clone = assigned_seats_sender.clone();
-
-                // 🚀 FIRE AND FORGET - THIS IS THE GO PATTERN!
-                // Spawn a new task to handle the HTTP request without blocking the listener.
+                let seat_id_clone = seat_id.clone();  // Clone seat_id for the spawned task
+                
                 tokio::spawn(async move {
-                    if let Err(_e) = take_seat_direct_final(&bot_user, &seat_id).await {
-                        // Optional: log the error, but don't do heavy work here.
-                        // println!("Failed to take seat {}: {}", seat_id, e);
-                    } else {
-                        // On success, notify the UI using the owned clone.
-                        sender_clone.send((user_index, seat_id)).ok();
+                    match take_seat_direct_final(&bot_user, &seat_id_clone).await {
+                        Ok(_) => {
+                            // SUCCESS - send the update
+                            sender_clone.send((actual_user_index, seat_id_clone)).ok();
+                            println!("✓ Seat taken successfully, updating UI");
+                        }
+                        Err(e) => {
+                            // ERROR - log it but don't send update
+                            println!("✗ Failed to take seat {}: {}", seat_id_clone, e);
+                        }
                     }
                 });
             }
