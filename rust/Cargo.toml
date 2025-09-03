@@ -31,6 +31,11 @@ telegram-bot = "0.7"
 tokio-native-tls = "0.3"
 base64 = "0.21"
 webbrowser = "0.8"
+grammers-client = "0.7.0"
+grammers-session = "0.7.0"
+grammers-tl-types = "0.7.0"
+
+dialoguer = "0.10"
 
 
 [profile.release]
