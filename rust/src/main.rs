@@ -1256,17 +1256,20 @@ impl WebbookBot {
     // This is the function that formats and appends the log, just like in Go.
     fn add_log(&mut self, user_index: usize, message: &str) {
         if let Some(user) = self.users.get_mut(user_index) {
-            // Get current time in HH:MM:SS format
+            // Get current time in HH:MM:SS:mmm format (with milliseconds)
             let now = std::time::SystemTime::now();
             let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
             let secs = since_epoch.as_secs();
+            let millis = since_epoch.subsec_millis(); // ADD THIS LINE
+            
             let timestamp_str = format!(
-                "{:02}:{:02}:{:02}",
+                "{:02}:{:02}:{:02}:{:03}",  // CHANGE THIS - added {:03} for milliseconds
                 (secs / 3600) % 24,
                 (secs / 60) % 60,
-                secs % 60
+                secs % 60,
+                millis  // ADD THIS - milliseconds with 3 digits, zero-padded
             );
-
+    
             let log_entry = format!("[{}] {}", timestamp_str, message);
             user.logs.push(log_entry);
         }
@@ -1380,7 +1383,8 @@ impl WebbookBot {
     }
     // In impl WebbookBot
 
-    fn show_transfer_modal(&mut self, ctx: &egui::Context) {
+     // Improved transfer modal with better UI (matches Go version)
+     fn show_transfer_modal(&mut self, ctx: &egui::Context) {
         let mut close_modal = false;
         let mut transfer_details: Option<(usize, usize)> = None;
 
@@ -1388,38 +1392,42 @@ impl WebbookBot {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                // User selection logic...
-                let star_users: Vec<(usize, String)> = self.users.iter().enumerate()
+                // Get users by type (like Go version)
+                let star_users: Vec<(usize, String, usize)> = self.users.iter().enumerate()
                     .filter(|(_, u)| u.user_type == "*")
-                    .map(|(i, u)| (i, u.email.clone()))
+                    .map(|(i, u)| (i, u.email.clone(), u.held_seats.len()))
                     .collect();
                 
-                let plus_users: Vec<(usize, String)> = self.users.iter().enumerate()
+                let plus_users: Vec<(usize, String, usize)> = self.users.iter().enumerate()
                     .filter(|(_, u)| u.user_type == "+")
-                    .map(|(i, u)| (i, u.email.clone()))
+                    .map(|(i, u)| (i, u.email.clone(), u.held_seats.len()))
                     .collect();
 
-                // Dropdowns for selection
+                // From user selection with seat count display
                 ui.horizontal(|ui| {
                     ui.label("From (*) user:");
                     egui::ComboBox::from_id_source("from_user")
-                        .selected_text(self.transfer_from_user.clone())
+                        .selected_text(&self.transfer_from_user)
                         .show_ui(ui, |ui| {
-                            for (idx, email) in &star_users {
-                                if ui.selectable_label(self.transfer_from_user == *email, email).clicked() {
+                            for (idx, email, seat_count) in &star_users {
+                                let display_text = format!("{} (has {} seats)", email, seat_count);
+                                if ui.selectable_label(self.transfer_from_user == *email, &display_text).clicked() {
                                     self.transfer_from_user = email.clone();
                                 }
                             }
                         });
                 });
 
+                // To user selection with seat count display
                 ui.horizontal(|ui| {
                     ui.label("To (+) user:");
                     egui::ComboBox::from_id_source("to_user")
-                        .selected_text(self.transfer_to_user.clone())
+                        .selected_text(&self.transfer_to_user)
                         .show_ui(ui, |ui| {
-                            for (idx, email) in &plus_users {
-                                if ui.selectable_label(self.transfer_to_user == *email, email).clicked() {
+                            for (idx, email, seat_count) in &plus_users {
+                                let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+                                let display_text = format!("{} (has {}/{} seats)", email, seat_count, d_seats_limit);
+                                if ui.selectable_label(self.transfer_to_user == *email, &display_text).clicked() {
                                     self.transfer_to_user = email.clone();
                                 }
                             }
@@ -1427,17 +1435,40 @@ impl WebbookBot {
                 });
 
                 ui.separator();
+
+                // Show transfer preview (like Go version)
+                if !self.transfer_from_user.is_empty() && !self.transfer_to_user.is_empty() {
+                    if let (Some(from_user), Some(to_user)) = (
+                        self.users.iter().find(|u| u.email == self.transfer_from_user),
+                        self.users.iter().find(|u| u.email == self.transfer_to_user)
+                    ) {
+                        let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+                        let can_receive = if d_seats_limit > 0 { 
+                            d_seats_limit.saturating_sub(to_user.held_seats.len()) 
+                        } else { 
+                            from_user.held_seats.len() 
+                        };
+                        let will_transfer = std::cmp::min(from_user.held_seats.len(), can_receive);
+
+                        ui.label(format!("Will transfer {} seats", will_transfer));
+                        if will_transfer == 0 {
+                            ui.colored_label(egui::Color32::RED, "⚠️ No seats can be transferred!");
+                        }
+                    }
+                }
                 
                 // Button logic
                 ui.horizontal(|ui| {
-                    if ui.button("Transfer").clicked() {
-                         let from_index = self.users.iter().position(|u| u.email == self.transfer_from_user);
-                         let to_index = self.users.iter().position(|u| u.email == self.transfer_to_user);
+                    let can_transfer = !self.transfer_from_user.is_empty() && !self.transfer_to_user.is_empty();
+                    
+                    if ui.add_enabled(can_transfer, egui::Button::new("Transfer")).clicked() {
+                        let from_index = self.users.iter().position(|u| u.email == self.transfer_from_user);
+                        let to_index = self.users.iter().position(|u| u.email == self.transfer_to_user);
             
-                         if let (Some(from_idx), Some(to_idx)) = (from_index, to_index) {
-                             transfer_details = Some((from_idx, to_idx));
-                         }
-                         close_modal = true;
+                        if let (Some(from_idx), Some(to_idx)) = (from_index, to_index) {
+                            transfer_details = Some((from_idx, to_idx));
+                        }
+                        close_modal = true;
                     }
 
                     if ui.button("Cancel").clicked() {
@@ -1447,7 +1478,7 @@ impl WebbookBot {
             });
 
         if let Some((from_idx, to_idx)) = transfer_details {
-            self.execute_transfer(from_idx, to_idx);
+            self.execute_ultra_fast_transfer(from_idx, to_idx);
         }
     
         if close_modal {
@@ -1455,8 +1486,297 @@ impl WebbookBot {
             self.transfer_from_user.clear();
             self.transfer_to_user.clear();
         }
-    }  
-   
+    }
+
+    // NEW: Pre-build take request (like Go's prepareTakeSeatRequest)
+    async fn prepare_take_request_for_transfer(
+        to_user: &BotUser,
+        seat_id: &str,
+    ) -> Result<PreparedTransferRequest> {
+        let hold_token = to_user.webook_hold_token.lock().clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
+
+        let shared_data = to_user.shared_data.read().await;
+        
+        // Build channel keys the same way as take_single_seat
+        let mut final_channel_keys = vec!["NO_CHANNEL".to_string()];
+        
+        if let Some(common_keys) = &shared_data.channel_key_common {
+            final_channel_keys.extend(common_keys.clone());
+        }
+        
+        if let Some(favorite_team) = &shared_data.favorite_team {
+            if let Some(channel_key_obj) = &shared_data.channel_key {
+                let team_to_use = match favorite_team.as_str() {
+                    "home" => &shared_data.home_team,
+                    "away" => &shared_data.away_team,
+                    _ => &shared_data.home_team,
+                };
+                
+                if let Some(team) = team_to_use {
+                    if let Some(team_id) = team.get("_id").and_then(|v| v.as_str()) {
+                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
+                            for key in team_keys {
+                                if let Some(key_str) = key.as_str() {
+                                    final_channel_keys.push(key_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let event_key = shared_data.event_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Event key not available"))?;
+            
+        let request_body = json!({
+            "events": [event_key],
+            "holdToken": hold_token,
+            "objects": [{"objectId": seat_id}],
+            "channelKeys": final_channel_keys,
+            "validateEventsLinkedToSameChart": true
+        });
+
+        let body_str = request_body.to_string();
+        let signature = to_user.generate_signature(&body_str).await?;
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("accept", "*/*".parse()?);
+        headers.insert("content-type", "application/json".parse()?);
+        headers.insert("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?);
+        headers.insert("x-client-tool", "Renderer".parse()?);
+        headers.insert("x-signature", signature.parse()?);
+        
+        if let Some(browser_id) = to_user.browser_id.lock().as_ref() {
+            headers.insert("x-browser-id", browser_id.parse()?);
+        }
+
+        if let Some(commit_hash) = &shared_data.commit_hash {
+            let referer = format!(
+                "https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={}",
+                commit_hash
+            );
+            headers.insert("referer", referer.parse()?);
+        }
+
+        Ok(PreparedTransferRequest {
+            url: format!(
+                "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
+                WORKSPACE_KEY
+            ),
+            headers,
+            body: body_str,
+            client: to_user.client.clone(),
+        })
+    }
+
+    // REPLACE execute_ultra_fast_transfer with this version that properly uses ignore list:
+fn execute_ultra_fast_transfer(&mut self, from_user_index: usize, to_user_index: usize) {
+    let assigned_seats_sender = match &self.assigned_seats_sender {
+        Some(sender) => sender.clone(),
+        None => { 
+            println!("Cannot transfer: assigned_seats_sender is not available."); 
+            return; 
+        }
+    };
+
+    let log_sender = match &self.log_sender {
+        Some(sender) => sender.clone(),
+        None => {
+            println!("Cannot transfer: log_sender is not available.");
+            return;
+        }
+    };
+
+    let telegram_sender = match &self.telegram_sender {
+        Some(sender) => sender.clone(),
+        None => {
+            println!("Cannot transfer: telegram_sender is not available.");
+            return;
+        }
+    };
+
+    if let (Some(bot_manager), Some(rt)) = (&self.bot_manager, &self.rt) {
+        let from_user = bot_manager.users[from_user_index].clone();
+        let to_user = bot_manager.users[to_user_index].clone();
+        let seats_to_transfer = from_user.held_seats.lock().clone();
+        let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+
+        if seats_to_transfer.is_empty() {
+            log_sender.send((from_user_index, "❌ No seats to transfer".to_string())).ok();
+            return;
+        }
+
+        // ADD SEATS TO IGNORE LIST BEFORE STARTING TRANSFER (CRITICAL FIX)
+        let ignore_list = self.transfer_ignore_list.clone();
+        {
+            let mut list = ignore_list.lock();
+            for seat in &seats_to_transfer {
+                list.insert(seat.clone());
+            }
+        }
+        log_sender.send((from_user_index, format!("🚫 Added {} seats to scanner ignore list", seats_to_transfer.len()))).ok();
+
+        log_sender.send((from_user_index, "🔄 Starting ULTRA-FAST seat transfer...".to_string())).ok();
+        log_sender.send((to_user_index, "🔄 Receiving seats...".to_string())).ok();
+
+        // Send notification
+        telegram_sender.send(format!(
+            "🔄 SEAT TRANSFER STARTING\n\
+            ——————————————————\n\
+            From: {}\n\
+            To: {}\n\
+            Seats: {}\n\
+            ——————————————————",
+            from_user.email, to_user.email, seats_to_transfer.len()
+        )).ok();
+
+        rt.spawn(async move {
+            log_sender.send((to_user_index, "⚡ Starting atomic transfers (no pre-building needed)...".to_string())).ok();
+
+            // DO ATOMIC TRANSFERS - build requests fresh each time
+            let mut successfully_transferred = 0;
+            for seat_id in seats_to_transfer {
+                // Check seat limit
+                if d_seats_limit > 0 && to_user.held_seats.lock().len() >= d_seats_limit {
+                    log_sender.send((to_user_index, format!("⚠️ Reached limit of {} seats, stopping", d_seats_limit))).ok();
+                    break;
+                }
+
+                // Build fresh request after release (with delay fix)
+                match Self::atomic_transfer_seat_ultra_fast(
+                    &from_user,
+                    &to_user, 
+                    &seat_id,
+                    PreparedTransferRequest { // dummy
+                        url: String::new(),
+                        headers: reqwest::header::HeaderMap::new(),
+                        body: String::new(),
+                        client: to_user.client.clone(),
+                    },
+                    &assigned_seats_sender,
+                    &log_sender,
+                    from_user_index,
+                    to_user_index,
+                ).await {
+                    Ok(true) => {
+                        successfully_transferred += 1;
+                    }
+                    Ok(false) | Err(_) => {
+                        log_sender.send((from_user_index, format!("❌ Transfer failed for {}, stopping", seat_id))).ok();
+                        break;
+                    }
+                }
+            }
+
+            // CLEAR IGNORE LIST AFTER TRANSFER COMPLETES (CRITICAL)
+            ignore_list.lock().clear();
+            log_sender.send((from_user_index, "🚫 Cleared scanner ignore list".to_string())).ok();
+
+            // Final notification
+            log_sender.send((from_user_index, format!("📊 Ultra-fast transfer result: {} seats transferred", successfully_transferred))).ok();
+            
+            telegram_sender.send(format!(
+                "🔄 SEAT TRANSFER COMPLETE\n\
+                ——————————————————\n\
+                From: {}\n\
+                To: {}\n\
+                Seats Transferred: {}\n\
+                Target Total: {}\n\
+                ——————————————————",
+                from_user.email,
+                to_user.email,
+                successfully_transferred,
+                to_user.held_seats.lock().len()
+            )).ok();
+        });
+    }
+}
+
+// ALSO UPDATE the atomic_transfer_seat_ultra_fast to have the 50ms delay fix:
+async fn atomic_transfer_seat_ultra_fast(
+    from_user: &BotUser,
+    to_user: &BotUser,
+    seat_id: &str,
+    _prepared_request: PreparedTransferRequest, // We'll rebuild this
+    assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
+    log_sender: &mpsc::UnboundedSender<(usize, String)>,
+    from_user_index: usize,
+    to_user_index: usize,
+) -> Result<bool> {
+    let event_keys = if let Ok(data) = from_user.shared_data.try_read() {
+        if let Some(event_key) = &data.event_key { vec![event_key.clone()] } 
+        else { return Err(anyhow::anyhow!("Event key not found")); }
+    } else { return Err(anyhow::anyhow!("Could not read shared data")); };
+
+    // Step 1: Release the seat
+    log_sender.send((from_user_index, format!("🔄 Releasing seat: {}", seat_id))).ok();
+    if !from_user.release_seat(seat_id, &event_keys).await? {
+        return Err(anyhow::anyhow!("Failed to release seat"));
+    }
+
+    // Step 2: Small delay to let server process the release (CRITICAL FIX)
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Step 3: Build fresh take request AFTER release (not pre-built)
+    log_sender.send((to_user_index, format!("⚡ Taking seat: {}", seat_id))).ok();
+    
+    let fresh_request = match Self::prepare_take_request_for_transfer(to_user, seat_id).await {
+        Ok(req) => req,
+        Err(e) => {
+            log_sender.send((to_user_index, format!("❌ Failed to prepare fresh request: {}", e))).ok();
+            return Err(e);
+        }
+    };
+
+    let response = fresh_request.client
+        .post(&fresh_request.url)
+        .headers(fresh_request.headers)
+        .body(fresh_request.body)
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        // Success - update seat tracking
+        to_user.held_seats.lock().push(seat_id.to_string());
+        
+        // Update UI
+        assigned_seats_sender.send((from_user_index, format!("REMOVE:{}", seat_id))).ok();
+        assigned_seats_sender.send((to_user_index, seat_id.to_string())).ok();
+        
+        log_sender.send((to_user_index, format!("✅ ATOMIC SUCCESS: {}", seat_id))).ok();
+        return Ok(true);
+    } else {
+        let error_text = response.text().await.unwrap_or_default();
+        log_sender.send((to_user_index, format!("❌ Take failed: {} - trying to restore", error_text))).ok();
+        
+        // Try to restore the seat to original user
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await; // Give server time
+        
+        if let Ok(restore_req) = Self::prepare_take_request_for_transfer(from_user, seat_id).await {
+            let restore_response = restore_req.client
+                .post(&restore_req.url)
+                .headers(restore_req.headers)
+                .body(restore_req.body)
+                .send()
+                .await;
+                
+            match restore_response {
+                Ok(resp) if resp.status().is_success() => {
+                    from_user.held_seats.lock().push(seat_id.to_string());
+                    assigned_seats_sender.send((from_user_index, seat_id.to_string())).ok();
+                    log_sender.send((from_user_index, format!("✅ Restored: {}", seat_id))).ok();
+                }
+                _ => {
+                    log_sender.send((from_user_index, format!("⚠️ FAILED TO RESTORE: {}", seat_id))).ok();
+                }
+            }
+        }
+        
+        return Err(anyhow::anyhow!("Transfer failed"));
+    }
+}
     
     fn build_channel_keys(&self) -> Vec<String> {
         let mut channel_keys = vec!["NO_CHANNEL".to_string()];
@@ -2510,6 +2830,8 @@ impl WebbookBot {
                                         seat_id, "SCANNER", bot_manager, ready_scanner_users, 
                                         next_user_index, assigned_seats_sender, log_sender, telegram_sender, users_data
                                     ).await;
+                                }else if is_ignored {
+                                    log_sender.send((0, format!("🚫 SCANNER: Ignoring {} (transfer in progress)", seat_id))).ok();
                                 }
                             }
                         }
@@ -2532,21 +2854,24 @@ impl WebbookBot {
                                 hasher.update(token.as_bytes());
                                 let hash_result = hasher.finalize();
                                 let hash_hex = hex::encode(hash_result);
-
+                        
                                 let seats_to_snipe = {
                                     let mut map = reserved_seats_map.lock();
                                     map.remove(&hash_hex)
                                 };
-
+                        
                                 if let Some(seats) = seats_to_snipe {
                                     log_sender.send((0, format!("🎯 SNIPER: Token expired, found {} seats to take.", seats.len()))).ok();
                                     for seat_id in seats {
-                                        print!("{}", seat_id);
-                                        if selected_channels.iter().any(|prefix| seat_id.starts_with(prefix)) {
+                                        // ADD IGNORE LIST CHECK FOR SNIPER TOO (CRITICAL FIX)
+                                        let is_ignored = transfer_ignore_list.lock().contains(&seat_id);
+                                        if !is_ignored && selected_channels.iter().any(|prefix| seat_id.starts_with(prefix)) {
                                             Self::dispatch_seat_take_task(
                                                 &seat_id, "SNIPER", bot_manager, ready_scanner_users, 
                                                 next_user_index, assigned_seats_sender, log_sender, telegram_sender, users_data
                                             ).await;
+                                        } else if is_ignored {
+                                            log_sender.send((0, format!("🚫 SNIPER: Ignoring {} (transfer in progress)", seat_id))).ok();
                                         }
                                     }
                                 }
