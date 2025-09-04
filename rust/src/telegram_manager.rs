@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 const API_ID: i32 = 29997839;
 const API_HASH: &str = "8061d4958099b07974fae4498903f16f";
 const SESSION_FILE: &str = "telegram.session";
-const CHAT_ID: i64 = -4952333786;
+const CHAT_ID: i64 = 4952333786;
 
 pub struct TelegramManager {
     client: Client,

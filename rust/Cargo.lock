@@ -4898,6 +4898,7 @@ dependencies = [
  "tokio-tungstenite",
  "url",
  "webbrowser",
+ "winapi 0.3.9",
 ]
 
 [[package]]
