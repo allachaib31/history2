@@ -7,10 +7,10 @@ use grammers_tl_types::types::InputPeerChat;
 use tokio::sync::mpsc;
 
 // Your constants remain the same
-const API_ID: i32 = 29997839;
-const API_HASH: &str = "8061d4958099b07974fae4498903f16f";
+const API_ID: i32 = 21955613;
+const API_HASH: &str = "8cc201109a0697c1e42e70bc942931a7";
 const SESSION_FILE: &str = "telegram.session";
-const CHAT_ID: i64 = 4952333786;
+const CHAT_ID: i64 = 4785839500;
 
 pub struct TelegramManager {
     client: Client,

@@ -94,6 +94,8 @@ pub struct WebbookBot {
     node_process: Option<Child>, // ADD THIS for Node.js process management
     token_file_path: String,  
     expiry_warnings_sent: HashMap<usize, bool>,
+    pending_scanner_seats: Arc<Mutex<HashMap<usize, usize>>>,
+
 }
 
 #[derive(Clone, Deserialize)]
@@ -1232,6 +1234,7 @@ impl WebbookBot {
             node_process: None,                        // ADD THIS
             token_file_path: "tokens.json".to_string(), // ADD THIS
             expiry_warnings_sent: HashMap::new(),
+            pending_scanner_seats: Arc::new(Mutex::new(HashMap::new())),
         };
         app
     }
@@ -1450,86 +1453,110 @@ impl WebbookBot {
 
     
         // In impl WebbookBot
-    async fn dispatch_seat_take_task(
-        seat_id: &str,
-        log_prefix: &str,
-        bot_manager: &Option<Arc<BotManager>>,
-        ready_scanner_users: &Arc<Mutex<Vec<usize>>>,
-        next_user_index: &Arc<AtomicUsize>,
-        assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
-        log_sender: &mpsc::UnboundedSender<(usize, String)>,
-        telegram_sender: &mpsc::UnboundedSender<String>,
-        ui_users: &Vec<User>,
-    ) {
-        if let Some(manager) = bot_manager {
-            let ready_users_indices = ready_scanner_users.lock();
-            let num_ready = ready_users_indices.len();
-            if num_ready == 0 { return; }
+    // In impl WebbookBot
+async fn dispatch_seat_take_task(
+    seat_id: &str,
+    log_prefix: &str,
+    bot_manager: &Option<Arc<BotManager>>,
+    ready_scanner_users: &Arc<Mutex<Vec<usize>>>,
+    next_user_index: &Arc<AtomicUsize>,
+    assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
+    log_sender: &mpsc::UnboundedSender<(usize, String)>,
+    telegram_sender: &mpsc::UnboundedSender<String>,
+    ui_users: &Vec<User>,
+    pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>,
+) {
+    if let Some(manager) = bot_manager {
+        let ready_users_indices = ready_scanner_users.lock();
+        let num_ready = ready_users_indices.len();
+        if num_ready == 0 { return; }
 
-            let start_index = next_user_index.load(Ordering::Relaxed);
+        let start_index = next_user_index.load(Ordering::Relaxed);
 
-            // This loop cycles through all ready users to find a suitable one
-            for i in 0..num_ready {
-                let pool_index = (start_index + i) % num_ready;
-                let actual_user_index = ready_users_indices[pool_index];
+        for i in 0..num_ready {
+            let pool_index = (start_index + i) % num_ready;
+            let actual_user_index = ready_users_indices[pool_index];
 
-                if let (Some(ui_user), Some(bot_user)) = (ui_users.get(actual_user_index), manager.users.get(actual_user_index)) {
+            if let (Some(ui_user), Some(bot_user)) = (ui_users.get(actual_user_index), manager.users.get(actual_user_index)) {
+                let is_truly_ready = bot_user.webook_hold_token.lock().is_some()
+                                     && bot_user.expire_time.load(Ordering::Relaxed) > 0;
+
+                if is_truly_ready {
+                    let held_count = bot_user.held_seats.lock().len();
                     
-                    // --- THIS IS THE CRITICAL READINESS CHECK ---
-                    let is_truly_ready = bot_user.webook_hold_token.lock().is_some()
-                                        && bot_user.expire_time.load(Ordering::Relaxed) > 0;
+                    // --- FIX 1: UPDATED ELIGIBILITY LOGIC ---
+                    // This now correctly separates the logic for '*' and '+' users.
+                    let is_eligible = if ui_user.user_type == "*" {
+                        true // '*' users are ALWAYS eligible.
+                    } else if ui_user.user_type == "+" {
+                        // For '+' users, we MUST check pending seats against their limit.
+                        let pending_map = pending_scanner_seats.lock();
+                        let pending_count = *pending_map.get(&actual_user_index).unwrap_or(&0);
+                        ui_user.max_seats > 0 && (held_count + pending_count) < ui_user.max_seats
+                    } else {
+                        false
+                    };
 
-                    if is_truly_ready {
-                        let held_count = bot_user.held_seats.lock().len();
-                        
-                        let is_eligible = if ui_user.user_type == "*" {
-                            true // '*' type users have no limit
-                        } else if ui_user.user_type == "+" {
-                            ui_user.max_seats > 0 && held_count < ui_user.max_seats
-                        } else {
-                            false
-                        };
-
-                        if is_eligible {
-                            // Found a valid user. Update the index for the next run.
-                            next_user_index.store((pool_index + 1) % num_ready, Ordering::Relaxed);
-
-                            // --- Dispatch the task to this user ---
-                            let bot_user_clone = bot_user.clone();
-                            let sender_clone = assigned_seats_sender.clone();
-                            let log_sender_clone = log_sender.clone();
-                            let telegram_sender_clone = telegram_sender.clone();
-                            let seat_id_clone = seat_id.to_string();
-                            let log_prefix_clone = log_prefix.to_string();
-                            let user_email = ui_user.email.clone();
-                            let max_seats = ui_user.max_seats;
-
-                            tokio::spawn(async move {
-                                if take_seat_direct_final(&bot_user_clone, &seat_id_clone).await.is_ok() {
-                                    sender_clone.send((actual_user_index, seat_id_clone.clone())).ok();
-                                    log_sender_clone.send((actual_user_index, format!("🚀 {}: Booked {}", log_prefix_clone, seat_id_clone))).ok();
-                                    let total_held = bot_user_clone.held_seats.lock().len();
-                                    let message = format!(
-                                        "🎫 SEAT TAKING ✅ SUCCESS\n\
-                                        ━━━━━━━━━━━━━━━━━\n\
-                                        🔧 Account: {}\n\
-                                        💺 Seats Taken: 1\n\
-                                        📊 Total Held: {}/{}\n\
-                                        ━━━━━━━━━━━━━━━━━",
-                                        user_email,
-                                        total_held,
-                                        if max_seats == 0 { "∞".to_string() } else { max_seats.to_string() }
-                                    );
-                                    telegram_sender_clone.send(message).ok();
-                                }
-                            });
-                            return; // IMPORTANT: Exit the loop after dispatching to ONE user.
+                    if is_eligible {
+                        // --- FIX 2: CONDITIONAL PENDING SEAT INCREMENT ---
+                        // ONLY increment the pending count if the user is a '+' type.
+                        if ui_user.user_type == "+" {
+                            let mut pending_map = pending_scanner_seats.lock();
+                            *pending_map.entry(actual_user_index).or_insert(0) += 1;
                         }
+                        
+                        next_user_index.store((pool_index + 1) % num_ready, Ordering::Relaxed);
+
+                        // Clone necessary data for the spawned task
+                        let pending_scanner_seats_clone = pending_scanner_seats.clone();
+                        let bot_user_clone = bot_user.clone();
+                        let user_type_clone = ui_user.user_type.clone(); // Clone user type for the task
+                        // ... clone other variables
+                        let sender_clone = assigned_seats_sender.clone();
+                        let log_sender_clone = log_sender.clone();
+                        let telegram_sender_clone = telegram_sender.clone();
+                        let seat_id_clone = seat_id.to_string();
+                        let log_prefix_clone = log_prefix.to_string();
+                        let user_email = ui_user.email.clone();
+                        let max_seats = ui_user.max_seats;
+
+
+                        tokio::spawn(async move {
+                            // The slow network operation
+                            let result = take_seat_direct_final(&bot_user_clone, &seat_id_clone).await;
+
+                            // --- FIX 3: CONDITIONAL PENDING SEAT DECREMENT ---
+                            // ONLY decrement the pending count if it was a '+' type user.
+                            if user_type_clone == "+" {
+                                pending_scanner_seats_clone.lock().entry(actual_user_index).and_modify(|c| *c -= 1);
+                            }
+
+                            // Handle success notification
+                            if result.is_ok() {
+                                sender_clone.send((actual_user_index, seat_id_clone.clone())).ok();
+                                log_sender_clone.send((actual_user_index, format!("🚀 {}: Booked {}", log_prefix_clone, seat_id_clone))).ok();
+                                let total_held = bot_user_clone.held_seats.lock().len();
+                                let message = format!(
+                                    "🎫 SEAT TAKING ✅ SUCCESS\n\
+                                    ━━━━━━━━━━━━━━━━━\n\
+                                    🔧 Account: {}\n\
+                                    💺 Seats Taken: 1\n\
+                                    📊 Total Held: {}/{}\n\
+                                    ━━━━━━━━━━━━━━━━━",
+                                    user_email,
+                                    total_held,
+                                    if max_seats == 0 { "∞".to_string() } else { max_seats.to_string() }
+                                );
+                                telegram_sender_clone.send(message).ok();
+                            }
+                        });
+                        return; // Exit after dispatching to one user.
                     }
                 }
             }
         }
     }
+}
     
     fn show_logs_modal(&mut self, ctx: &egui::Context) {
         if let Some(user_index) = self.selected_user_index {
@@ -2086,13 +2113,12 @@ impl WebbookBot {
         }
     }
     
+    // In impl WebbookBot
     fn get_seats_from_selected_sections(&self) -> Vec<String> {
         let mut all_seats = Vec::new();
-
         if let Some(shared_data_arc) = &self.shared_data {
             if let Ok(shared_data) = shared_data_arc.try_read() {
                 if let Some(channels) = &shared_data.channels {
-                    // Get selected section prefixes
                     let selected_sections: Vec<String> = self
                         .selected_sections
                         .iter()
@@ -2104,19 +2130,20 @@ impl WebbookBot {
                             }
                         })
                         .collect();
-
-                    // Find all seats that start with selected sections
+    
                     for seat in channels {
                         for selected_section in &selected_sections {
                             if seat.starts_with(selected_section) {
-                                all_seats.push(seat.clone());
+                                if seat.len() == selected_section.len() ||
+                                   seat.chars().nth(selected_section.len()).map_or(false, |c| !c.is_ascii_digit()) {
+                                    all_seats.push(seat.clone());
+                                }
                             }
                         }
                     }
                 }
             }
         }
-
         all_seats
     }
 
@@ -2968,7 +2995,7 @@ impl WebbookBot {
         let telegram_sender = self.telegram_sender.as_ref().unwrap().clone();
         let reserved_seats_map_clone = self.reserved_seats_map.clone();
         let transfer_ignore_list_clone = self.transfer_ignore_list.clone(); // --- ADD THIS ---
-
+        let pending_scanner_seats_clone = self.pending_scanner_seats.clone();
         if let Some(rt) = &self.rt {
             let shared_data = self.shared_data.clone().unwrap();
             let bot_manager = self.bot_manager.clone();
@@ -2983,6 +3010,7 @@ impl WebbookBot {
                     ready_scanner_users_clone, next_user_index_clone,
                     reserved_seats_map_clone,
                     transfer_ignore_list_clone, // --- PASS IT HERE ---
+                    pending_scanner_seats_clone,
                 ).await {
                     println!("Scanner error: {}", e);
                 }
@@ -3016,6 +3044,7 @@ impl WebbookBot {
         next_user_index: Arc<AtomicUsize>,
         reserved_seats_map: Arc<Mutex<HashMap<String, Vec<String>>>>,
         transfer_ignore_list: Arc<Mutex<HashSet<String>>>, // Add this parameter
+        pending_scanner_seats: Arc<Mutex<HashMap<usize, usize>>>,
     ) -> Result<()> {
         loop { // The reconnect loop
             match Self::connect_and_listen(
@@ -3023,6 +3052,7 @@ impl WebbookBot {
                 &assigned_seats_sender, &log_sender, &telegram_sender,
                 &ready_scanner_users, &next_user_index, &reserved_seats_map,
                 &transfer_ignore_list, // Pass it down
+                &pending_scanner_seats,
             ).await {
                 Ok(_) => { println!("WebSocket connection ended normally"); break; }
                 Err(e) => {
@@ -3045,6 +3075,7 @@ impl WebbookBot {
         next_user_index: &Arc<AtomicUsize>,
         reserved_seats_map: &Arc<Mutex<HashMap<String, Vec<String>>>>,
         transfer_ignore_list: &Arc<Mutex<HashSet<String>>>, // Add this parameter
+        pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>,
     ) -> Result<()> {
         use sha1::{Sha1, Digest};
         use tokio_tungstenite::{connect_async, tungstenite::Message, connect_async_with_config, tungstenite::protocol::WebSocketConfig}; // MODIFIED: Added imports
@@ -3098,10 +3129,17 @@ impl WebbookBot {
                                 // --- THIS IS THE FIX ---
                                 // Check the ignore list before trying to take a seat.
                                 let is_ignored = transfer_ignore_list.lock().contains(seat_id);
-                                if !is_ignored && selected_channels.iter().any(|prefix| seat_id.starts_with(prefix)) {
+                                let is_in_selected_section = selected_channels.iter().any(|prefix| {
+                                    seat_id.starts_with(prefix) &&
+                                    (seat_id.len() == prefix.len() ||
+                                     seat_id.chars().nth(prefix.len()).map_or(false, |c| !c.is_ascii_digit()))
+                                });
+                                
+                                if !is_ignored && is_in_selected_section {
                                     Self::dispatch_seat_take_task(
                                         seat_id, "SCANNER", bot_manager, ready_scanner_users, 
-                                        next_user_index, assigned_seats_sender, log_sender, telegram_sender, users_data
+                                        next_user_index, assigned_seats_sender, log_sender, telegram_sender, users_data,
+                                        pending_scanner_seats
                                     ).await;
                                 }else if is_ignored {
                                     log_sender.send((0, format!("🚫 SCANNER: Ignoring {} (transfer in progress)", seat_id))).ok();
@@ -3138,10 +3176,17 @@ impl WebbookBot {
                                     for seat_id in seats {
                                         // ADD IGNORE LIST CHECK FOR SNIPER TOO (CRITICAL FIX)
                                         let is_ignored = transfer_ignore_list.lock().contains(&seat_id);
-                                        if !is_ignored && selected_channels.iter().any(|prefix| seat_id.starts_with(prefix)) {
+                                        
+                                        let is_in_selected_section = selected_channels.iter().any(|prefix| {
+                                            seat_id.starts_with(prefix) &&
+                                            (seat_id.len() == prefix.len() ||
+                                             seat_id.chars().nth(prefix.len()).map_or(false, |c| !c.is_ascii_digit()))
+                                        });
+                                        if !is_ignored && is_in_selected_section {
                                             Self::dispatch_seat_take_task(
                                                 &seat_id, "SNIPER", bot_manager, ready_scanner_users, 
-                                                next_user_index, assigned_seats_sender, log_sender, telegram_sender, users_data
+                                                next_user_index, assigned_seats_sender, log_sender, telegram_sender, users_data,
+                                                pending_scanner_seats
                                             ).await;
                                         } else if is_ignored {
                                             log_sender.send((0, format!("🚫 SNIPER: Ignoring {} (transfer in progress)", seat_id))).ok();
