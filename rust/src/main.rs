@@ -1449,8 +1449,7 @@ impl WebbookBot {
     }
 
     
-    // In impl WebbookBot
-    // This is a new helper function to avoid duplicating code.
+        // In impl WebbookBot
     async fn dispatch_seat_take_task(
         seat_id: &str,
         log_prefix: &str,
@@ -1464,26 +1463,39 @@ impl WebbookBot {
     ) {
         if let Some(manager) = bot_manager {
             let ready_users_indices = ready_scanner_users.lock();
-            //let num_ready = ready_users_indices.len();
-            //if num_ready == 0 { return; }
-    
-            for user_idx in ready_users_indices.iter() {
-                //let current_atomic_index = next_user_index.fetch_add(1, Ordering::Relaxed);
-                //let user_pool_index = current_atomic_index % num_ready;
-                //let actual_user_index = ready_users_indices[user_pool_index];
-    
-                if let Some(ui_user) = ui_users.get(*user_idx) {
-                    let held_count = manager.users[*user_idx].held_seats.lock().len();
-                
-                    let is_eligible = if ui_user.user_type == "*" {
-                        ui_user.max_seats == 0 || held_count < ui_user.max_seats
-                    } else if ui_user.user_type == "+" {
-                        ui_user.max_seats > 0 && held_count < ui_user.max_seats
-                    } else { false };
+            let num_ready = ready_users_indices.len();
+            if num_ready == 0 { return; }
+
+            let start_index = next_user_index.load(Ordering::Relaxed);
+
+            // This loop cycles through all ready users to find a suitable one
+            for i in 0..num_ready {
+                let pool_index = (start_index + i) % num_ready;
+                let actual_user_index = ready_users_indices[pool_index];
+
+                if let (Some(ui_user), Some(bot_user)) = (ui_users.get(actual_user_index), manager.users.get(actual_user_index)) {
                     
-                    if is_eligible {
-                        for _ in 0..5 {
-                            let bot_user = manager.users[*user_idx].clone();
+                    // --- THIS IS THE CRITICAL READINESS CHECK ---
+                    let is_truly_ready = bot_user.webook_hold_token.lock().is_some()
+                                        && bot_user.expire_time.load(Ordering::Relaxed) > 0;
+
+                    if is_truly_ready {
+                        let held_count = bot_user.held_seats.lock().len();
+                        
+                        let is_eligible = if ui_user.user_type == "*" {
+                            true // '*' type users have no limit
+                        } else if ui_user.user_type == "+" {
+                            ui_user.max_seats > 0 && held_count < ui_user.max_seats
+                        } else {
+                            false
+                        };
+
+                        if is_eligible {
+                            // Found a valid user. Update the index for the next run.
+                            next_user_index.store((pool_index + 1) % num_ready, Ordering::Relaxed);
+
+                            // --- Dispatch the task to this user ---
+                            let bot_user_clone = bot_user.clone();
                             let sender_clone = assigned_seats_sender.clone();
                             let log_sender_clone = log_sender.clone();
                             let telegram_sender_clone = telegram_sender.clone();
@@ -1491,48 +1503,34 @@ impl WebbookBot {
                             let log_prefix_clone = log_prefix.to_string();
                             let user_email = ui_user.email.clone();
                             let max_seats = ui_user.max_seats;
-                            let actual_user_index = *user_idx;
 
                             tokio::spawn(async move {
-                                match take_seat_direct_final(&bot_user, &seat_id_clone).await {
-                                    Ok(_) => {
-                                        sender_clone.send((actual_user_index, seat_id_clone.clone())).ok();
-                                        log_sender_clone.send((actual_user_index, format!("🚀 {}: Booked {}", log_prefix_clone, seat_id_clone))).ok();
-                                            // NOW USE THE CLONED DATA (NO LIFETIME ISSUES)
-                                        let seats_count = 1;
-                                        let total_held = bot_user.held_seats.lock().len();
-                                        
-                                        let message = format!(
-                                            "🎫 SEAT TAKING ✅ SUCCESS\n\
-                                            ━━━━━━━━━━━━━━━━━\n\
-                                            🔧 Account: {}\n\
-                                            💺 Seats Taken: {}\n\
-                                            📊 Total Held: {}/{}\n\
-                                            ━━━━━━━━━━━━━━━━━",
-                                            user_email,        // CLONED DATA
-                                            seats_count,
-                                            total_held,
-                                            max_seats          // CLONED DATA
-                                        );
-                                        telegram_sender_clone.send(message).ok();
-                                            return; // Exit early on first success
-                                        }
-                                    Err(_) => {
-                                        // Don't log failures to reduce noise
-                                    }
+                                if take_seat_direct_final(&bot_user_clone, &seat_id_clone).await.is_ok() {
+                                    sender_clone.send((actual_user_index, seat_id_clone.clone())).ok();
+                                    log_sender_clone.send((actual_user_index, format!("🚀 {}: Booked {}", log_prefix_clone, seat_id_clone))).ok();
+                                    let total_held = bot_user_clone.held_seats.lock().len();
+                                    let message = format!(
+                                        "🎫 SEAT TAKING ✅ SUCCESS\n\
+                                        ━━━━━━━━━━━━━━━━━\n\
+                                        🔧 Account: {}\n\
+                                        💺 Seats Taken: 1\n\
+                                        📊 Total Held: {}/{}\n\
+                                        ━━━━━━━━━━━━━━━━━",
+                                        user_email,
+                                        total_held,
+                                        if max_seats == 0 { "∞".to_string() } else { max_seats.to_string() }
+                                    );
+                                    telegram_sender_clone.send(message).ok();
                                 }
                             });
+                            return; // IMPORTANT: Exit the loop after dispatching to ONE user.
                         }
-                        
-                        return;
                     }
                 }
             }
         }
     }
     
-    // In impl WebbookBot
-    // In impl WebbookBot
     fn show_logs_modal(&mut self, ctx: &egui::Context) {
         if let Some(user_index) = self.selected_user_index {
             // Get the user's current data
@@ -2491,8 +2489,8 @@ impl WebbookBot {
                                             }
                                         } else {
                                             log_sender_clone_task.send((user_index, "❌ FAILED to get new token.".to_string())).ok();
-                                            user_clone.expire_time.store(300, Ordering::Relaxed);
-                                            //user_clone.expire_time.store(0, Ordering::Relaxed); // Allow re-try
+                                            //user_clone.expire_time.store(300, Ordering::Relaxed);
+                                            user_clone.expire_time.store(0, Ordering::Relaxed); // Allow re-try
                                         }
                                     });
                                 }
