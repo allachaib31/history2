@@ -14,10 +14,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use url::Url;
+#[cfg(unix)]
+use libc::{rlimit, RLIMIT_NOFILE, setrlimit};
 mod telegram_manager;
 use telegram_manager::TelegramManager;
 mod captcha_solver;
 use captcha_solver::CaptchaSolver;
+use std::process::{Child, Command, Stdio};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
+
+
+
 
 const WORKSPACE_KEY: &str = "3d443a0c-83b8-4a11-8c57-3db9d116ef76";
 #[derive(Clone)] // <-- ADD THIS LINE
@@ -84,6 +91,9 @@ pub struct WebbookBot {
     log_receiver: Option<mpsc::UnboundedReceiver<(usize, String)>>,
     telegram_sender: Option<mpsc::UnboundedSender<String>>, // --- ADD THIS ---
     transfer_ignore_list: Arc<Mutex<HashSet<String>>>,
+    node_process: Option<Child>, // ADD THIS for Node.js process management
+    token_file_path: String,  
+    expiry_warnings_sent: HashMap<usize, bool>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -263,10 +273,13 @@ impl BotUser {
         let client = Client::builder()
             .proxy(proxy)
             .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
-            .pool_max_idle_per_host(10) 
-            .connect_timeout(std::time::Duration::from_secs(20)) 
-            .timeout(std::time::Duration::from_secs(17))
+            .pool_max_idle_per_host(100)  // INCREASE from 10 to 100 (like Go)
+            .http2_keep_alive_interval(Some(std::time::Duration::from_secs(60)))
+            .http2_keep_alive_timeout(std::time::Duration::from_secs(20))
+            .connect_timeout(std::time::Duration::from_secs(60))  // REDUCE from 20
+            .timeout(std::time::Duration::from_secs(90))           // REDUCE from 17
             .tcp_keepalive(std::time::Duration::from_secs(60))
+            .tcp_nodelay(true)  // ADD THIS - disables Nagle's algorithm
             .build()?;
 
         Ok(Self {
@@ -848,45 +861,34 @@ impl BotUser {
     }
 }
 
+// CHANGE take_seat_direct_final to use ZERO JSON serialization:
 async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<()> {
-    // 1. Get the pre-built template. This lock is extremely short.
     let prepared = bot_user.prepared_request.lock().clone()
         .ok_or_else(|| anyhow::anyhow!("Request template not ready"))?;
 
-    // 2. Create the final payload with a fast string replacement. NO JSON serialization.
+    // ULTRA-FAST string replacement (no JSON parsing)
     let final_payload = prepared.json_payload_template.replace("__SEAT_ID_PLACEHOLDER__", seat_id);
-    //println!("{:?}",final_payload);
-    // 3. Generate signature (very fast CPU-bound task).
+    
+    // MINIMAL signature generation
     let signature = bot_user.generate_signature(&final_payload).await?;
-    //println!("{:?}",signature);
-    // 4. Clone headers and add the final signature.
+    
     let mut headers = prepared.headers.clone();
     headers.insert("x-signature", signature.parse()?);
 
-    // 5. FIRE THE REQUEST!
+    // FIRE IMMEDIATELY - no error parsing
     let response = prepared.client
         .post(&prepared.url)
         .headers(headers)
-        .body(final_payload) // Use the final string payload
+        .body(final_payload)
         .send()
         .await?;
 
-    // 6. Check status ONLY. Do not wait for `.json()`.
-    let status = response.status();
-    //let data: Value = response.json().await?;
-    //println!("{:?}",data);
-
-    if status == 200 || status == 204 {
-        // Success! Don't parse the body, just update state.
+    if response.status().is_success() {
         bot_user.held_seats.lock().push(seat_id.to_string());
         Ok(())
     } else {
-        // The request failed. Now it's safe to read the body for error details.
-        let error_body = response.text().await.unwrap_or_else(|_| "Could not read error body".to_string());
-        println!("Error Body: {}", error_body);
-        Err(anyhow::anyhow!("Seat take failed with status: {}. Body: {}", status, error_body))
+        Err(anyhow::anyhow!("Failed: {}", response.status()))
     }
-
 }
 fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
     let parsed = Url::parse(event_url)?;
@@ -1189,7 +1191,7 @@ impl WebbookBot {
             }
         });
         let app = Self {
-            event_url: "https://webook.com/en/events/spl-25-26-al-fateh".to_string(),
+            event_url: "".to_string(),
             seats: "1".to_string(),
             d_seats: "1".to_string(),
             favorite_team: "home".to_string(),
@@ -1200,13 +1202,7 @@ impl WebbookBot {
                 "away".to_string(),
                 "neutral".to_string(),
             ],
-            users: vec![User {
-                email: "alzeen.42@outlook.com".to_string(),
-                user_type: "*".to_string(),
-                password: "Bb654321@".to_string(),
-                proxy: "http://spurs72ctg:5kolK...".to_string(),
-                ..Default::default()
-            }],
+            users: vec![],
             proxies: vec![],
             rt: Some(rt),
             bot_manager: None,
@@ -1233,8 +1229,185 @@ impl WebbookBot {
             log_receiver: Some(log_receiver),
             telegram_sender: Some(telegram_sender),
             transfer_ignore_list: Arc::new(Mutex::new(HashSet::new())), 
+            node_process: None,                        // ADD THIS
+            token_file_path: "tokens.json".to_string(), // ADD THIS
+            expiry_warnings_sent: HashMap::new(),
         };
         app
+    }
+    fn save_tokens(&mut self) {
+        println!("Try to save token");
+        if self.users.is_empty() {
+            println!("No users loaded. Please load users first.");
+            return;
+        }
+
+        // Load existing tokens from file
+        let mut existing_tokens: HashMap<String, TokenData> = HashMap::new();
+        if let Ok(content) = fs::read_to_string(&self.token_file_path) {
+            if let Ok(tokens) = serde_json::from_str(&content) {
+                existing_tokens = tokens;
+            }
+        }
+        println!("exisiting tokens: {:?}",existing_tokens);
+        if let Some(rt) = &self.rt {
+            let users_clone = self.users.clone();
+            let token_file_path = self.token_file_path.clone();
+            let log_sender = self.log_sender.as_ref().unwrap().clone();
+
+            rt.spawn(async move {
+                let mut all_tokens = existing_tokens;
+                
+                for (user_index, user) in users_clone.iter().enumerate() {
+                    // Check if valid token already exists
+                    if let Some(existing_token) = all_tokens.get(&user.email) {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+                        
+                        if existing_token.expires_at > now {
+                            log_sender.send((user_index, "Using existing valid token.".to_string())).ok();
+                            continue;
+                        }
+                    }
+
+                    // Get new token for this user
+                    log_sender.send((user_index, "Getting new token...".to_string())).ok();
+                    
+                    match Self::get_token_for_user(user).await {
+                        Ok(token_data) => {
+                            all_tokens.insert(user.email.clone(), token_data);
+                            log_sender.send((user_index, "Token saved successfully".to_string())).ok();
+                        }
+                        Err(e) => {
+                            log_sender.send((user_index, format!("Token save failed: {}", e))).ok();
+                        }
+                    }
+                }
+
+                // Save all tokens back to file
+                if let Ok(json_data) = serde_json::to_string_pretty(&all_tokens) {
+                    if let Err(e) = fs::write(&token_file_path, json_data) {
+                        println!("Failed to write tokens to file: {}", e);
+                    }
+                }
+            });
+        }
+        else {
+            println!("ooops");
+        }
+    }
+    async fn get_token_for_user(user: &User) -> Result<TokenData> {
+        #[derive(Serialize)]
+        struct LoginRequest {
+            email: String,
+            password: String,
+            proxy: String,
+        }
+
+        #[derive(Deserialize)]
+        struct LoginResponse {
+            success: bool,
+            access_token: String,
+            refresh_token: String,
+            token_expires_in: i64,
+            token: String,
+            id: String,
+            #[serde(rename = "utm_wbk_wa_session_id")]
+            session_id: String,
+        }
+
+        let login_req = LoginRequest {
+            email: user.email.clone(),
+            password: user.password.clone(),
+            proxy: user.proxy.clone(),
+        };
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()?;
+
+        let response = client
+            .post("http://localhost:3000/capturelogin")
+            .json(&login_req)
+            .send()
+            .await?;
+
+        if response.status() != 200 {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("HTTP error: {}", error_text));
+        }
+
+        let login_resp: LoginResponse = response.json().await?;
+
+        if !login_resp.success {
+            return Err(anyhow::anyhow!("Login was not successful"));
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let expires_at = if login_resp.token_expires_in > 0 {
+            now + (login_resp.token_expires_in as u64 * 1000)
+        } else {
+            now + (7 * 24 * 60 * 60 * 1000) // 7 days default
+        };
+
+        Ok(TokenData {
+            token: login_resp.token,
+            refresh_token: login_resp.refresh_token,
+            access_token: login_resp.access_token,
+            session_id: login_resp.session_id,
+            saved_at: now,
+            expires_at,
+        })
+    }
+    fn start_node_process(&mut self) -> Result<()> {
+        // Kill existing process if running
+        if let Some(mut process) = self.node_process.take() {
+            let _ = process.kill();
+            println!("Killed existing Node.js process");
+        }
+
+        // Start new Node.js process
+        let event_url = self.event_url.clone();
+        
+        let mut command = Command::new("node");
+        command
+            .arg("../../newHistory/newWebokboot/newTest2.js")
+            .arg(&event_url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        match command.spawn() {
+            Ok(child) => {
+                println!("Node.js server started with PID: {}", child.id());
+                self.node_process = Some(child);
+                Ok(())
+            }
+            Err(e) => {
+                let error_msg = format!(
+                    "Failed to start Node.js server: {}\n\nMake sure Node.js is installed and the script is at '../newWebokboot/newTest2.js'", 
+                    e
+                );
+                println!("{}", error_msg);
+                Err(anyhow::anyhow!(error_msg))
+            }
+        }
+    }
+
+    // NEW: Stop Node.js process
+    fn stop_node_process(&mut self) {
+        if let Some(mut process) = self.node_process.take() {
+            if let Err(e) = process.kill() {
+                println!("Failed to kill Node.js process: {}", e);
+            } else {
+                println!("Node.js process stopped");
+            }
+        }
     }
     // In impl WebbookBot
     fn update_logs(&mut self) {
@@ -1280,7 +1453,7 @@ impl WebbookBot {
     // This is a new helper function to avoid duplicating code.
     async fn dispatch_seat_take_task(
         seat_id: &str,
-        log_prefix: &str, // e.g., "SNIPER" or "SCANNER"
+        log_prefix: &str,
         bot_manager: &Option<Arc<BotManager>>,
         ready_scanner_users: &Arc<Mutex<Vec<usize>>>,
         next_user_index: &Arc<AtomicUsize>,
@@ -1291,17 +1464,17 @@ impl WebbookBot {
     ) {
         if let Some(manager) = bot_manager {
             let ready_users_indices = ready_scanner_users.lock();
-            let num_ready = ready_users_indices.len();
-            if num_ready == 0 { return; }
-
-            for _ in 0..num_ready {
-                let current_atomic_index = next_user_index.fetch_add(1, Ordering::Relaxed);
-                let user_pool_index = current_atomic_index % num_ready;
-                let actual_user_index = ready_users_indices[user_pool_index];
-
-                if let Some(ui_user) = ui_users.get(actual_user_index) {
-                    let held_count = manager.users[actual_user_index].held_seats.lock().len();
-                    
+            //let num_ready = ready_users_indices.len();
+            //if num_ready == 0 { return; }
+    
+            for user_idx in ready_users_indices.iter() {
+                //let current_atomic_index = next_user_index.fetch_add(1, Ordering::Relaxed);
+                //let user_pool_index = current_atomic_index % num_ready;
+                //let actual_user_index = ready_users_indices[user_pool_index];
+    
+                if let Some(ui_user) = ui_users.get(*user_idx) {
+                    let held_count = manager.users[*user_idx].held_seats.lock().len();
+                
                     let is_eligible = if ui_user.user_type == "*" {
                         ui_user.max_seats == 0 || held_count < ui_user.max_seats
                     } else if ui_user.user_type == "+" {
@@ -1309,27 +1482,48 @@ impl WebbookBot {
                     } else { false };
                     
                     if is_eligible {
-                        let bot_user = manager.users[actual_user_index].clone();
-                        let sender_clone = assigned_seats_sender.clone();
-                        let log_sender_clone = log_sender.clone();
-                        let telegram_sender_clone = telegram_sender.clone();
-                        let seat_id_clone = seat_id.to_string();
-                        let log_prefix_clone = log_prefix.to_string();
+                        for _ in 0..5 {
+                            let bot_user = manager.users[*user_idx].clone();
+                            let sender_clone = assigned_seats_sender.clone();
+                            let log_sender_clone = log_sender.clone();
+                            let telegram_sender_clone = telegram_sender.clone();
+                            let seat_id_clone = seat_id.to_string();
+                            let log_prefix_clone = log_prefix.to_string();
+                            let user_email = ui_user.email.clone();
+                            let max_seats = ui_user.max_seats;
+                            let actual_user_index = *user_idx;
+
+                            tokio::spawn(async move {
+                                match take_seat_direct_final(&bot_user, &seat_id_clone).await {
+                                    Ok(_) => {
+                                        sender_clone.send((actual_user_index, seat_id_clone.clone())).ok();
+                                        log_sender_clone.send((actual_user_index, format!("🚀 {}: Booked {}", log_prefix_clone, seat_id_clone))).ok();
+                                            // NOW USE THE CLONED DATA (NO LIFETIME ISSUES)
+                                        let seats_count = 1;
+                                        let total_held = bot_user.held_seats.lock().len();
+                                        
+                                        let message = format!(
+                                            "🎫 SEAT TAKING ✅ SUCCESS\n\
+                                            ━━━━━━━━━━━━━━━━━\n\
+                                            🔧 Account: {}\n\
+                                            💺 Seats Taken: {}\n\
+                                            📊 Total Held: {}/{}\n\
+                                            ━━━━━━━━━━━━━━━━━",
+                                            user_email,        // CLONED DATA
+                                            seats_count,
+                                            total_held,
+                                            max_seats          // CLONED DATA
+                                        );
+                                        telegram_sender_clone.send(message).ok();
+                                            return; // Exit early on first success
+                                        }
+                                    Err(_) => {
+                                        // Don't log failures to reduce noise
+                                    }
+                                }
+                            });
+                        }
                         
-                        tokio::spawn(async move {
-                            match take_seat_direct_final(&bot_user, &seat_id_clone).await {
-                                Ok(_) => {
-                                    sender_clone.send((actual_user_index, seat_id_clone.clone())).ok();
-                                    let log_msg = format!("🚀 {}: Booked {}", log_prefix_clone, seat_id_clone);
-                                    log_sender_clone.send((actual_user_index, log_msg.clone())).ok();
-                                    let notification = format!("✅ Seat Taken! ({})\nAccount: {}\nSeat: {}", log_prefix_clone, bot_user.email, seat_id_clone);
-                                    telegram_sender_clone.send(notification).ok();
-                                }
-                                Err(e) => {
-                                    log_sender_clone.send((actual_user_index, format!("✗ {} FAILED for {}: {}", log_prefix_clone, seat_id_clone, e))).ok();
-                                }
-                            }
-                        });
                         return;
                     }
                 }
@@ -1572,212 +1766,223 @@ impl WebbookBot {
     }
 
     // REPLACE execute_ultra_fast_transfer with this version that properly uses ignore list:
-fn execute_ultra_fast_transfer(&mut self, from_user_index: usize, to_user_index: usize) {
-    let assigned_seats_sender = match &self.assigned_seats_sender {
-        Some(sender) => sender.clone(),
-        None => { 
-            println!("Cannot transfer: assigned_seats_sender is not available."); 
-            return; 
-        }
-    };
-
-    let log_sender = match &self.log_sender {
-        Some(sender) => sender.clone(),
-        None => {
-            println!("Cannot transfer: log_sender is not available.");
-            return;
-        }
-    };
-
-    let telegram_sender = match &self.telegram_sender {
-        Some(sender) => sender.clone(),
-        None => {
-            println!("Cannot transfer: telegram_sender is not available.");
-            return;
-        }
-    };
-
-    if let (Some(bot_manager), Some(rt)) = (&self.bot_manager, &self.rt) {
-        let from_user = bot_manager.users[from_user_index].clone();
-        let to_user = bot_manager.users[to_user_index].clone();
-        let seats_to_transfer = from_user.held_seats.lock().clone();
-        let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
-
-        if seats_to_transfer.is_empty() {
-            log_sender.send((from_user_index, "❌ No seats to transfer".to_string())).ok();
-            return;
-        }
-
-        // ADD SEATS TO IGNORE LIST BEFORE STARTING TRANSFER (CRITICAL FIX)
-        let ignore_list = self.transfer_ignore_list.clone();
-        {
-            let mut list = ignore_list.lock();
-            for seat in &seats_to_transfer {
-                list.insert(seat.clone());
+    fn execute_ultra_fast_transfer(&mut self, from_user_index: usize, to_user_index: usize) {
+        let assigned_seats_sender = match &self.assigned_seats_sender {
+            Some(sender) => sender.clone(),
+            None => { 
+                println!("Cannot transfer: assigned_seats_sender is not available."); 
+                return; 
             }
-        }
-        log_sender.send((from_user_index, format!("🚫 Added {} seats to scanner ignore list", seats_to_transfer.len()))).ok();
+        };
 
-        log_sender.send((from_user_index, "🔄 Starting ULTRA-FAST seat transfer...".to_string())).ok();
-        log_sender.send((to_user_index, "🔄 Receiving seats...".to_string())).ok();
+        let log_sender = match &self.log_sender {
+            Some(sender) => sender.clone(),
+            None => {
+                println!("Cannot transfer: log_sender is not available.");
+                return;
+            }
+        };
 
-        // Send notification
-        telegram_sender.send(format!(
-            "🔄 SEAT TRANSFER STARTING\n\
-            ——————————————————\n\
-            From: {}\n\
-            To: {}\n\
-            Seats: {}\n\
-            ——————————————————",
-            from_user.email, to_user.email, seats_to_transfer.len()
-        )).ok();
+        let telegram_sender = match &self.telegram_sender {
+            Some(sender) => sender.clone(),
+            None => {
+                println!("Cannot transfer: telegram_sender is not available.");
+                return;
+            }
+        };
 
-        rt.spawn(async move {
-            log_sender.send((to_user_index, "⚡ Starting atomic transfers (no pre-building needed)...".to_string())).ok();
+        if let (Some(bot_manager), Some(rt)) = (&self.bot_manager, &self.rt) {
+            let from_user = bot_manager.users[from_user_index].clone();
+            let to_user = bot_manager.users[to_user_index].clone();
+            let seats_to_transfer = from_user.held_seats.lock().clone();
+            let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+            let from_user_email = from_user.email.clone();
+            let to_user_email = to_user.email.clone();
 
-            // DO ATOMIC TRANSFERS - build requests fresh each time
-            let mut successfully_transferred = 0;
-            for seat_id in seats_to_transfer {
-                // Check seat limit
-                if d_seats_limit > 0 && to_user.held_seats.lock().len() >= d_seats_limit {
-                    log_sender.send((to_user_index, format!("⚠️ Reached limit of {} seats, stopping", d_seats_limit))).ok();
-                    break;
+            let notify_sender = self.telegram_sender.clone();
+
+            if seats_to_transfer.is_empty() {
+                log_sender.send((from_user_index, "❌ No seats to transfer".to_string())).ok();
+                return;
+            }
+
+            // ADD SEATS TO IGNORE LIST BEFORE STARTING TRANSFER (CRITICAL FIX)
+            let ignore_list = self.transfer_ignore_list.clone();
+            {
+                let mut list = ignore_list.lock();
+                for seat in &seats_to_transfer {
+                    list.insert(seat.clone());
                 }
+            }
+            log_sender.send((from_user_index, format!("🚫 Added {} seats to scanner ignore list", seats_to_transfer.len()))).ok();
 
-                // Build fresh request after release (with delay fix)
-                match Self::atomic_transfer_seat_ultra_fast(
-                    &from_user,
-                    &to_user, 
-                    &seat_id,
-                    PreparedTransferRequest { // dummy
-                        url: String::new(),
-                        headers: reqwest::header::HeaderMap::new(),
-                        body: String::new(),
-                        client: to_user.client.clone(),
-                    },
-                    &assigned_seats_sender,
-                    &log_sender,
-                    from_user_index,
-                    to_user_index,
-                ).await {
-                    Ok(true) => {
-                        successfully_transferred += 1;
-                    }
-                    Ok(false) | Err(_) => {
-                        log_sender.send((from_user_index, format!("❌ Transfer failed for {}, stopping", seat_id))).ok();
+            log_sender.send((from_user_index, "🔄 Starting ULTRA-FAST seat transfer...".to_string())).ok();
+            log_sender.send((to_user_index, "🔄 Receiving seats...".to_string())).ok();
+
+            rt.spawn(async move {
+                log_sender.send((to_user_index, "⚡ Starting atomic transfers (no pre-building needed)...".to_string())).ok();
+
+                // DO ATOMIC TRANSFERS - build requests fresh each time
+                let mut successfully_transferred = 0;
+                for seat_id in seats_to_transfer {
+                    // Check seat limit
+                    if d_seats_limit > 0 && to_user.held_seats.lock().len() >= d_seats_limit {
+                        log_sender.send((to_user_index, format!("⚠️ Reached limit of {} seats, stopping", d_seats_limit))).ok();
                         break;
                     }
+
+                    // Build fresh request after release (with delay fix)
+                    match Self::atomic_transfer_seat_ultra_fast(
+                        &from_user,
+                        &to_user, 
+                        &seat_id,
+                        PreparedTransferRequest { // dummy
+                            url: String::new(),
+                            headers: reqwest::header::HeaderMap::new(),
+                            body: String::new(),
+                            client: to_user.client.clone(),
+                        },
+                        &assigned_seats_sender,
+                        &log_sender,
+                        from_user_index,
+                        to_user_index,
+                    ).await {
+                        Ok(true) => {
+                            successfully_transferred += 1;
+                            if let Some(sender) = notify_sender.clone() {
+                                let final_seat_count = to_user.held_seats.lock().len();
+                                let message = format!(
+                                    "🔄 SEAT TRANSFER\n\
+                                    ━━━━━━━━━━━━━━━━━\n\
+                                    From: {}\n\
+                                    To: {}\n\
+                                    Seats Transferred: {}\n\
+                                    Target Total: {}\n\
+                                    ━━━━━━━━━━━━━━━━━",
+                                    from_user_email,
+                                    to_user_email,
+                                    successfully_transferred,
+                                    final_seat_count
+                                );
+                                sender.send(message).ok();
+                            }
+                        }
+                        Ok(false) | Err(_) => {
+                            log_sender.send((from_user_index, format!("❌ Transfer failed for {}, stopping", seat_id))).ok();
+                            break;
+                        }
+                    }
                 }
-            }
 
-            // CLEAR IGNORE LIST AFTER TRANSFER COMPLETES (CRITICAL)
-            ignore_list.lock().clear();
-            log_sender.send((from_user_index, "🚫 Cleared scanner ignore list".to_string())).ok();
+                // CLEAR IGNORE LIST AFTER TRANSFER COMPLETES (CRITICAL)
+                ignore_list.lock().clear();
+                log_sender.send((from_user_index, "🚫 Cleared scanner ignore list".to_string())).ok();
 
-            // Final notification
-            log_sender.send((from_user_index, format!("📊 Ultra-fast transfer result: {} seats transferred", successfully_transferred))).ok();
-            
-            telegram_sender.send(format!(
-                "🔄 SEAT TRANSFER COMPLETE\n\
-                ——————————————————\n\
-                From: {}\n\
-                To: {}\n\
-                Seats Transferred: {}\n\
-                Target Total: {}\n\
-                ——————————————————",
-                from_user.email,
-                to_user.email,
-                successfully_transferred,
-                to_user.held_seats.lock().len()
-            )).ok();
-        });
-    }
-}
-
-// ALSO UPDATE the atomic_transfer_seat_ultra_fast to have the 50ms delay fix:
-async fn atomic_transfer_seat_ultra_fast(
-    from_user: &BotUser,
-    to_user: &BotUser,
-    seat_id: &str,
-    _prepared_request: PreparedTransferRequest, // We'll rebuild this
-    assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
-    log_sender: &mpsc::UnboundedSender<(usize, String)>,
-    from_user_index: usize,
-    to_user_index: usize,
-) -> Result<bool> {
-    let event_keys = if let Ok(data) = from_user.shared_data.try_read() {
-        if let Some(event_key) = &data.event_key { vec![event_key.clone()] } 
-        else { return Err(anyhow::anyhow!("Event key not found")); }
-    } else { return Err(anyhow::anyhow!("Could not read shared data")); };
-
-    // Step 1: Release the seat
-    log_sender.send((from_user_index, format!("🔄 Releasing seat: {}", seat_id))).ok();
-    if !from_user.release_seat(seat_id, &event_keys).await? {
-        return Err(anyhow::anyhow!("Failed to release seat"));
-    }
-
-    // Step 2: Small delay to let server process the release (CRITICAL FIX)
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-    // Step 3: Build fresh take request AFTER release (not pre-built)
-    log_sender.send((to_user_index, format!("⚡ Taking seat: {}", seat_id))).ok();
-    
-    let fresh_request = match Self::prepare_take_request_for_transfer(to_user, seat_id).await {
-        Ok(req) => req,
-        Err(e) => {
-            log_sender.send((to_user_index, format!("❌ Failed to prepare fresh request: {}", e))).ok();
-            return Err(e);
-        }
-    };
-
-    let response = fresh_request.client
-        .post(&fresh_request.url)
-        .headers(fresh_request.headers)
-        .body(fresh_request.body)
-        .send()
-        .await?;
-
-    if response.status().is_success() {
-        // Success - update seat tracking
-        to_user.held_seats.lock().push(seat_id.to_string());
-        
-        // Update UI
-        assigned_seats_sender.send((from_user_index, format!("REMOVE:{}", seat_id))).ok();
-        assigned_seats_sender.send((to_user_index, seat_id.to_string())).ok();
-        
-        log_sender.send((to_user_index, format!("✅ ATOMIC SUCCESS: {}", seat_id))).ok();
-        return Ok(true);
-    } else {
-        let error_text = response.text().await.unwrap_or_default();
-        log_sender.send((to_user_index, format!("❌ Take failed: {} - trying to restore", error_text))).ok();
-        
-        // Try to restore the seat to original user
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await; // Give server time
-        
-        if let Ok(restore_req) = Self::prepare_take_request_for_transfer(from_user, seat_id).await {
-            let restore_response = restore_req.client
-                .post(&restore_req.url)
-                .headers(restore_req.headers)
-                .body(restore_req.body)
-                .send()
-                .await;
+                // Final notification
+                log_sender.send((from_user_index, format!("📊 Ultra-fast transfer result: {} seats transferred", successfully_transferred))).ok();
                 
-            match restore_response {
-                Ok(resp) if resp.status().is_success() => {
-                    from_user.held_seats.lock().push(seat_id.to_string());
-                    assigned_seats_sender.send((from_user_index, seat_id.to_string())).ok();
-                    log_sender.send((from_user_index, format!("✅ Restored: {}", seat_id))).ok();
-                }
-                _ => {
-                    log_sender.send((from_user_index, format!("⚠️ FAILED TO RESTORE: {}", seat_id))).ok();
+                telegram_sender.send(format!(
+                    "🔄 SEAT TRANSFER COMPLETE\n\
+                    ——————————————————\n\
+                    From: {}\n\
+                    To: {}\n\
+                    Seats Transferred: {}\n\
+                    Target Total: {}\n\
+                    ——————————————————",
+                    from_user.email,
+                    to_user.email,
+                    successfully_transferred,
+                    to_user.held_seats.lock().len()
+                )).ok();
+            });
+        }
+    }
+
+    // ALSO UPDATE the atomic_transfer_seat_ultra_fast to have the 50ms delay fix:
+    async fn atomic_transfer_seat_ultra_fast(
+        from_user: &BotUser,
+        to_user: &BotUser,
+        seat_id: &str,
+        _prepared_request: PreparedTransferRequest, // We'll rebuild this
+        assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
+        log_sender: &mpsc::UnboundedSender<(usize, String)>,
+        from_user_index: usize,
+        to_user_index: usize,
+    ) -> Result<bool> {
+        let event_keys = if let Ok(data) = from_user.shared_data.try_read() {
+            if let Some(event_key) = &data.event_key { vec![event_key.clone()] } 
+            else { return Err(anyhow::anyhow!("Event key not found")); }
+        } else { return Err(anyhow::anyhow!("Could not read shared data")); };
+
+        // Step 1: Release the seat
+        log_sender.send((from_user_index, format!("🔄 Releasing seat: {}", seat_id))).ok();
+        if !from_user.release_seat(seat_id, &event_keys).await? {
+            return Err(anyhow::anyhow!("Failed to release seat"));
+        }
+
+        // Step 2: Small delay to let server process the release (CRITICAL FIX)
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Step 3: Build fresh take request AFTER release (not pre-built)
+        log_sender.send((to_user_index, format!("⚡ Taking seat: {}", seat_id))).ok();
+        
+        let fresh_request = match Self::prepare_take_request_for_transfer(to_user, seat_id).await {
+            Ok(req) => req,
+            Err(e) => {
+                log_sender.send((to_user_index, format!("❌ Failed to prepare fresh request: {}", e))).ok();
+                return Err(e);
+            }
+        };
+
+        let response = fresh_request.client
+            .post(&fresh_request.url)
+            .headers(fresh_request.headers)
+            .body(fresh_request.body)
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            // Success - update seat tracking
+            to_user.held_seats.lock().push(seat_id.to_string());
+            
+            // Update UI
+            assigned_seats_sender.send((from_user_index, format!("REMOVE:{}", seat_id))).ok();
+            assigned_seats_sender.send((to_user_index, seat_id.to_string())).ok();
+            
+            log_sender.send((to_user_index, format!("✅ ATOMIC SUCCESS: {}", seat_id))).ok();
+            return Ok(true);
+        } else {
+            let error_text = response.text().await.unwrap_or_default();
+            log_sender.send((to_user_index, format!("❌ Take failed: {} - trying to restore", error_text))).ok();
+            
+            // Try to restore the seat to original user
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await; // Give server time
+            
+            if let Ok(restore_req) = Self::prepare_take_request_for_transfer(from_user, seat_id).await {
+                let restore_response = restore_req.client
+                    .post(&restore_req.url)
+                    .headers(restore_req.headers)
+                    .body(restore_req.body)
+                    .send()
+                    .await;
+                    
+                match restore_response {
+                    Ok(resp) if resp.status().is_success() => {
+                        from_user.held_seats.lock().push(seat_id.to_string());
+                        assigned_seats_sender.send((from_user_index, seat_id.to_string())).ok();
+                        log_sender.send((from_user_index, format!("✅ Restored: {}", seat_id))).ok();
+                    }
+                    _ => {
+                        log_sender.send((from_user_index, format!("⚠️ FAILED TO RESTORE: {}", seat_id))).ok();
+                    }
                 }
             }
+            
+            return Err(anyhow::anyhow!("Transfer failed"));
         }
-        
-        return Err(anyhow::anyhow!("Transfer failed"));
     }
-}
-    
+        
+        
     fn build_channel_keys(&self) -> Vec<String> {
         let mut channel_keys = vec!["NO_CHANNEL".to_string()];
 
@@ -1989,9 +2194,39 @@ async fn atomic_transfer_seat_ultra_fast(
                 if user_index < self.users.len() {
                     self.users[user_index].expire = expire_time.to_string();
 
+                    // ADD EXPIRY WARNING NOTIFICATION (like Go version)
+                    if expire_time > 0 && expire_time < 100 {
+                        // Check if we haven't already sent warning for this user
+                        if !self.expiry_warnings_sent.get(&user_index).unwrap_or(&false) {
+                            // Send expiry warning notification
+                            if let Some(telegram_sender) = &self.telegram_sender {
+                                let user = &self.users[user_index];
+                                let message = format!(
+                                    "⚠️ EXPIRY WARNING\n\
+                                    ━━━━━━━━━━━━━━━━━\n\
+                                    🔧 Account: {}\n\
+                                    💺 Seats Held: {}\n\
+                                    ⏰ Time Left: <100 seconds\n\
+                                    ━━━━━━━━━━━━━━━━━",
+                                    user.email,
+                                    user.held_seats.len()
+                                );
+                                telegram_sender.send(message).ok();
+                            }
+                            
+                            // Mark warning as sent for this user
+                            self.expiry_warnings_sent.insert(user_index, true);
+                        }
+                    } else if expire_time >= 100 {
+                        // Reset warning flag when token gets refreshed
+                        self.expiry_warnings_sent.insert(user_index, false);
+                    }
+
                     // Update status based on expire time
                     if expire_time == 0 {
                         self.users[user_index].status = "Expired".to_string();
+                        // Reset warning flag on expiry
+                        self.expiry_warnings_sent.insert(user_index, false);
                     } else if expire_time < 30 {
                         self.users[user_index].status = "Expiring Soon".to_string();
                     } else {
@@ -2096,6 +2331,13 @@ async fn atomic_transfer_seat_ultra_fast(
             println!("Please load users first");
             return;
         }
+        if let Err(e) = self.start_node_process() {
+            println!("Failed to start Node.js server: {}", e);
+            return;
+        }
+
+        // Give Node.js server time to start
+        std::thread::sleep(std::time::Duration::from_secs(2));
     
         // Set seat limits for each user type
         let star_user_limit: usize = self.seats.parse().unwrap_or(0);
@@ -2249,7 +2491,8 @@ async fn atomic_transfer_seat_ultra_fast(
                                             }
                                         } else {
                                             log_sender_clone_task.send((user_index, "❌ FAILED to get new token.".to_string())).ok();
-                                            user_clone.expire_time.store(0, Ordering::Relaxed); // Allow re-try
+                                            user_clone.expire_time.store(300, Ordering::Relaxed);
+                                            //user_clone.expire_time.store(0, Ordering::Relaxed); // Allow re-try
                                         }
                                     });
                                 }
@@ -2274,6 +2517,9 @@ async fn atomic_transfer_seat_ultra_fast(
 
             if ui.button("Load Proxies").clicked() {
                 self.load_proxies();
+            }
+            if ui.button("Save Token").clicked() {
+                self.save_tokens();
             }
 
             ui.separator();
@@ -2302,6 +2548,7 @@ async fn atomic_transfer_seat_ultra_fast(
             if ui.button(bot_button_text).clicked() {
                 if self.bot_running {
                     self.bot_running = false;
+                    self.stop_node_process();
                 } else {
                     self.start_bot();
                 }
@@ -2437,9 +2684,7 @@ async fn atomic_transfer_seat_ultra_fast(
             }
         }
     }
-    // In impl WebbookBot
-    // In impl WebbookBot
-    // In impl WebbookBot
+
     fn render_user_table(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
 
@@ -2510,9 +2755,7 @@ async fn atomic_transfer_seat_ultra_fast(
         }
         // --- END OF FIX ---
     }
-    // In impl WebbookBot
-    // In impl WebbookBot
-    // In impl WebbookBot
+
     fn handle_payment_click(&mut self, user_index: usize) {
         if let (Some(bot_manager), Some(rt), Some(log_sender), Some(telegram_sender)) = 
             (&self.bot_manager, &self.rt, &self.log_sender, &self.telegram_sender) 
@@ -2520,7 +2763,9 @@ async fn atomic_transfer_seat_ultra_fast(
             let bot_manager_clone = bot_manager.clone();
             let log_sender_clone = log_sender.clone();
             let telegram_sender_clone = telegram_sender.clone();
-
+            let user_email = self.users[user_index].email.clone();
+            let user_type = self.users[user_index].user_type.clone();
+            let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
             log_sender_clone.send((user_index, "💳 Generating payment link...".to_string())).ok();
 
             rt.spawn(async move {
@@ -2613,7 +2858,42 @@ async fn atomic_transfer_seat_ultra_fast(
                             if let Ok(data) = serde_json::from_str::<Value>(&body_text) {
                                 if let Some(link) = data.get("data").and_then(|d| d.get("redirect_url")).and_then(|l| l.as_str()) {
                                     log_sender_clone.send((user_index, format!("✅ Payment link: {}", link))).ok();
-                                    telegram_sender_clone.send(format!("💳 Payment Link for {}:\n{}", bot_user.email, link)).ok();
+                                    let held_seats = bot_manager_clone.users[user_index].held_seats.lock();
+                                    let seats_count = held_seats.len();
+                                    let seat_list: Vec<String> = held_seats.clone();
+                                    
+                                    let message = if user_type == "+" && d_seats_limit > 0 && seats_count >= d_seats_limit {
+                                        // Payment required notification
+                                        format!(
+                                            "⚠️ PAYMENT REQUIRED (LIMIT REACHED)\n\
+                                            ━━━━━━━━━━━━━━━━━\n\
+                                            🔧 User: {} (Type: +)\n\
+                                            🎫 Seats: {} (Limit reached)\n\
+                                            💰 Must pay now!\n\
+                                            🔗 Payment: {}\n\
+                                            ━━━━━━━━━━━━━━━━━",
+                                            user_email,
+                                            seats_count,
+                                            link
+                                        )
+                                    } else {
+                                        // Regular payment link notification
+                                        let seats_formatted = seat_list.join("\n");
+                                        format!(
+                                            "💳 PAYMENT LINK GENERATED\n\
+                                            ━━━━━━━━━━━━━━━━━\n\
+                                            🔧 User: {}\n\
+                                            🎫 Seats ({}):\n{}\n\
+                                            🔗 Link: {}\n\
+                                            ━━━━━━━━━━━━━━━━━",
+                                            user_email,
+                                            seats_count,
+                                            seats_formatted,
+                                            link
+                                        )
+                                    };
+                                    
+                                    telegram_sender_clone.send(message).ok();
                                 } else {
                                     log_sender_clone.send((user_index, format!("❌ Link not found in response: {}", body_text))).ok();
                                 }
@@ -2725,19 +3005,6 @@ async fn atomic_transfer_seat_ultra_fast(
             .collect()
     }
 
-    fn update_ready_star_users(&mut self) {
-        let new_users: Vec<usize> = self.users
-        .iter()
-        .enumerate()
-        .filter(|(_, user)| user.user_type == "*" && user.status == "Active")
-        .map(|(i, _)| i)  // This is the actual index in self.users
-        .collect();
-        
-        let mut ready_users = self.ready_scanner_users.lock();
-        ready_users.clear();
-        ready_users.extend(new_users);
-    }
-
     // In impl WebbookBot
     async fn run_websocket_scanner(
         shared_data: Arc<RwLock<SharedData>>,
@@ -2768,8 +3035,6 @@ async fn atomic_transfer_seat_ultra_fast(
         }
         Ok(())
     }
-    // In impl WebbookBot
-    // In impl WebbookBot
     async fn connect_and_listen(
         shared_data: &Arc<RwLock<SharedData>>,
         bot_manager: &Option<Arc<BotManager>>,
@@ -2784,11 +3049,21 @@ async fn atomic_transfer_seat_ultra_fast(
         transfer_ignore_list: &Arc<Mutex<HashSet<String>>>, // Add this parameter
     ) -> Result<()> {
         use sha1::{Sha1, Digest};
-        use tokio_tungstenite::{connect_async, tungstenite::Message};
+        use tokio_tungstenite::{connect_async, tungstenite::Message, connect_async_with_config, tungstenite::protocol::WebSocketConfig}; // MODIFIED: Added imports
         use futures_util::{SinkExt, StreamExt};
     
         let ws_url = "wss://messaging-eu.seatsio.net/ws";
-        let (ws_stream, _) = connect_async(ws_url).await?;
+        let config = WebSocketConfig {
+            max_send_queue: Some(1000),
+            max_message_size: Some(64 << 20),
+            max_frame_size: Some(16 << 20),
+            // --- FIX: ADDED MISSING FIELDS ---
+            write_buffer_size: 16 << 20,      // 16MB initial write buffer
+            max_write_buffer_size: 64 << 20,  // 64MB max write buffer
+            // --- END FIX ---
+            accept_unmasked_frames: false,
+        };
+        let (ws_stream, _) = connect_async_with_config(ws_url, Some(config), false).await?;
         let (mut write, mut read) = ws_stream.split();
     
         // Subscription logic remains the same
@@ -2886,155 +3161,107 @@ async fn atomic_transfer_seat_ultra_fast(
         Ok(())
     }
     
-
-    // In impl WebbookBot
-    async fn atomic_transfer_seat(
-        from_user: &BotUser,
-        to_user: &BotUser,
-        seat_id: &str,
-        prepared_request: (String, reqwest::header::HeaderMap, String),
-        assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
-        from_user_index: usize,
-        to_user_index: usize,
-    ) -> Result<bool> {
-        let event_keys = if let Ok(data) = from_user.shared_data.try_read() {
-            if let Some(event_key) = &data.event_key { vec![event_key.clone()] } 
-            else { return Err(anyhow::anyhow!("Event key not found")); }
-        } else { return Err(anyhow::anyhow!("Could not read shared data")); };
-
-        // --- START OF NEW SEQUENTIAL LOGIC ---
-
-        // Step 1: Send the release request and WAIT for the server to confirm it succeeded.
-        let release_succeeded = from_user.release_seat(seat_id, &event_keys).await?;
-        
-        if !release_succeeded {
-            println!("❌ Transfer FAILED for {}. Seat could not be released.", seat_id);
-            return Ok(false); // Halt the entire transfer operation.
+    fn notify_transfer_complete(
+        &self, 
+        from_user_email: &str, 
+        to_user_email: &str, 
+        transferred_count: usize, 
+        to_user_total_seats: usize
+    ) {
+        if let Some(telegram_sender) = &self.telegram_sender {
+            let message = format!(
+                "🔄 SEAT TRANSFER\n\
+                ━━━━━━━━━━━━━━━━━\n\
+                From: {}\n\
+                To: {}\n\
+                Seats Transferred: {}\n\
+                Target Total: {}\n\
+                ━━━━━━━━━━━━━━━━━",
+                from_user_email,
+                to_user_email,
+                transferred_count,
+                to_user_total_seats
+            );
+            telegram_sender.send(message).ok();
         }
-
-        // Step 2: Only if the release was successful, immediately fire the 5 concurrent take requests.
-        let mut take_handles = Vec::new();
-        for i in 0..5 {
-            let to_user_client = to_user.client.clone();
-            let (url, headers, body) = (prepared_request.0.clone(), prepared_request.1.clone(), prepared_request.2.clone());
-            take_handles.push(tokio::spawn(async move {
-                to_user_client.post(&url).headers(headers).body(body).send().await
-            }));
-        }
-        
-        let take_results = futures::future::join_all(take_handles).await;
-        
-        // Step 3: Analyze the results of the take requests.
-        let mut take_succeeded = false;
-        for (i, res) in take_results.into_iter().enumerate() {
-            match res {
-                Ok(Ok(resp)) => {
-                    if resp.status().is_success() {
-                        if !take_succeeded {
-                            println!("✅ Transfer take request #{} SUCCEEDED", i + 1);
-                            take_succeeded = true;
-                        }
-                    } else {
-                        let status = resp.status();
-                        let body = resp.text().await.unwrap_or_default();
-                        println!("❌ Transfer take request #{} FAILED with status {}: {}", i + 1, status, body);
-                    }
-                }
-                Ok(Err(e)) => { println!("❌ Transfer take request #{} FAILED with network error: {}", i + 1, e); }
-                Err(e) => { println!("❌ Transfer take request #{} FAILED with task error: {}", i + 1, e); }
-            }
-        }
-
-        // Step 4: Update the UI and state based on the final outcome.
-        if take_succeeded {
-            to_user.held_seats.lock().push(seat_id.to_string());
-            println!("✅ Safe Transfer SUCCESS for {}", seat_id);
-            assigned_seats_sender.send((from_user_index, format!("REMOVE:{}", seat_id))).ok();
-            assigned_seats_sender.send((to_user_index, seat_id.to_string())).ok();
-            return Ok(true);
-        } else {
-            // Since the release succeeded but the take failed, the seat is lost.
-            println!("❌ Safe Transfer FAILED for {}. Seat released but not recaptured.", seat_id);
-            assigned_seats_sender.send((from_user_index, format!("REMOVE:{}", seat_id))).ok();
-            return Ok(false);
-        }
-        // --- END OF NEW LOGIC ---
     }
-    fn execute_transfer(&mut self, from_user_index: usize, to_user_index: usize) {
-        let assigned_seats_sender = match &self.assigned_seats_sender {
-            Some(sender) => sender.clone(),
-            None => { println!("Cannot transfer: assigned_seats_sender is not available."); return; }
-        };
-        let ignore_list = self.transfer_ignore_list.clone();
 
-        if let (Some(bot_manager), Some(rt)) = (&self.bot_manager, &self.rt) {
-            let from_user = bot_manager.users[from_user_index].clone();
-            let to_user = bot_manager.users[to_user_index].clone();
-            let seats_to_transfer = from_user.held_seats.lock().clone();
+    // 2. Expiry Warning Notification (like Go's notifyExpiryWarning)
+    fn notify_expiry_warning(&self, user_email: &str, seats_held: usize) {
+        if let Some(telegram_sender) = &self.telegram_sender {
+            let message = format!(
+                "⚠️ EXPIRY WARNING\n\
+                ━━━━━━━━━━━━━━━━━\n\
+                🔧 Account: {}\n\
+                💺 Seats Held: {}\n\
+                ⏰ Time Left: <100 seconds\n\
+                ━━━━━━━━━━━━━━━━━",
+                user_email,
+                seats_held
+            );
+            telegram_sender.send(message).ok();
+        }
+    }
 
-            if seats_to_transfer.is_empty() {
-                println!("No seats to transfer for user {}", from_user.email);
-                return;
-            }
-            {
-                let mut list = ignore_list.lock();
-                for seat in &seats_to_transfer {
-                    list.insert(seat.clone());
-                }
-                println!("Added {} seats to transfer ignore list.", seats_to_transfer.len());
-            }
-            let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
-            println!("Starting ULTRA-FAST transfer: {} seats from {} to {}", seats_to_transfer.len(), from_user.email, to_user.email);
+    // 3. Seat Taking Notification (like Go's notifySeatsToken)
+    fn notify_seats_taken(&self, user_email: &str, seats_taken: usize, total_held: usize, max_seats: usize, success: bool) {
+        if let Some(telegram_sender) = &self.telegram_sender {
+            let status = if success { "✅ SUCCESS" } else { "❌ FAILED" };
+            
+            let message = format!(
+                "🎫 SEAT TAKING {}\n\
+                ━━━━━━━━━━━━━━━━━\n\
+                🔧 Account: {}\n\
+                💺 Seats Taken: {}\n\
+                📊 Total Held: {}/{}\n\
+                ━━━━━━━━━━━━━━━━━",
+                status,
+                user_email,
+                seats_taken,
+                total_held,
+                max_seats
+            );
+            telegram_sender.send(message).ok();
+        }
+    }
 
-            rt.spawn(async move {
-                let mut prepared_requests = HashMap::new();
-                let mut base_headers = reqwest::header::HeaderMap::new();
-                base_headers.insert("content-type", "application/json".parse().unwrap());
-                if let Some(browser_id) = to_user.browser_id.lock().as_ref() {
-                    base_headers.insert("x-browser-id", browser_id.parse().unwrap());
-                }
+    // 4. Payment Link Generated (like Go's notifyPaymentLink)
+    fn notify_payment_link(&self, user_email: &str, seats_held: usize, seat_list: &[String], payment_link: &str) {
+        if let Some(telegram_sender) = &self.telegram_sender {
+            let seats_formatted = seat_list.join("\n");
+            
+            let message = format!(
+                "💳 PAYMENT LINK GENERATED\n\
+                ━━━━━━━━━━━━━━━━━\n\
+                🔧 User: {}\n\
+                🎫 Seats ({}):\n{}\n\
+                🔗 Link: {}\n\
+                ━━━━━━━━━━━━━━━━━",
+                user_email,
+                seats_held,
+                seats_formatted,
+                payment_link
+            );
+            telegram_sender.send(message).ok();
+        }
+    }
 
-                for seat_id in &seats_to_transfer {
-                    if let Ok(req) = to_user.prepare_take_request(seat_id, &base_headers).await {
-                        prepared_requests.insert(seat_id.clone(), req);
-                    }
-                }
-                
-                for seat_id in seats_to_transfer {
-                    // This check correctly respects the target's seat limit.
-                    let to_user_seat_count = to_user.held_seats.lock().len();
-                    if d_seats_limit > 0 && to_user_seat_count >= d_seats_limit {
-                        println!("Target user {} reached seat limit of {}. Halting transfer.", to_user.email, d_seats_limit);
-                        break;
-                    }
-                    if let Some(prepared) = prepared_requests.remove(&seat_id) {
-                        // --- START OF FIX ---
-                        // This `match` block now handles all types of failures and stops the loop.
-                        match Self::atomic_transfer_seat(
-                            &from_user, &to_user, &seat_id, prepared, 
-                            &assigned_seats_sender, from_user_index, to_user_index
-                        ).await {
-                            Ok(true) => {
-                                // Success, continue to the next seat.
-                            }
-                            Ok(false) => {
-                                // Soft failure (e.g., restore failed), stop the entire transfer.
-                                println!("Atomic transfer failed for seat {}. Halting.", seat_id);
-                                break;
-                            }
-                            Err(e) => {
-                                // Hard failure (e.g., network error), stop the entire transfer.
-                                println!("Error during atomic transfer for seat {}: {}. Halting.", seat_id, e);
-                                break;
-                            }
-                        }
-                        // --- END OF FIX ---
-                    }
-                }
-                println!("Transfer process complete for {} -> {}", from_user.email, to_user.email);
-                ignore_list.lock().clear();
-                println!("Transfer ignore list cleared.");
-            });
+    // 5. Payment Required (like Go's notifyPaymentRequired)
+    fn notify_payment_required(&self, user_email: &str, seats_held: usize, payment_link: &str) {
+        if let Some(telegram_sender) = &self.telegram_sender {
+            let message = format!(
+                "⚠️ PAYMENT REQUIRED (LIMIT REACHED)\n\
+                ━━━━━━━━━━━━━━━━━\n\
+                🔧 User: {} (Type: +)\n\
+                🎫 Seats: {} (Limit reached)\n\
+                💰 Must pay now!\n\
+                🔗 Payment: {}\n\
+                ━━━━━━━━━━━━━━━━━",
+                user_email,
+                seats_held,
+                payment_link
+            );
+            telegram_sender.send(message).ok();
         }
     }
 }
@@ -3115,7 +3342,22 @@ impl eframe::App for WebbookBot {
 
 }
 
+
+#[cfg(unix)]
+fn optimize_system_settings() {
+    // Set file descriptor limits
+    unsafe {
+        // --- FIX: CORRECTED rlimit USAGE ---
+        let mut limits = rlimit { rlim_cur: 65536, rlim_max: 65536 };
+        if setrlimit(RLIMIT_NOFILE, &limits) != 0 {
+            println!("Warning: Failed to set file descriptor limit. May encounter issues under heavy load.");
+        }
+        // --- END FIX ---
+    }
+}
 fn main() -> Result<(), eframe::Error> {
+    #[cfg(unix)]
+    optimize_system_settings();
     env_logger::init();
 
     let options = eframe::NativeOptions {
