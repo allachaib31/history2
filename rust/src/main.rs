@@ -253,37 +253,33 @@ impl TokenManager {
 }
 
 impl BotUser {
-    // In impl BotUser
-    // In impl BotUser
-    // In impl BotUser
-    // In impl BotUser
-    // In impl BotUser
     fn new(
         email: String,
-        proxy_url: String,
+        proxy_url: String, // Keep as String to avoid breaking existing code
         shared_data: Arc<RwLock<SharedData>>,
         token_manager: Arc<TokenManager>,
     ) -> Result<Self> {
-        // --- START OF FINAL FIX ---
-        // Use the constructor suggested by the compiler to avoid name collisions.
         let no_proxy = reqwest::NoProxy::from_string("localhost,127.0.0.1");
-        
-        let proxy = Proxy::all(&proxy_url)?
-            .no_proxy(no_proxy);
-        // --- END OF FINAL FIX ---
-
-        let client = Client::builder()
-            .proxy(proxy)
+    
+        let mut client_builder = Client::builder()
             .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
-            .pool_max_idle_per_host(100)  // INCREASE from 10 to 100 (like Go)
+            .pool_max_idle_per_host(100)
             .http2_keep_alive_interval(Some(std::time::Duration::from_secs(60)))
             .http2_keep_alive_timeout(std::time::Duration::from_secs(20))
-            .connect_timeout(std::time::Duration::from_secs(60))  // REDUCE from 20
-            .timeout(std::time::Duration::from_secs(90))           // REDUCE from 17
+            .connect_timeout(std::time::Duration::from_secs(60))
+            .timeout(std::time::Duration::from_secs(90))
             .tcp_keepalive(std::time::Duration::from_secs(60))
-            .tcp_nodelay(true)  // ADD THIS - disables Nagle's algorithm
-            .build()?;
-
+            .tcp_nodelay(true);
+    
+        // Only add proxy if provided and not empty/sentinel value
+        if !proxy_url.is_empty() && proxy_url != "No proxy" {
+            let proxy = Proxy::all(&proxy_url)?
+                .no_proxy(no_proxy);
+            client_builder = client_builder.proxy(proxy);
+        }
+    
+        let client = client_builder.build()?;
+    
         Ok(Self {
             email,
             proxy_url,
@@ -908,20 +904,21 @@ fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
 
 impl BotManager {
     async fn new(
-        users_data: Vec<(String, String)>,
+        users_data: Vec<(String, Option<String>)>, // Changed from Vec<(String, String)>
         event_url: String,
         shared_data: Arc<RwLock<SharedData>>,
     ) -> Result<Self> {
         let mut token_manager = TokenManager::new();
         if let Err(e) = token_manager.load_from_file("tokens.json") {
             println!("Warning: Could not load tokens.json: {}", e);
-            // Continue without tokens file
         }
         let token_manager = Arc::new(token_manager);
 
         let mut users = Vec::new();
-        for (email, proxy) in users_data {
-            let user = BotUser::new(email, proxy, shared_data.clone(), token_manager.clone())?;
+        for (email, proxy) in users_data { // proxy is now Option<String>
+            // Convert Option<String> to String for BotUser::new
+            let proxy_string = proxy.unwrap_or_else(|| "No proxy".to_string());
+            let user = BotUser::new(email, proxy_string, shared_data.clone(), token_manager.clone())?;
             users.push(user);
         }
 
@@ -1380,7 +1377,7 @@ impl WebbookBot {
         
         let mut command = Command::new("node");
         command
-            .arg("../../newHistory/newWebokboot/newTest2.js")
+            .arg("./script/newTest2.js")
             .arg(&event_url)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -2299,10 +2296,11 @@ async fn dispatch_seat_take_task(
                         match result {
                             Ok(mut user) => {
                                 let mut user: User = user;
+                                // Assign proxy only if proxies are available
                                 user.proxy = if !self.proxies.is_empty() {
                                     self.proxies[new_users.len() % self.proxies.len()].clone()
                                 } else {
-                                    "No proxy".to_string()
+                                    "No proxy".to_string() // Default when no proxies
                                 };
                                 user.status = "Ready".to_string();
                                 user.expire = "0".to_string();
@@ -2336,9 +2334,9 @@ async fn dispatch_seat_take_task(
                         .map(|line| line.trim().to_string())
                         .collect();
 
-                    // Update user proxies
-                    for (i, user) in self.users.iter_mut().enumerate() {
-                        if !self.proxies.is_empty() {
+                    // Update user proxies only if proxies are loaded
+                    if !self.proxies.is_empty() {
+                        for (i, user) in self.users.iter_mut().enumerate() {
                             user.proxy = self.proxies[i % self.proxies.len()].clone();
                         }
                     }
@@ -2376,8 +2374,17 @@ async fn dispatch_seat_take_task(
         }
     
         // Prepare data and channels for the background tasks
-        let users_data: Vec<(String, String)> =
-            self.users.iter().map(|u| (u.email.clone(), u.proxy.clone())).collect();
+        let users_data: Vec<(String, Option<String>)> = self.users
+            .iter()
+            .map(|u| {
+                let proxy = if u.proxy == "No proxy" || u.proxy.is_empty() {
+                    None
+                } else {
+                    Some(u.proxy.clone())
+                };
+                (u.email.clone(), proxy)
+            })
+            .collect();
         let event_url = self.event_url.clone();
     
         // Create the single, shared channel for all seat updates
@@ -2748,7 +2755,14 @@ async fn dispatch_seat_take_task(
                         }
                     });
                     row.col(|ui| { ui.label(&user.user_type); });
-                    row.col(|ui| { ui.label(&user.proxy); });
+                    row.col(|ui| { 
+                        // Show proxy status with color coding
+                        if user.proxy == "No proxy" || user.proxy.is_empty() {
+                            ui.colored_label(egui::Color32::LIGHT_GRAY, "No proxy");
+                        } else {
+                            ui.label(&user.proxy);
+                        }
+                    });
                     row.col(|ui| {
                         let color = match user.status.as_str() {
                             "Ready" => egui::Color32::GREEN,
@@ -3416,3 +3430,5 @@ fn main() -> Result<(), eframe::Error> {
         Box::new(|_cc| Box::new(WebbookBot::new())),
     )
 }
+
+// he can't chaneg seat limitation we he distubuted reverse 
