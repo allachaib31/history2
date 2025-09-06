@@ -11,10 +11,14 @@ const API_ID: i32 = 21955613;
 const API_HASH: &str = "8cc201109a0697c1e42e70bc942931a7";
 const SESSION_FILE: &str = "telegram.session";
 const CHAT_ID: i64 = 4785839500;
-
+#[derive(Debug)]
+pub struct TelegramMessage {
+    pub text: String,
+    pub chat_id: i64,
+}
 pub struct TelegramManager {
     client: Client,
-    receiver: mpsc::UnboundedReceiver<String>,
+    receiver: mpsc::UnboundedReceiver<TelegramMessage>, // Changed from String
     gui_request_sender: Option<mpsc::UnboundedSender<TelegramRequest>>,
     gui_response_receiver: Option<mpsc::UnboundedReceiver<String>>,
 }
@@ -27,7 +31,7 @@ pub enum TelegramRequest {
 
 impl TelegramManager {
     pub async fn new(
-        receiver: mpsc::UnboundedReceiver<String>,
+        receiver: mpsc::UnboundedReceiver<TelegramMessage>, // Changed from String
         gui_request_sender: mpsc::UnboundedSender<TelegramRequest>,
         gui_response_receiver: mpsc::UnboundedReceiver<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -89,12 +93,12 @@ impl TelegramManager {
             println!("Telegram: Already signed in.");
         }
         
-        while let Some(message) = self.receiver.recv().await {
+        while let Some(telegram_msg) = self.receiver.recv().await {
             let request = SendMessage {
-                peer: InputPeer::Chat(InputPeerChat { chat_id: CHAT_ID }),
-                message,
+                peer: InputPeer::Chat(InputPeerChat { chat_id: telegram_msg.chat_id }), // Use dynamic chat_id
+                message: telegram_msg.text, // Use text from struct
                 random_id: rand::random(),
-                
+        
                 // Manually set all other fields to their default values
                 no_webpage: false,
                 silent: false,

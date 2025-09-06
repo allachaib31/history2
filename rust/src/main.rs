@@ -23,7 +23,7 @@ use captcha_solver::CaptchaSolver;
 use std::process::{Child, Command, Stdio};
 use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
 use telegram_manager::TelegramRequest;
-
+use telegram_manager::TelegramMessage;
 
 const WORKSPACE_KEY: &str = "3d443a0c-83b8-4a11-8c57-3db9d116ef76";
 #[derive(Clone)] // <-- ADD THIS LINE
@@ -88,7 +88,7 @@ pub struct WebbookBot {
     ready_receiver: Option<mpsc::UnboundedReceiver<usize>>, // ADD THIS LINE
     log_sender: Option<mpsc::UnboundedSender<(usize, String)>>,
     log_receiver: Option<mpsc::UnboundedReceiver<(usize, String)>>,
-    telegram_sender: Option<mpsc::UnboundedSender<String>>, // --- ADD THIS ---
+    telegram_sender: Option<mpsc::UnboundedSender<TelegramMessage>>, // --- ADD THIS ---
     transfer_ignore_list: Arc<Mutex<HashSet<String>>>,
     node_process: Option<Child>, // ADD THIS for Node.js process management
     token_file_path: String,  
@@ -1116,17 +1116,18 @@ impl WebbookBot {
     pub fn new() -> Self {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
         let (log_sender, log_receiver) = mpsc::unbounded_channel();
-        let (telegram_sender, telegram_receiver) = mpsc::unbounded_channel();
+        let (telegram_sender, telegram_receiver) = mpsc::unbounded_channel::<TelegramMessage>();
         let (telegram_request_sender, telegram_request_receiver) = mpsc::unbounded_channel();
         let (telegram_response_sender, telegram_response_receiver) = mpsc::unbounded_channel(); // --- ADD THIS ---
     
         // --- ADD THIS BLOCK to start the Telegram client ---
         rt.spawn(async move {
             match TelegramManager::new(
-                telegram_receiver,
+                telegram_receiver, // CORRECT - this is the receiver variable
                 telegram_request_sender,
                 telegram_response_receiver
             ).await {
+            
                 Ok(mut manager) => {
                     println!("Telegram Manager created. Running...");
                     if let Err(e) = manager.run().await {
@@ -1413,7 +1414,7 @@ impl WebbookBot {
         next_user_index: &Arc<AtomicUsize>,
         assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
         log_sender: &mpsc::UnboundedSender<(usize, String)>,
-        telegram_sender: &mpsc::UnboundedSender<String>,
+        telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
         ui_users: &Vec<User>,
         pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>,
     ) {
@@ -1498,7 +1499,10 @@ impl WebbookBot {
                                         total_held,
                                         if max_seats == 0 { "∞".to_string() } else { max_seats.to_string() }
                                     );
-                                    telegram_sender_clone.send(message).ok();
+                                    telegram_sender_clone.send(TelegramMessage {
+                                        text: message,
+                                        chat_id: 4785839500, // Seat operations group
+                                    }).ok();
                                 }
                             });
                             return; // Exit after dispatching to one user.
@@ -1840,7 +1844,10 @@ impl WebbookBot {
                                     successfully_transferred,
                                     final_seat_count
                                 );
-                                sender.send(message).ok();
+                                sender.send(TelegramMessage {
+                                    text: message,
+                                    chat_id: 4940392737, // Transfer operations group
+                                }).ok();
                             }
                         }
                         Ok(false) | Err(_) => {
@@ -1856,8 +1863,7 @@ impl WebbookBot {
 
                 // Final notification
                 log_sender.send((from_user_index, format!("📊 Ultra-fast transfer result: {} seats transferred", successfully_transferred))).ok();
-                
-                telegram_sender.send(format!(
+                let message = format!(
                     "🔄 SEAT TRANSFER COMPLETE\n\
                     ——————————————————\n\
                     From: {}\n\
@@ -1868,8 +1874,13 @@ impl WebbookBot {
                     from_user.email,
                     to_user.email,
                     successfully_transferred,
-                    to_user.held_seats.lock().len()
-                )).ok();
+                    to_user.held_seats.lock().len(),
+                );
+                telegram_sender.send(TelegramMessage{
+                    text: message,
+                    chat_id: 4940392737,
+                }
+                ).ok();
             });
         }
     }
@@ -2187,7 +2198,10 @@ impl WebbookBot {
                                     user.email,
                                     user.held_seats.len()
                                 );
-                                telegram_sender.send(message).ok();
+                                telegram_sender.send(TelegramMessage {
+                                    text: message,
+                                    chat_id: 4639502335, // Expiry group
+                                }).ok();
                             }
                             
                             // Mark warning as sent for this user
@@ -2802,7 +2816,7 @@ impl WebbookBot {
                     if let Err(e) = bot_manager_clone.extract_recaptcha_site_key().await {
                         // If localhost is down or fails, cancel the payment operation.
                         log_sender_clone.send((user_index, format!("❌ Could not get site key from localhost: {}", e))).ok();
-                        telegram_sender_clone.send(format!("⚠️ Payment for {} failed. Could not connect to the local Node.js server.", bot_manager_clone.users[user_index].email)).ok();
+                        //telegram_sender_clone.send(format!("⚠️ Payment for {} failed. Could not connect to the local Node.js server.", bot_manager_clone.users[user_index].email)).ok();
                         return;
                     }
                     
@@ -2910,7 +2924,10 @@ impl WebbookBot {
                                         )
                                     };
                                     
-                                    telegram_sender_clone.send(message).ok();
+                                    telegram_sender_clone.send(TelegramMessage {
+                                        text: message,
+                                        chat_id: 4814580777, // Payment group
+                                    }).ok();
                                 } else {
                                     log_sender_clone.send((user_index, format!("❌ Link not found in response: {}", body_text))).ok();
                                 }
@@ -2954,7 +2971,10 @@ impl WebbookBot {
                             user_email,
                             payment_link
                         );
-                        telegram_sender_clone.send(message).ok();
+                        telegram_sender_clone.send(TelegramMessage {
+                            text: message,
+                            chat_id: 4785839500, // Seat operations group
+                        }).ok();
                     }
                     Err(e) => {
                         log_sender_clone.send((user_index, format!("❌ Payment link (M2) failed: {}", e))).ok();
@@ -3089,7 +3109,7 @@ impl WebbookBot {
             rt.spawn(async move {
                 if let Err(e) = Self::run_websocket_scanner(
                     shared_data, bot_manager, selected_channels, users_data_clone,
-                    assigned_seats_sender, log_sender, telegram_sender,
+                    assigned_seats_sender, log_sender, &telegram_sender,
                     ready_scanner_users_clone, next_user_index_clone,
                     reserved_seats_map_clone,
                     transfer_ignore_list_clone, // --- PASS IT HERE ---
@@ -3122,7 +3142,8 @@ impl WebbookBot {
         users_data: Vec<User>,
         assigned_seats_sender: mpsc::UnboundedSender<(usize, String)>,
         log_sender: mpsc::UnboundedSender<(usize, String)>,
-        telegram_sender: mpsc::UnboundedSender<String>,
+        telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
+
         ready_scanner_users: Arc<Mutex<Vec<usize>>>,
         next_user_index: Arc<AtomicUsize>,
         reserved_seats_map: Arc<Mutex<HashMap<String, Vec<String>>>>,
@@ -3153,7 +3174,7 @@ impl WebbookBot {
         users_data: &Vec<User>,
         assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
         log_sender: &mpsc::UnboundedSender<(usize, String)>,
-        telegram_sender: &mpsc::UnboundedSender<String>,
+        telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
         ready_scanner_users: &Arc<Mutex<Vec<usize>>>,
         next_user_index: &Arc<AtomicUsize>,
         reserved_seats_map: &Arc<Mutex<HashMap<String, Vec<String>>>>,
@@ -3221,7 +3242,7 @@ impl WebbookBot {
                                 if !is_ignored && is_in_selected_section {
                                     Self::dispatch_seat_take_task(
                                         seat_id, "SCANNER", bot_manager, ready_scanner_users, 
-                                        next_user_index, assigned_seats_sender, log_sender, telegram_sender, users_data,
+                                        next_user_index, assigned_seats_sender, log_sender, &telegram_sender, users_data,
                                         pending_scanner_seats
                                     ).await;
                                 }else if is_ignored {
@@ -3268,7 +3289,7 @@ impl WebbookBot {
                                         if !is_ignored && is_in_selected_section {
                                             Self::dispatch_seat_take_task(
                                                 &seat_id, "SNIPER", bot_manager, ready_scanner_users, 
-                                                next_user_index, assigned_seats_sender, log_sender, telegram_sender, users_data,
+                                                next_user_index, assigned_seats_sender, log_sender, &telegram_sender, users_data,
                                                 pending_scanner_seats
                                             ).await;
                                         } else if is_ignored {
