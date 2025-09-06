@@ -25,6 +25,7 @@ use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSoc
 use telegram_manager::TelegramRequest;
 use telegram_manager::TelegramMessage;
 
+
 const WORKSPACE_KEY: &str = "3d443a0c-83b8-4a11-8c57-3db9d116ef76";
 #[derive(Clone)] // <-- ADD THIS LINE
 struct PreparedSeatRequest {
@@ -55,7 +56,7 @@ pub struct WebbookBot {
     // User data
     users: Vec<User>,
     proxies: Vec<String>,
-
+    selected_sections_shared: Arc<Mutex<HashMap<String, bool>>>,
     // Status
     bot_running: bool,
 
@@ -1119,7 +1120,7 @@ impl WebbookBot {
         let (telegram_sender, telegram_receiver) = mpsc::unbounded_channel::<TelegramMessage>();
         let (telegram_request_sender, telegram_request_receiver) = mpsc::unbounded_channel();
         let (telegram_response_sender, telegram_response_receiver) = mpsc::unbounded_channel(); // --- ADD THIS ---
-    
+        let selected_sections_shared = Arc::new(Mutex::new(HashMap::new()));
         // --- ADD THIS BLOCK to start the Telegram client ---
         rt.spawn(async move {
             match TelegramManager::new(
@@ -1157,6 +1158,7 @@ impl WebbookBot {
             bot_manager: None,
             status_receiver: None,
             selected_sections: HashMap::new(),
+            selected_sections_shared: selected_sections_shared.clone(),
             shared_data: None, // ADD THIS LINE
             bot_manager_receiver: None,
             expire_receiver: None,         // This exists
@@ -2657,15 +2659,21 @@ impl WebbookBot {
             // If selection changed, redistribute seats
             // If selection changed, redistribute seats AND start scanner
             if selection_changed {
-                println!("selection succed");
+                println!("selection changed");
+                
+                // Update shared selections for scanner
+                {
+                    let mut shared = self.selected_sections_shared.lock();
+                    *shared = self.selected_sections.clone();
+                }
+                
                 self.distribute_seats_to_users();
                 
-                // Start scanner when first checkbox is selected
                 let has_selected = self.selected_sections.values().any(|&selected| selected);
                 if has_selected && !self.scanner_running && self.bot_running {
                     self.start_scanner();
-                }else if !has_selected && self.scanner_running {
-                    self.scanner_running = false; // Stop if no sections selected
+                } else if !has_selected && self.scanner_running {
+                    self.scanner_running = false;
                 }
             }
         });
@@ -3086,8 +3094,16 @@ impl WebbookBot {
     // In impl WebbookBot
     fn start_scanner(&mut self) {
         if self.scanner_running || !self.bot_running || self.shared_data.is_none() { return; }
-        let selected_channels = self.get_selected_channels();
-        if selected_channels.is_empty() { return; }
+        
+        // Initialize shared selections with current state
+        {
+            let mut shared = self.selected_sections_shared.lock();
+            *shared = self.selected_sections.clone();
+        }
+        
+        // Check if we have any selected sections
+        let has_selections = self.selected_sections.values().any(|&selected| selected);
+        if !has_selections { return; }
 
         self.scanner_running = true;
         self.reserved_seats_map.lock().clear();
@@ -3097,8 +3113,10 @@ impl WebbookBot {
         let log_sender = self.log_sender.as_ref().unwrap().clone();
         let telegram_sender = self.telegram_sender.as_ref().unwrap().clone();
         let reserved_seats_map_clone = self.reserved_seats_map.clone();
-        let transfer_ignore_list_clone = self.transfer_ignore_list.clone(); // --- ADD THIS ---
+        let transfer_ignore_list_clone = self.transfer_ignore_list.clone();
         let pending_scanner_seats_clone = self.pending_scanner_seats.clone();
+        let selected_sections_shared_clone = self.selected_sections_shared.clone(); // ADD THIS
+        
         if let Some(rt) = &self.rt {
             let shared_data = self.shared_data.clone().unwrap();
             let bot_manager = self.bot_manager.clone();
@@ -3108,11 +3126,10 @@ impl WebbookBot {
             
             rt.spawn(async move {
                 if let Err(e) = Self::run_websocket_scanner(
-                    shared_data, bot_manager, selected_channels, users_data_clone,
-                    assigned_seats_sender, log_sender, &telegram_sender,
+                    shared_data, bot_manager, selected_sections_shared_clone, // CHANGED
+                    users_data_clone, assigned_seats_sender, log_sender, &telegram_sender,
                     ready_scanner_users_clone, next_user_index_clone,
-                    reserved_seats_map_clone,
-                    transfer_ignore_list_clone, // --- PASS IT HERE ---
+                    reserved_seats_map_clone, transfer_ignore_list_clone,
                     pending_scanner_seats_clone,
                 ).await {
                     println!("Scanner error: {}", e);
@@ -3120,6 +3137,7 @@ impl WebbookBot {
             });
         }
     }
+
 
     fn get_selected_channels(&self) -> Vec<String> {
         self.selected_sections
@@ -3138,25 +3156,23 @@ impl WebbookBot {
     async fn run_websocket_scanner(
         shared_data: Arc<RwLock<SharedData>>,
         bot_manager: Option<Arc<BotManager>>,
-        selected_channels: Vec<String>,
+        selected_sections_shared: Arc<Mutex<HashMap<String, bool>>>, // CHANGED
         users_data: Vec<User>,
         assigned_seats_sender: mpsc::UnboundedSender<(usize, String)>,
         log_sender: mpsc::UnboundedSender<(usize, String)>,
         telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
-
         ready_scanner_users: Arc<Mutex<Vec<usize>>>,
         next_user_index: Arc<AtomicUsize>,
         reserved_seats_map: Arc<Mutex<HashMap<String, Vec<String>>>>,
-        transfer_ignore_list: Arc<Mutex<HashSet<String>>>, // Add this parameter
+        transfer_ignore_list: Arc<Mutex<HashSet<String>>>,
         pending_scanner_seats: Arc<Mutex<HashMap<usize, usize>>>,
     ) -> Result<()> {
         loop { // The reconnect loop
             match Self::connect_and_listen(
-                &shared_data, &bot_manager, &selected_channels, &users_data,
-                &assigned_seats_sender, &log_sender, &telegram_sender,
+                &shared_data, &bot_manager, &selected_sections_shared, // CHANGED
+                &users_data, &assigned_seats_sender, &log_sender, &telegram_sender,
                 &ready_scanner_users, &next_user_index, &reserved_seats_map,
-                &transfer_ignore_list, // Pass it down
-                &pending_scanner_seats,
+                &transfer_ignore_list, &pending_scanner_seats,
             ).await {
                 Ok(_) => { println!("WebSocket connection ended normally"); break; }
                 Err(e) => {
@@ -3170,7 +3186,7 @@ impl WebbookBot {
     async fn connect_and_listen(
         shared_data: &Arc<RwLock<SharedData>>,
         bot_manager: &Option<Arc<BotManager>>,
-        selected_channels: &[String],
+        selected_sections_shared: &Arc<Mutex<HashMap<String, bool>>>, // Changed parameter
         users_data: &Vec<User>,
         assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
         log_sender: &mpsc::UnboundedSender<(usize, String)>,
@@ -3178,7 +3194,7 @@ impl WebbookBot {
         ready_scanner_users: &Arc<Mutex<Vec<usize>>>,
         next_user_index: &Arc<AtomicUsize>,
         reserved_seats_map: &Arc<Mutex<HashMap<String, Vec<String>>>>,
-        transfer_ignore_list: &Arc<Mutex<HashSet<String>>>, // Add this parameter
+        transfer_ignore_list: &Arc<Mutex<HashSet<String>>>,
         pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>,
     ) -> Result<()> {
         use sha1::{Sha1, Digest};
@@ -3233,11 +3249,14 @@ impl WebbookBot {
                                 // --- THIS IS THE FIX ---
                                 // Check the ignore list before trying to take a seat.
                                 let is_ignored = transfer_ignore_list.lock().contains(seat_id);
-                                let is_in_selected_section = selected_channels.iter().any(|prefix| {
-                                    seat_id.starts_with(prefix) &&
-                                    (seat_id.len() == prefix.len() ||
-                                     seat_id.chars().nth(prefix.len()).map_or(false, |c| !c.is_ascii_digit()))
-                                });
+                                let is_in_selected_section = {
+                                    let current_selections = selected_sections_shared.lock();
+                                    current_selections.iter().any(|(section, &is_selected)| {
+                                        is_selected && seat_id.starts_with(section) &&
+                                        (seat_id.len() == section.len() ||
+                                         seat_id.chars().nth(section.len()).map_or(false, |c| !c.is_ascii_digit()))
+                                    })
+                                };
                                 
                                 if !is_ignored && is_in_selected_section {
                                     Self::dispatch_seat_take_task(
@@ -3281,11 +3300,14 @@ impl WebbookBot {
                                         // ADD IGNORE LIST CHECK FOR SNIPER TOO (CRITICAL FIX)
                                         let is_ignored = transfer_ignore_list.lock().contains(&seat_id);
                                         
-                                        let is_in_selected_section = selected_channels.iter().any(|prefix| {
-                                            seat_id.starts_with(prefix) &&
-                                            (seat_id.len() == prefix.len() ||
-                                             seat_id.chars().nth(prefix.len()).map_or(false, |c| !c.is_ascii_digit()))
-                                        });
+                                        let is_in_selected_section = {
+                                            let current_selections = selected_sections_shared.lock();
+                                            current_selections.iter().any(|(section, &is_selected)| {
+                                                is_selected && seat_id.starts_with(section) &&
+                                                (seat_id.len() == section.len() ||
+                                                 seat_id.chars().nth(section.len()).map_or(false, |c| !c.is_ascii_digit()))
+                                            })
+                                        };
                                         if !is_ignored && is_in_selected_section {
                                             Self::dispatch_seat_take_task(
                                                 &seat_id, "SNIPER", bot_manager, ready_scanner_users, 
