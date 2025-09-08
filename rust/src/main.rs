@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 use anyhow::Result;
 use eframe::egui;
+#[cfg(unix)]
+use libc::{rlimit, setrlimit, RLIMIT_NOFILE};
 use log::info;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -14,23 +16,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use url::Url;
-#[cfg(unix)]
-use libc::{rlimit, RLIMIT_NOFILE, setrlimit};
 mod telegram_manager;
 use telegram_manager::TelegramManager;
 mod captcha_solver;
 use captcha_solver::CaptchaSolver;
 use std::process::{Child, Command, Stdio};
-use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
-use telegram_manager::TelegramRequest;
 use telegram_manager::TelegramMessage;
-
+use telegram_manager::TelegramRequest;
+use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
 
 const WORKSPACE_KEY: &str = "3d443a0c-83b8-4a11-8c57-3db9d116ef76";
 #[derive(Clone)] // <-- ADD THIS LINE
 struct PreparedSeatRequest {
     url: String,
-    json_payload_template: String, 
+    json_payload_template: String,
     headers: reqwest::header::HeaderMap,
     client: reqwest::Client,
 }
@@ -42,7 +41,6 @@ struct PreparedTransferRequest {
     body: String,
     client: reqwest::Client,
 }
-
 
 #[derive(Default)]
 pub struct WebbookBot {
@@ -77,9 +75,19 @@ pub struct WebbookBot {
     scanner_running: bool, // Indices of ready users
     // ADD these fields:
     reserved_seats_map: Arc<Mutex<HashMap<String, Vec<String>>>>, // holdTokenHash -> seats
-    ready_scanner_users: Arc<Mutex<Vec<usize>>>, // Indices of ready users  
+    ready_scanner_users: Arc<Mutex<Vec<usize>>>,                  // Indices of ready users
     next_user_index: Arc<AtomicUsize>,
-    ws_connection: Option<Arc<Mutex<Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>>>>,
+    ws_connection: Option<
+        Arc<
+            Mutex<
+                Option<
+                    tokio_tungstenite::WebSocketStream<
+                        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                    >,
+                >,
+            >,
+        >,
+    >,
     show_transfer_modal: bool,
     transfer_from_user: String,
     transfer_to_user: String,
@@ -92,7 +100,7 @@ pub struct WebbookBot {
     telegram_sender: Option<mpsc::UnboundedSender<TelegramMessage>>, // --- ADD THIS ---
     transfer_ignore_list: Arc<Mutex<HashSet<String>>>,
     node_process: Option<Child>, // ADD THIS for Node.js process management
-    token_file_path: String,  
+    token_file_path: String,
     expiry_warnings_sent: HashMap<usize, bool>,
     pending_scanner_seats: Arc<Mutex<HashMap<usize, usize>>>,
     show_telegram_dialog: bool,
@@ -100,7 +108,9 @@ pub struct WebbookBot {
     telegram_input: String,
     telegram_request_receiver: Option<mpsc::UnboundedReceiver<TelegramRequest>>,
     telegram_response_sender: Option<mpsc::UnboundedSender<String>>,
-
+    payment_status_sender: Option<mpsc::UnboundedSender<usize>>,
+    payment_status_receiver: Option<mpsc::UnboundedReceiver<usize>>,
+    paid_users: Arc<Mutex<HashSet<usize>>>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -128,9 +138,11 @@ struct User {
     #[serde(skip)]
     held_seats: Vec<String>,
     #[serde(skip)]
-    logs: Vec<String>, 
+    logs: Vec<String>,
     #[serde(skip)] // Add this
     max_seats: usize, // Add this
+    #[serde(default)] // This will default to `false` if the column is missing in the CSV
+    payment_completed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -158,7 +170,7 @@ struct SharedData {
     season_structure: Option<String>,
     chart_token: Option<String>,
     commit_hash: Option<String>,
-    favorite_team: Option<String>, 
+    favorite_team: Option<String>,
     recaptcha_site_key: Option<String>,
 }
 
@@ -178,7 +190,6 @@ struct BotUser {
     browser_id: Arc<Mutex<Option<String>>>,
     held_seats: Arc<Mutex<Vec<String>>>,
     prepared_request: Arc<Mutex<Option<PreparedSeatRequest>>>, // ADD THIS
-    
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +240,7 @@ impl Default for User {
             held_seats: Vec::new(),
             logs: Vec::new(),
             max_seats: 0, // Add this
+            payment_completed: false,
         }
     }
 }
@@ -265,7 +277,7 @@ impl BotUser {
         token_manager: Arc<TokenManager>,
     ) -> Result<Self> {
         let no_proxy = reqwest::NoProxy::from_string("localhost,127.0.0.1");
-    
+
         let mut client_builder = Client::builder()
             .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
             .pool_max_idle_per_host(100)
@@ -275,16 +287,15 @@ impl BotUser {
             .timeout(std::time::Duration::from_secs(90))
             .tcp_keepalive(std::time::Duration::from_secs(60))
             .tcp_nodelay(true);
-    
+
         // Only add proxy if provided and not empty/sentinel value
         if !proxy_url.is_empty() && proxy_url != "No proxy" {
-            let proxy = Proxy::all(&proxy_url)?
-                .no_proxy(no_proxy);
+            let proxy = Proxy::all(&proxy_url)?.no_proxy(no_proxy);
             client_builder = client_builder.proxy(proxy);
         }
-    
+
         let client = client_builder.build()?;
-    
+
         Ok(Self {
             email,
             proxy_url,
@@ -300,47 +311,61 @@ impl BotUser {
     }
     // In impl BotUser
     async fn find_seats(&self) -> Result<Value> {
-        let hold_token = self.webook_hold_token.lock().clone()
+        let hold_token = self
+            .webook_hold_token
+            .lock()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("Hold token not available for findSeats"))?;
-        
+
         let held_seats = self.held_seats.lock().clone();
-        
+
         let payload = json!({
             "SeatsTaking": held_seats,
             "holdToken": hold_token,
         });
 
-        let resp = self.client.post("http://localhost:3000/findSeats")
+        let resp = self
+            .client
+            .post("http://localhost:3000/findSeats")
+            .timeout(std::time::Duration::from_secs(600))
             .json(&payload)
-            .send().await?;
+            .send()
+            .await?;
 
         // The response from /findSeats is an array of objects, each with a "seat" key.
         // We need to extract the value of each "seat" key into a new array.
         let seat_info_array: Vec<Value> = resp.json().await?;
-        let selected_seats: Vec<Value> = seat_info_array.into_iter()
+        let selected_seats: Vec<Value> = seat_info_array
+            .into_iter()
             .filter_map(|v| v.get("seat").cloned())
             .collect();
 
         // Convert the final array back to a serde_json::Value
         Ok(serde_json::to_value(selected_seats)?)
     }
-    
+
     // NEW FUNCTION: Pre-builds everything except the seat ID.
     // Call this function once after the user's hold token is acquired.
-    async fn prepare_request_template(&self, channel_keys: Vec<String>) -> Result<PreparedSeatRequest> {
-        let hold_token = self.webook_hold_token.lock().clone()
-        .ok_or_else(|| anyhow::anyhow!("No hold token"))?;
+    async fn prepare_request_template(
+        &self,
+        channel_keys: Vec<String>,
+    ) -> Result<PreparedSeatRequest> {
+        let hold_token = self
+            .webook_hold_token
+            .lock()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No hold token"))?;
 
         let shared_data = self.shared_data.read().await;
-        
+
         // BUILD CHANNEL KEYS PROPERLY HERE
         let mut final_channel_keys = vec!["NO_CHANNEL".to_string()];
-        
+
         // Add common channel keys
         if let Some(common_keys) = &shared_data.channel_key_common {
             final_channel_keys.extend(common_keys.clone());
         }
-        
+
         // Add team-specific keys based on favorite team
         if let Some(favorite_team) = &shared_data.favorite_team {
             if let Some(channel_key_obj) = &shared_data.channel_key {
@@ -349,10 +374,12 @@ impl BotUser {
                     "away" => &shared_data.away_team,
                     _ => &shared_data.home_team,
                 };
-                
+
                 if let Some(team) = team_to_use {
                     if let Some(team_id) = team.get("_id").and_then(|v| v.as_str()) {
-                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
+                        if let Some(team_keys) =
+                            channel_key_obj.get(team_id).and_then(|v| v.as_array())
+                        {
                             for key in team_keys {
                                 if let Some(key_str) = key.as_str() {
                                     final_channel_keys.push(key_str.to_string());
@@ -363,7 +390,7 @@ impl BotUser {
                 }
             }
         }
-        
+
         // Use final_channel_keys instead of the parameter
         let request_body_template = json!({
             "events": if let Some(event_key) = &shared_data.event_key {
@@ -376,10 +403,10 @@ impl BotUser {
             "channelKeys": final_channel_keys,  // USE THE PROPERLY BUILT KEYS
             "validateEventsLinkedToSameChart": true
         });
-    
+
         let json_payload_template = request_body_template.to_string();
-        println!("{:?}",json_payload_template);
-        
+        println!("{:?}", json_payload_template);
+
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("accept", "*/*".parse()?);
         headers.insert("content-type", "application/json".parse()?);
@@ -387,7 +414,7 @@ impl BotUser {
         if let Some(browser_id) = self.browser_id.lock().as_ref() {
             headers.insert("x-browser-id", browser_id.parse()?);
         }
-    
+
         Ok(PreparedSeatRequest {
             url: format!(
                 "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
@@ -400,33 +427,38 @@ impl BotUser {
     }
 
     // ULTRA-FAST execution - no building, just fire!
-    
 
     async fn release_seat(&self, seat_id: &str, event_keys: &[String]) -> Result<bool> {
-        let hold_token = self.webook_hold_token.lock().clone()
+        let hold_token = self
+            .webook_hold_token
+            .lock()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
-    
+
         let request_body = json!({
             "events": event_keys,
             "holdToken": hold_token,
             "objects": [{"objectId": seat_id}],
             "validateEventsLinkedToSameChart": true
         });
-    
+
         let request_body_str = request_body.to_string();
         let signature = self.generate_signature(&request_body_str).await?;
-    
+
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("accept", "*/*".parse()?);
         headers.insert("content-type", "application/json".parse()?);
-        headers.insert("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?);
+        headers.insert(
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?,
+        );
         headers.insert("x-client-tool", "Renderer".parse()?);
         headers.insert("x-signature", signature.parse()?);
-    
+
         if let Some(browser_id) = self.browser_id.lock().as_ref() {
             headers.insert("x-browser-id", browser_id.parse()?);
         }
-    
+
         if let Some(commit_hash) = &self.shared_data.read().await.commit_hash {
             let referer = format!(
                 "https://cdn-eu.seatsio.net/static/version/seatsio-ui-prod-00384-f7t/chart-renderer/chartRendererIframe.html?environment=PROD&commit_hash={}",
@@ -434,31 +466,32 @@ impl BotUser {
             );
             headers.insert("referer", referer.parse()?);
         }
-    
+
         let url = format!(
             "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/release-held-objects",
             WORKSPACE_KEY
         );
-    
-        let response = self.client
+
+        let response = self
+            .client
             .post(&url)
             .headers(headers)
             .body(request_body_str)
             .send()
             .await?;
-    
+
         let success = response.status() == 200 || response.status() == 204;
-        
+
         if success {
             // Remove from held seats
             let mut held = self.held_seats.lock();
             held.retain(|s| s != seat_id);
             println!("Released seat: {}", seat_id);
         }
-    
+
         Ok(success)
     }
-    
+
     // In impl BotUser
     // In impl BotUser
     async fn retake_seats(
@@ -473,7 +506,11 @@ impl BotUser {
             return Ok(());
         }
 
-        println!("User {}: Starting ULTRA-FAST retake for {} seats", self.email, seats_to_retake.len());
+        println!(
+            "User {}: Starting ULTRA-FAST retake for {} seats",
+            self.email,
+            seats_to_retake.len()
+        );
 
         // Create a collection of tasks, one for each seat.
         let tasks = seats_to_retake
@@ -490,7 +527,9 @@ impl BotUser {
                     match take_seat_direct_final(&bot_user_clone, &seat_id_clone).await {
                         Ok(_) => {
                             // Send successful seat to UI thread
-                            assigned_seats_sender_clone.send((user_index, seat_id_clone)).ok();
+                            assigned_seats_sender_clone
+                                .send((user_index, seat_id_clone))
+                                .ok();
                             println!("🚀 RETAKE SUCCESS: {} by {}", seat, bot_user_clone.email);
                         }
                         Err(e) => {
@@ -522,8 +561,15 @@ impl BotUser {
             return Ok(());
         }
 
-        log_sender.send((user_index, format!("🎯 Starting to take {} seats manually...", target_seats.len()))).ok();
-
+        log_sender
+            .send((
+                user_index,
+                format!(
+                    "🎯 Starting to take {} seats manually...",
+                    target_seats.len()
+                ),
+            ))
+            .ok();
 
         // Prepare base headers once (optimization)
         let mut base_headers = reqwest::header::HeaderMap::new();
@@ -574,48 +620,71 @@ impl BotUser {
                 //let status_sender_clone = status_sender.clone();
                 let log_sender_clone = log_sender.clone(); // ADD THIS
 
-
                 // 3. Spawn a new task for this single seat. This happens almost instantly.
                 tokio::spawn(async move {
-                    match bot_user_clone.take_single_seat(&seat, &channel_keys_clone, &event_keys_clone, &base_headers_clone).await {
+                    match bot_user_clone
+                        .take_single_seat(
+                            &seat,
+                            &channel_keys_clone,
+                            &event_keys_clone,
+                            &base_headers_clone,
+                        )
+                        .await
+                    {
                         Ok(true) => {
-                            assigned_seats_sender_clone.send((user_index, seat.clone())).ok();
-                            log_sender_clone.send((user_index, format!("✅ Manual Take: {}", seat))).ok(); // ADD THIS
+                            assigned_seats_sender_clone
+                                .send((user_index, seat.clone()))
+                                .ok();
+                            log_sender_clone
+                                .send((user_index, format!("✅ Manual Take: {}", seat)))
+                                .ok(); // ADD THIS
                         }
                         Ok(false) => {
-                            log_sender_clone.send((user_index, format!("✗ Seat Not Available: {}", seat))).ok(); // ADD THIS
+                            log_sender_clone
+                                .send((user_index, format!("✗ Seat Not Available: {}", seat)))
+                                .ok(); // ADD THIS
                         }
                         Err(e) => {
-                            log_sender_clone.send((user_index, format!("❌ Error taking {}: {}", seat, e))).ok(); // ADD THIS
+                            log_sender_clone
+                                .send((user_index, format!("❌ Error taking {}: {}", seat, e)))
+                                .ok(); // ADD THIS
                         }
                     }
                 })
-            }).collect::<Vec<_>>();// Collect all the spawned tasks into a vector.
+            })
+            .collect::<Vec<_>>(); // Collect all the spawned tasks into a vector.
 
-
-            futures::future::join_all(tasks).await;
-            log_sender.send((user_index, "🏁 All manual seat attempts completed.".to_string())).ok();
-            Ok(())
+        futures::future::join_all(tasks).await;
+        log_sender
+            .send((
+                user_index,
+                "🏁 All manual seat attempts completed.".to_string(),
+            ))
+            .ok();
+        Ok(())
     }
 
     async fn take_single_seat(
         &self,
         seat: &str,
-        channel_keys: &[String],  // This parameter can be ignored now
+        channel_keys: &[String], // This parameter can be ignored now
         event_keys: &[String],
         base_headers: &reqwest::header::HeaderMap,
     ) -> Result<bool> {
-        let hold_token = self.webook_hold_token.lock().clone()
+        let hold_token = self
+            .webook_hold_token
+            .lock()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
-    
+
         // BUILD CHANNEL KEYS THE SAME WAY
         let shared_data = self.shared_data.read().await;
         let mut final_channel_keys = vec!["NO_CHANNEL".to_string()];
-        
+
         if let Some(common_keys) = &shared_data.channel_key_common {
             final_channel_keys.extend(common_keys.clone());
         }
-        
+
         if let Some(favorite_team) = &shared_data.favorite_team {
             if let Some(channel_key_obj) = &shared_data.channel_key {
                 let team_to_use = match favorite_team.as_str() {
@@ -623,10 +692,12 @@ impl BotUser {
                     "away" => &shared_data.away_team,
                     _ => &shared_data.home_team,
                 };
-                
+
                 if let Some(team) = team_to_use {
                     if let Some(team_id) = team.get("_id").and_then(|v| v.as_str()) {
-                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
+                        if let Some(team_keys) =
+                            channel_key_obj.get(team_id).and_then(|v| v.as_array())
+                        {
                             for key in team_keys {
                                 if let Some(key_str) = key.as_str() {
                                     final_channel_keys.push(key_str.to_string());
@@ -637,7 +708,7 @@ impl BotUser {
                 }
             }
         }
-    
+
         let request_body = json!({
             "events": event_keys,
             "holdToken": hold_token,
@@ -804,20 +875,26 @@ impl BotUser {
 
 // CHANGE take_seat_direct_final to use ZERO JSON serialization:
 async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<()> {
-    let prepared = bot_user.prepared_request.lock().clone()
+    let prepared = bot_user
+        .prepared_request
+        .lock()
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("Request template not ready"))?;
 
     // ULTRA-FAST string replacement (no JSON parsing)
-    let final_payload = prepared.json_payload_template.replace("__SEAT_ID_PLACEHOLDER__", seat_id);
-    
+    let final_payload = prepared
+        .json_payload_template
+        .replace("__SEAT_ID_PLACEHOLDER__", seat_id);
+
     // MINIMAL signature generation
     let signature = bot_user.generate_signature(&final_payload).await?;
-    
+
     let mut headers = prepared.headers.clone();
     headers.insert("x-signature", signature.parse()?);
 
     // FIRE IMMEDIATELY - no error parsing
-    let response = prepared.client
+    let response = prepared
+        .client
         .post(&prepared.url)
         .headers(headers)
         .body(final_payload)
@@ -841,7 +918,7 @@ fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
     if segments.len() < 2 {
         anyhow::bail!("Not enough URL segments");
     }
-    println!("{:?}",segments);
+    println!("{:?}", segments);
     Ok(segments[segments.len() - 2].to_string())
 }
 
@@ -858,10 +935,16 @@ impl BotManager {
         let token_manager = Arc::new(token_manager);
 
         let mut users = Vec::new();
-        for (email, proxy) in users_data { // proxy is now Option<String>
+        for (email, proxy) in users_data {
+            // proxy is now Option<String>
             // Convert Option<String> to String for BotUser::new
             let proxy_string = proxy.unwrap_or_else(|| "No proxy".to_string());
-            let user = BotUser::new(email, proxy_string, shared_data.clone(), token_manager.clone())?;
+            let user = BotUser::new(
+                email,
+                proxy_string,
+                shared_data.clone(),
+                token_manager.clone(),
+            )?;
             users.push(user);
         }
 
@@ -879,13 +962,16 @@ impl BotManager {
         // Create a new client with a long timeout specifically for the local server,
         // as Puppeteer can be slow to start.
         let local_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(90)) // Generous 90-second timeout
+            .timeout(std::time::Duration::from_secs(300)) // Generous 90-second timeout
             .build()?;
         // --- END OF FIX ---
 
         // Use the new local_client for this request instead of the user's client
-        let resp = local_client.get("http://localhost:3000/extractcaptcha").send().await?;
-        
+        let resp = local_client
+            .get("http://localhost:3000/extractcaptcha")
+            .send()
+            .await?;
+
         #[derive(Deserialize)]
         struct SiteKeyResponse {
             success: bool,
@@ -893,7 +979,7 @@ impl BotManager {
             site_key: Option<String>,
             error: Option<String>,
         }
-        
+
         let data: SiteKeyResponse = resp.json().await?;
 
         if data.success {
@@ -904,7 +990,10 @@ impl BotManager {
                 Err(anyhow::anyhow!("Site key not found in successful response"))
             }
         } else {
-            Err(anyhow::anyhow!("Failed to get site key: {}", data.error.unwrap_or_default()))
+            Err(anyhow::anyhow!(
+                "Failed to get site key: {}",
+                data.error.unwrap_or_default()
+            ))
         }
     }
     async fn extract_seatsio_chart_data(&self) -> Result<()> {
@@ -1076,36 +1165,72 @@ impl BotManager {
             let status_sender_clone = status_sender.clone();
 
             let task = tokio::spawn(async move {
-                log_sender_clone.send((user_index, "ðŸš€ Bot started".to_string())).ok();
+                log_sender_clone
+                    .send((user_index, "ðŸš€ Bot started".to_string()))
+                    .ok();
 
                 for attempt in 1..=100 {
-                    log_sender_clone.send((user_index, format!("Attempt {} - Getting hold token", attempt))).ok();
+                    log_sender_clone
+                        .send((
+                            user_index,
+                            format!("Attempt {} - Getting hold token", attempt),
+                        ))
+                        .ok();
 
                     match user_clone.get_webook_hold_token().await {
                         Ok(_) => {
-                            log_sender_clone.send((user_index, "âœ… Hold token received.".to_string())).ok();
-                            match user_clone.prepare_request_template(channel_keys_clone.clone()).await {
+                            log_sender_clone
+                                .send((user_index, "âœ… Hold token received.".to_string()))
+                                .ok();
+                            match user_clone
+                                .prepare_request_template(channel_keys_clone.clone())
+                                .await
+                            {
                                 Ok(template) => {
                                     *user_clone.prepared_request.lock() = Some(template);
-                                    log_sender_clone.send((user_index, "âœ… Request template prepared.".to_string())).ok();
-                                },
+                                    log_sender_clone
+                                        .send((
+                                            user_index,
+                                            "âœ… Request template prepared.".to_string(),
+                                        ))
+                                        .ok();
+                                }
                                 Err(e) => {
-                                    log_sender_clone.send((user_index, format!("â Œ FAILED to prepare template: {}", e))).ok();
+                                    log_sender_clone
+                                        .send((
+                                            user_index,
+                                            format!("â Œ FAILED to prepare template: {}", e),
+                                        ))
+                                        .ok();
                                 }
                             }
 
                             // Use the cloned sender here
-                            status_sender_clone.send(format!("USER_READY:{}", user_index)).ok();
+                            status_sender_clone
+                                .send(format!("USER_READY:{}", user_index))
+                                .ok();
                             if user_clone.get_expire_time().await.is_err() {
-                                log_sender_clone.send((user_index, "â Œ Error getting expire time.".to_string())).ok();
+                                log_sender_clone
+                                    .send((
+                                        user_index,
+                                        "â Œ Error getting expire time.".to_string(),
+                                    ))
+                                    .ok();
                             } else {
-                                log_sender_clone.send((user_index, "âœ… Session verified.".to_string())).ok();
+                                log_sender_clone
+                                    .send((user_index, "âœ… Session verified.".to_string()))
+                                    .ok();
 
                                 return; // Exit loop on success
                             }
                         }
                         Err(e) => {
-                            log_sender_clone.send((user_index, format!("â Œ Attempt {} failed: {}", attempt, e))).ok();
+                            log_sender_clone
+                                .send((
+                                    user_index,
+                                    format!("â Œ Attempt {} failed: {}", attempt, e),
+                                ))
+                                .ok();
                         }
                     }
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -1127,14 +1252,17 @@ impl WebbookBot {
         let (telegram_request_sender, telegram_request_receiver) = mpsc::unbounded_channel();
         let (telegram_response_sender, telegram_response_receiver) = mpsc::unbounded_channel(); // --- ADD THIS ---
         let selected_sections_shared = Arc::new(Mutex::new(HashMap::new()));
+        let (payment_status_sender, payment_status_receiver) = mpsc::unbounded_channel();
+
         // --- ADD THIS BLOCK to start the Telegram client ---
         rt.spawn(async move {
             match TelegramManager::new(
                 telegram_receiver, // CORRECT - this is the receiver variable
                 telegram_request_sender,
-                telegram_response_receiver
-            ).await {
-            
+                telegram_response_receiver,
+            )
+            .await
+            {
                 Ok(mut manager) => {
                     println!("Telegram Manager created. Running...");
                     if let Err(e) = manager.run().await {
@@ -1171,7 +1299,7 @@ impl WebbookBot {
             assigned_seats_receiver: None, // This exists
             assigned_seats_sender: None,
             ready_receiver: None,
-            ctx: None,           
+            ctx: None,
             scanner_running: false,
             reserved_seats_map: Arc::new(Mutex::new(HashMap::new())),
             ready_scanner_users: Arc::new(Mutex::new(Vec::new())), // <-- Corrected line
@@ -1185,8 +1313,8 @@ impl WebbookBot {
             log_sender: Some(log_sender),
             log_receiver: Some(log_receiver),
             telegram_sender: Some(telegram_sender),
-            transfer_ignore_list: Arc::new(Mutex::new(HashSet::new())), 
-            node_process: None,                        // ADD THIS
+            transfer_ignore_list: Arc::new(Mutex::new(HashSet::new())),
+            node_process: None,                         // ADD THIS
             token_file_path: "tokens.json".to_string(), // ADD THIS
             expiry_warnings_sent: HashMap::new(),
             pending_scanner_seats: Arc::new(Mutex::new(HashMap::new())),
@@ -1195,6 +1323,9 @@ impl WebbookBot {
             telegram_input: String::new(),
             telegram_request_receiver: Some(telegram_request_receiver),
             telegram_response_sender: Some(telegram_response_sender),
+            payment_status_sender: Some(payment_status_sender),
+            payment_status_receiver: Some(payment_status_receiver),
+            paid_users: Arc::new(Mutex::new(HashSet::new())),
         };
         app
     }
@@ -1212,7 +1343,7 @@ impl WebbookBot {
                 existing_tokens = tokens;
             }
         }
-        println!("exisiting tokens: {:?}",existing_tokens);
+        println!("exisiting tokens: {:?}", existing_tokens);
         if let Some(rt) = &self.rt {
             let users_clone = self.users.clone();
             let token_file_path = self.token_file_path.clone();
@@ -1220,7 +1351,7 @@ impl WebbookBot {
 
             rt.spawn(async move {
                 let mut all_tokens = existing_tokens;
-                
+
                 for (user_index, user) in users_clone.iter().enumerate() {
                     // Check if valid token already exists
                     if let Some(existing_token) = all_tokens.get(&user.email) {
@@ -1228,23 +1359,31 @@ impl WebbookBot {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap()
                             .as_millis() as u64;
-                        
+
                         if existing_token.expires_at > now {
-                            log_sender.send((user_index, "Using existing valid token.".to_string())).ok();
+                            log_sender
+                                .send((user_index, "Using existing valid token.".to_string()))
+                                .ok();
                             continue;
                         }
                     }
 
                     // Get new token for this user
-                    log_sender.send((user_index, "Getting new token...".to_string())).ok();
-                    
+                    log_sender
+                        .send((user_index, "Getting new token...".to_string()))
+                        .ok();
+
                     match Self::get_token_for_user(user).await {
                         Ok(token_data) => {
                             all_tokens.insert(user.email.clone(), token_data);
-                            log_sender.send((user_index, "Token saved successfully".to_string())).ok();
+                            log_sender
+                                .send((user_index, "Token saved successfully".to_string()))
+                                .ok();
                         }
                         Err(e) => {
-                            log_sender.send((user_index, format!("Token save failed: {}", e))).ok();
+                            log_sender
+                                .send((user_index, format!("Token save failed: {}", e)))
+                                .ok();
                         }
                     }
                 }
@@ -1256,8 +1395,7 @@ impl WebbookBot {
                     }
                 }
             });
-        }
-        else {
+        } else {
             println!("ooops");
         }
     }
@@ -1288,7 +1426,7 @@ impl WebbookBot {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(300))
             .build()?;
 
         let response = client
@@ -1337,10 +1475,10 @@ impl WebbookBot {
 
         // Start new Node.js process
         let event_url = self.event_url.clone();
-        
+
         let mut command = Command::new("node");
         command
-            .arg("./script/newTest2.js")
+            .arg("../../newHistory/newWebokboot/newTest2.js")
             .arg(&event_url)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1394,26 +1532,26 @@ impl WebbookBot {
         if let Some(user) = self.users.get_mut(user_index) {
             // Get current time in HH:MM:SS:mmm format (with milliseconds)
             let now = std::time::SystemTime::now();
-            let since_epoch = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let since_epoch = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
             let secs = since_epoch.as_secs();
             let millis = since_epoch.subsec_millis(); // ADD THIS LINE
-            
+
             let timestamp_str = format!(
-                "{:02}:{:02}:{:02}:{:03}",  // CHANGE THIS - added {:03} for milliseconds
+                "{:02}:{:02}:{:02}:{:03}", // CHANGE THIS - added {:03} for milliseconds
                 (secs / 3600) % 24,
                 (secs / 60) % 60,
                 secs % 60,
-                millis  // ADD THIS - milliseconds with 3 digits, zero-padded
+                millis // ADD THIS - milliseconds with 3 digits, zero-padded
             );
-    
+
             let log_entry = format!("[{}] {}", timestamp_str, message);
             user.logs.push(log_entry);
         }
     }
 
-    
-        // In impl WebbookBot
-    // In impl WebbookBot
+    // in impl WebbookBot
     async fn dispatch_seat_take_task(
         seat_id: &str,
         log_prefix: &str,
@@ -1444,23 +1582,23 @@ impl WebbookBot {
                     if is_truly_ready {
                         let held_count = bot_user.held_seats.lock().len();
                         
-                        // --- FIX 1: UPDATED ELIGIBILITY LOGIC ---
-                        // This now correctly separates the logic for '*' and '+' users.
-                        let is_eligible = if ui_user.user_type == "*" {
-                            true // '*' users are ALWAYS eligible.
-                        } else if ui_user.user_type == "+" {
-                            // For '+' users, we MUST check pending seats against their limit.
+                        // --- START OF CHANGE ---
+                        // This logic now applies the same rules to both '*' and '+' users.
+                        let is_eligible = if ui_user.user_type == "*" || ui_user.user_type == "+" {
                             let pending_map = pending_scanner_seats.lock();
                             let pending_count = *pending_map.get(&actual_user_index).unwrap_or(&0);
-                            ui_user.max_seats > 0 && (held_count + pending_count) < ui_user.max_seats
+
+                            // A limit of 0 means infinite seats (always eligible).
+                            // Otherwise, we check if the user is under their limit.
+                            ui_user.max_seats == 0 || (held_count + pending_count) < ui_user.max_seats
                         } else {
                             false
                         };
+                        // --- END OF CHANGE ---
 
                         if is_eligible {
-                            // --- FIX 2: CONDITIONAL PENDING SEAT INCREMENT ---
-                            // ONLY increment the pending count if the user is a '+' type.
-                            if ui_user.user_type == "+" {
+                            // We only increment pending seats if a limit is actually in place.
+                            if ui_user.max_seats > 0 {
                                 let mut pending_map = pending_scanner_seats.lock();
                                 *pending_map.entry(actual_user_index).or_insert(0) += 1;
                             }
@@ -1470,24 +1608,21 @@ impl WebbookBot {
                             // Clone necessary data for the spawned task
                             let pending_scanner_seats_clone = pending_scanner_seats.clone();
                             let bot_user_clone = bot_user.clone();
-                            let user_type_clone = ui_user.user_type.clone(); // Clone user type for the task
-                            // ... clone other variables
+                            let max_seats_clone = ui_user.max_seats; // Clone max_seats for the task
                             let sender_clone = assigned_seats_sender.clone();
                             let log_sender_clone = log_sender.clone();
                             let telegram_sender_clone = telegram_sender.clone();
                             let seat_id_clone = seat_id.to_string();
                             let log_prefix_clone = log_prefix.to_string();
                             let user_email = ui_user.email.clone();
-                            let max_seats = ui_user.max_seats;
 
 
                             tokio::spawn(async move {
                                 // The slow network operation
                                 let result = take_seat_direct_final(&bot_user_clone, &seat_id_clone).await;
 
-                                // --- FIX 3: CONDITIONAL PENDING SEAT DECREMENT ---
-                                // ONLY decrement the pending count if it was a '+' type user.
-                                if user_type_clone == "+" {
+                                // We only decrement pending seats if a limit was in place.
+                                if max_seats_clone > 0 {
                                     pending_scanner_seats_clone.lock().entry(actual_user_index).and_modify(|c| *c -= 1);
                                 }
 
@@ -1505,7 +1640,7 @@ impl WebbookBot {
                                         ━━━━━━━━━━━━━━━━━",
                                         user_email,
                                         total_held,
-                                        if max_seats == 0 { "∞".to_string() } else { max_seats.to_string() }
+                                        if max_seats_clone == 0 { "∞".to_string() } else { max_seats_clone.to_string() }
                                     );
                                     telegram_sender_clone.send(TelegramMessage {
                                         text: message,
@@ -1520,7 +1655,139 @@ impl WebbookBot {
             }
         }
     }
-        
+    // In impl WebbookBot
+    /*async fn dispatch_seat_take_task(
+        seat_id: &str,
+        log_prefix: &str,
+        bot_manager: &Option<Arc<BotManager>>,
+        ready_scanner_users: &Arc<Mutex<Vec<usize>>>,
+        next_user_index: &Arc<AtomicUsize>,
+        assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
+        log_sender: &mpsc::UnboundedSender<(usize, String)>,
+        telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
+        ui_users: &Vec<User>,
+        pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>,
+    ) {
+        if let Some(manager) = bot_manager {
+            let ready_users_indices = ready_scanner_users.lock();
+            let num_ready = ready_users_indices.len();
+            if num_ready == 0 {
+                return;
+            }
+
+            let start_index = next_user_index.load(Ordering::Relaxed);
+
+            for i in 0..num_ready {
+                let pool_index = (start_index + i) % num_ready;
+                let actual_user_index = ready_users_indices[pool_index];
+
+                if let (Some(ui_user), Some(bot_user)) = (
+                    ui_users.get(actual_user_index),
+                    manager.users.get(actual_user_index),
+                ) {
+                    let is_truly_ready = bot_user.webook_hold_token.lock().is_some()
+                        && bot_user.expire_time.load(Ordering::Relaxed) > 0;
+
+                    if is_truly_ready {
+                        let held_count = bot_user.held_seats.lock().len();
+
+                        // --- FIX 1: UPDATED ELIGIBILITY LOGIC ---
+                        // This now correctly separates the logic for '*' and '+' users.
+                        let is_eligible = if ui_user.user_type == "*" {
+                            true // '*' users are ALWAYS eligible.
+                        } else if ui_user.user_type == "+" {
+                            // For '+' users, we MUST check pending seats against their limit.
+                            let pending_map = pending_scanner_seats.lock();
+                            let pending_count = *pending_map.get(&actual_user_index).unwrap_or(&0);
+                            ui_user.max_seats > 0
+                                && (held_count + pending_count) < ui_user.max_seats
+                        } else {
+                            false
+                        };
+
+                        if is_eligible {
+                            // --- FIX 2: CONDITIONAL PENDING SEAT INCREMENT ---
+                            // ONLY increment the pending count if the user is a '+' type.
+                            if ui_user.user_type == "+" {
+                                let mut pending_map = pending_scanner_seats.lock();
+                                *pending_map.entry(actual_user_index).or_insert(0) += 1;
+                            }
+
+                            next_user_index.store((pool_index + 1) % num_ready, Ordering::Relaxed);
+
+                            // Clone necessary data for the spawned task
+                            let pending_scanner_seats_clone = pending_scanner_seats.clone();
+                            let bot_user_clone = bot_user.clone();
+                            let user_type_clone = ui_user.user_type.clone(); // Clone user type for the task
+                                                                             // ... clone other variables
+                            let sender_clone = assigned_seats_sender.clone();
+                            let log_sender_clone = log_sender.clone();
+                            let telegram_sender_clone = telegram_sender.clone();
+                            let seat_id_clone = seat_id.to_string();
+                            let log_prefix_clone = log_prefix.to_string();
+                            let user_email = ui_user.email.clone();
+                            let max_seats = ui_user.max_seats;
+
+                            tokio::spawn(async move {
+                                // The slow network operation
+                                let result =
+                                    take_seat_direct_final(&bot_user_clone, &seat_id_clone).await;
+
+                                // --- FIX 3: CONDITIONAL PENDING SEAT DECREMENT ---
+                                // ONLY decrement the pending count if it was a '+' type user.
+                                if user_type_clone == "+" {
+                                    pending_scanner_seats_clone
+                                        .lock()
+                                        .entry(actual_user_index)
+                                        .and_modify(|c| *c -= 1);
+                                }
+
+                                // Handle success notification
+                                if result.is_ok() {
+                                    sender_clone
+                                        .send((actual_user_index, seat_id_clone.clone()))
+                                        .ok();
+                                    log_sender_clone
+                                        .send((
+                                            actual_user_index,
+                                            format!(
+                                                "🚀 {}: Booked {}",
+                                                log_prefix_clone, seat_id_clone
+                                            ),
+                                        ))
+                                        .ok();
+                                    let total_held = bot_user_clone.held_seats.lock().len();
+                                    let message = format!(
+                                        "🎫 SEAT TAKING ✅ SUCCESS\n\
+                                        ━━━━━━━━━━━━━━━━━\n\
+                                        🔧 Account: {}\n\
+                                        💺 Seats Taken: 1\n\
+                                        📊 Total Held: {}/{}\n\
+                                        ━━━━━━━━━━━━━━━━━",
+                                        user_email,
+                                        total_held,
+                                        if max_seats == 0 {
+                                            "∞".to_string()
+                                        } else {
+                                            max_seats.to_string()
+                                        }
+                                    );
+                                    telegram_sender_clone
+                                        .send(TelegramMessage {
+                                            text: message,
+                                            chat_id: 4785839500, // Seat operations group
+                                        })
+                                        .ok();
+                                }
+                            });
+                            return; // Exit after dispatching to one user.
+                        }
+                    }
+                }
+            }
+        }
+    }*/
+
     fn show_logs_modal(&mut self, ctx: &egui::Context) {
         if let Some(user_index) = self.selected_user_index {
             // Get the user's current data
@@ -1544,8 +1811,8 @@ impl WebbookBot {
                                     // Use a read-only TextEdit to display the live logs
                                     ui.add(
                                         egui::TextEdit::multiline(&mut all_logs.as_str())
-                                        .font(egui::TextStyle::Monospace)
-                                        .desired_width(f32::INFINITY)
+                                            .font(egui::TextStyle::Monospace)
+                                            .desired_width(f32::INFINITY),
                                     );
                                 }
                                 // --- END OF FIX ---
@@ -1565,7 +1832,7 @@ impl WebbookBot {
     }
     // In impl WebbookBot
 
-     // Improved transfer modal with better UI (matches Go version)
+    // Improved transfer modal with better UI (matches Go version)
     fn show_transfer_modal(&mut self, ctx: &egui::Context) {
         let mut close_modal = false;
         let mut transfer_details: Option<(usize, usize)> = None;
@@ -1575,12 +1842,18 @@ impl WebbookBot {
             .resizable(false)
             .show(ctx, |ui| {
                 // Get users by type (like Go version)
-                let star_users: Vec<(usize, String, usize)> = self.users.iter().enumerate()
+                let star_users: Vec<(usize, String, usize)> = self
+                    .users
+                    .iter()
+                    .enumerate()
                     .filter(|(_, u)| u.user_type == "*")
                     .map(|(i, u)| (i, u.email.clone(), u.held_seats.len()))
                     .collect();
-                
-                let plus_users: Vec<(usize, String, usize)> = self.users.iter().enumerate()
+
+                let plus_users: Vec<(usize, String, usize)> = self
+                    .users
+                    .iter()
+                    .enumerate()
                     .filter(|(_, u)| u.user_type == "+")
                     .map(|(i, u)| (i, u.email.clone(), u.held_seats.len()))
                     .collect();
@@ -1593,7 +1866,13 @@ impl WebbookBot {
                         .show_ui(ui, |ui| {
                             for (idx, email, seat_count) in &star_users {
                                 let display_text = format!("{} (has {} seats)", email, seat_count);
-                                if ui.selectable_label(self.transfer_from_user == *email, &display_text).clicked() {
+                                if ui
+                                    .selectable_label(
+                                        self.transfer_from_user == *email,
+                                        &display_text,
+                                    )
+                                    .clicked()
+                                {
                                     self.transfer_from_user = email.clone();
                                 }
                             }
@@ -1608,8 +1887,17 @@ impl WebbookBot {
                         .show_ui(ui, |ui| {
                             for (idx, email, seat_count) in &plus_users {
                                 let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
-                                let display_text = format!("{} (has {}/{} seats)", email, seat_count, d_seats_limit);
-                                if ui.selectable_label(self.transfer_to_user == *email, &display_text).clicked() {
+                                let display_text = format!(
+                                    "{} (has {}/{} seats)",
+                                    email, seat_count, d_seats_limit
+                                );
+                                if ui
+                                    .selectable_label(
+                                        self.transfer_to_user == *email,
+                                        &display_text,
+                                    )
+                                    .clicked()
+                                {
                                     self.transfer_to_user = email.clone();
                                 }
                             }
@@ -1621,14 +1909,16 @@ impl WebbookBot {
                 // Show transfer preview (like Go version)
                 if !self.transfer_from_user.is_empty() && !self.transfer_to_user.is_empty() {
                     if let (Some(from_user), Some(to_user)) = (
-                        self.users.iter().find(|u| u.email == self.transfer_from_user),
-                        self.users.iter().find(|u| u.email == self.transfer_to_user)
+                        self.users
+                            .iter()
+                            .find(|u| u.email == self.transfer_from_user),
+                        self.users.iter().find(|u| u.email == self.transfer_to_user),
                     ) {
                         let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
-                        let can_receive = if d_seats_limit > 0 { 
-                            d_seats_limit.saturating_sub(to_user.held_seats.len()) 
-                        } else { 
-                            from_user.held_seats.len() 
+                        let can_receive = if d_seats_limit > 0 {
+                            d_seats_limit.saturating_sub(to_user.held_seats.len())
+                        } else {
+                            from_user.held_seats.len()
                         };
                         let will_transfer = std::cmp::min(from_user.held_seats.len(), can_receive);
 
@@ -1638,15 +1928,25 @@ impl WebbookBot {
                         }
                     }
                 }
-                
+
                 // Button logic
                 ui.horizontal(|ui| {
-                    let can_transfer = !self.transfer_from_user.is_empty() && !self.transfer_to_user.is_empty();
-                    
-                    if ui.add_enabled(can_transfer, egui::Button::new("Transfer")).clicked() {
-                        let from_index = self.users.iter().position(|u| u.email == self.transfer_from_user);
-                        let to_index = self.users.iter().position(|u| u.email == self.transfer_to_user);
-            
+                    let can_transfer =
+                        !self.transfer_from_user.is_empty() && !self.transfer_to_user.is_empty();
+
+                    if ui
+                        .add_enabled(can_transfer, egui::Button::new("Transfer"))
+                        .clicked()
+                    {
+                        let from_index = self
+                            .users
+                            .iter()
+                            .position(|u| u.email == self.transfer_from_user);
+                        let to_index = self
+                            .users
+                            .iter()
+                            .position(|u| u.email == self.transfer_to_user);
+
                         if let (Some(from_idx), Some(to_idx)) = (from_index, to_index) {
                             transfer_details = Some((from_idx, to_idx));
                         }
@@ -1662,7 +1962,7 @@ impl WebbookBot {
         if let Some((from_idx, to_idx)) = transfer_details {
             self.execute_ultra_fast_transfer(from_idx, to_idx);
         }
-    
+
         if close_modal {
             self.show_transfer_modal = false;
             self.transfer_from_user.clear();
@@ -1675,18 +1975,21 @@ impl WebbookBot {
         to_user: &BotUser,
         seat_id: &str,
     ) -> Result<PreparedTransferRequest> {
-        let hold_token = to_user.webook_hold_token.lock().clone()
+        let hold_token = to_user
+            .webook_hold_token
+            .lock()
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("No hold token available"))?;
 
         let shared_data = to_user.shared_data.read().await;
-        
+
         // Build channel keys the same way as take_single_seat
         let mut final_channel_keys = vec!["NO_CHANNEL".to_string()];
-        
+
         if let Some(common_keys) = &shared_data.channel_key_common {
             final_channel_keys.extend(common_keys.clone());
         }
-        
+
         if let Some(favorite_team) = &shared_data.favorite_team {
             if let Some(channel_key_obj) = &shared_data.channel_key {
                 let team_to_use = match favorite_team.as_str() {
@@ -1694,10 +1997,12 @@ impl WebbookBot {
                     "away" => &shared_data.away_team,
                     _ => &shared_data.home_team,
                 };
-                
+
                 if let Some(team) = team_to_use {
                     if let Some(team_id) = team.get("_id").and_then(|v| v.as_str()) {
-                        if let Some(team_keys) = channel_key_obj.get(team_id).and_then(|v| v.as_array()) {
+                        if let Some(team_keys) =
+                            channel_key_obj.get(team_id).and_then(|v| v.as_array())
+                        {
                             for key in team_keys {
                                 if let Some(key_str) = key.as_str() {
                                     final_channel_keys.push(key_str.to_string());
@@ -1709,9 +2014,11 @@ impl WebbookBot {
             }
         }
 
-        let event_key = shared_data.event_key.as_ref()
+        let event_key = shared_data
+            .event_key
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Event key not available"))?;
-            
+
         let request_body = json!({
             "events": [event_key],
             "holdToken": hold_token,
@@ -1726,10 +2033,13 @@ impl WebbookBot {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("accept", "*/*".parse()?);
         headers.insert("content-type", "application/json".parse()?);
-        headers.insert("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?);
+        headers.insert(
+            "user-agent",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36".parse()?,
+        );
         headers.insert("x-client-tool", "Renderer".parse()?);
         headers.insert("x-signature", signature.parse()?);
-        
+
         if let Some(browser_id) = to_user.browser_id.lock().as_ref() {
             headers.insert("x-browser-id", browser_id.parse()?);
         }
@@ -1757,9 +2067,9 @@ impl WebbookBot {
     fn execute_ultra_fast_transfer(&mut self, from_user_index: usize, to_user_index: usize) {
         let assigned_seats_sender = match &self.assigned_seats_sender {
             Some(sender) => sender.clone(),
-            None => { 
-                println!("Cannot transfer: assigned_seats_sender is not available."); 
-                return; 
+            None => {
+                println!("Cannot transfer: assigned_seats_sender is not available.");
+                return;
             }
         };
 
@@ -1790,7 +2100,9 @@ impl WebbookBot {
             let notify_sender = self.telegram_sender.clone();
 
             if seats_to_transfer.is_empty() {
-                log_sender.send((from_user_index, "❌ No seats to transfer".to_string())).ok();
+                log_sender
+                    .send((from_user_index, "❌ No seats to transfer".to_string()))
+                    .ok();
                 return;
             }
 
@@ -1802,29 +2114,55 @@ impl WebbookBot {
                     list.insert(seat.clone());
                 }
             }
-            log_sender.send((from_user_index, format!("🚫 Added {} seats to scanner ignore list", seats_to_transfer.len()))).ok();
+            log_sender
+                .send((
+                    from_user_index,
+                    format!(
+                        "🚫 Added {} seats to scanner ignore list",
+                        seats_to_transfer.len()
+                    ),
+                ))
+                .ok();
 
-            log_sender.send((from_user_index, "🔄 Starting ULTRA-FAST seat transfer...".to_string())).ok();
-            log_sender.send((to_user_index, "🔄 Receiving seats...".to_string())).ok();
+            log_sender
+                .send((
+                    from_user_index,
+                    "🔄 Starting ULTRA-FAST seat transfer...".to_string(),
+                ))
+                .ok();
+            log_sender
+                .send((to_user_index, "🔄 Receiving seats...".to_string()))
+                .ok();
 
             rt.spawn(async move {
-                log_sender.send((to_user_index, "⚡ Starting atomic transfers (no pre-building needed)...".to_string())).ok();
+                log_sender
+                    .send((
+                        to_user_index,
+                        "⚡ Starting atomic transfers (no pre-building needed)...".to_string(),
+                    ))
+                    .ok();
 
                 // DO ATOMIC TRANSFERS - build requests fresh each time
                 let mut successfully_transferred = 0;
                 for seat_id in seats_to_transfer {
                     // Check seat limit
                     if d_seats_limit > 0 && to_user.held_seats.lock().len() >= d_seats_limit {
-                        log_sender.send((to_user_index, format!("⚠️ Reached limit of {} seats, stopping", d_seats_limit))).ok();
+                        log_sender
+                            .send((
+                                to_user_index,
+                                format!("⚠️ Reached limit of {} seats, stopping", d_seats_limit),
+                            ))
+                            .ok();
                         break;
                     }
 
                     // Build fresh request after release (with delay fix)
                     match Self::atomic_transfer_seat_ultra_fast(
                         &from_user,
-                        &to_user, 
+                        &to_user,
                         &seat_id,
-                        PreparedTransferRequest { // dummy
+                        PreparedTransferRequest {
+                            // dummy
                             url: String::new(),
                             headers: reqwest::header::HeaderMap::new(),
                             body: String::new(),
@@ -1834,7 +2172,9 @@ impl WebbookBot {
                         &log_sender,
                         from_user_index,
                         to_user_index,
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(true) => {
                             successfully_transferred += 1;
                             if let Some(sender) = notify_sender.clone() {
@@ -1852,14 +2192,21 @@ impl WebbookBot {
                                     successfully_transferred,
                                     final_seat_count
                                 );
-                                sender.send(TelegramMessage {
-                                    text: message,
-                                    chat_id: 4940392737, // Transfer operations group
-                                }).ok();
+                                sender
+                                    .send(TelegramMessage {
+                                        text: message,
+                                        chat_id: 4940392737, // Transfer operations group
+                                    })
+                                    .ok();
                             }
                         }
                         Ok(false) | Err(_) => {
-                            log_sender.send((from_user_index, format!("❌ Transfer failed for {}, stopping", seat_id))).ok();
+                            log_sender
+                                .send((
+                                    from_user_index,
+                                    format!("❌ Transfer failed for {}, stopping", seat_id),
+                                ))
+                                .ok();
                             break;
                         }
                     }
@@ -1867,10 +2214,23 @@ impl WebbookBot {
 
                 // CLEAR IGNORE LIST AFTER TRANSFER COMPLETES (CRITICAL)
                 ignore_list.lock().clear();
-                log_sender.send((from_user_index, "🚫 Cleared scanner ignore list".to_string())).ok();
+                log_sender
+                    .send((
+                        from_user_index,
+                        "🚫 Cleared scanner ignore list".to_string(),
+                    ))
+                    .ok();
 
                 // Final notification
-                log_sender.send((from_user_index, format!("📊 Ultra-fast transfer result: {} seats transferred", successfully_transferred))).ok();
+                log_sender
+                    .send((
+                        from_user_index,
+                        format!(
+                            "📊 Ultra-fast transfer result: {} seats transferred",
+                            successfully_transferred
+                        ),
+                    ))
+                    .ok();
                 let message = format!(
                     "🔄 SEAT TRANSFER COMPLETE\n\
                     ——————————————————\n\
@@ -1884,11 +2244,12 @@ impl WebbookBot {
                     successfully_transferred,
                     to_user.held_seats.lock().len(),
                 );
-                telegram_sender.send(TelegramMessage{
-                    text: message,
-                    chat_id: 4940392737,
-                }
-                ).ok();
+                telegram_sender
+                    .send(TelegramMessage {
+                        text: message,
+                        chat_id: 4940392737,
+                    })
+                    .ok();
             });
         }
     }
@@ -1905,12 +2266,19 @@ impl WebbookBot {
         to_user_index: usize,
     ) -> Result<bool> {
         let event_keys = if let Ok(data) = from_user.shared_data.try_read() {
-            if let Some(event_key) = &data.event_key { vec![event_key.clone()] } 
-            else { return Err(anyhow::anyhow!("Event key not found")); }
-        } else { return Err(anyhow::anyhow!("Could not read shared data")); };
+            if let Some(event_key) = &data.event_key {
+                vec![event_key.clone()]
+            } else {
+                return Err(anyhow::anyhow!("Event key not found"));
+            }
+        } else {
+            return Err(anyhow::anyhow!("Could not read shared data"));
+        };
 
         // Step 1: Release the seat
-        log_sender.send((from_user_index, format!("🔄 Releasing seat: {}", seat_id))).ok();
+        log_sender
+            .send((from_user_index, format!("🔄 Releasing seat: {}", seat_id)))
+            .ok();
         if !from_user.release_seat(seat_id, &event_keys).await? {
             return Err(anyhow::anyhow!("Failed to release seat"));
         }
@@ -1919,17 +2287,25 @@ impl WebbookBot {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Step 3: Build fresh take request AFTER release (not pre-built)
-        log_sender.send((to_user_index, format!("⚡ Taking seat: {}", seat_id))).ok();
-        
+        log_sender
+            .send((to_user_index, format!("⚡ Taking seat: {}", seat_id)))
+            .ok();
+
         let fresh_request = match Self::prepare_take_request_for_transfer(to_user, seat_id).await {
             Ok(req) => req,
             Err(e) => {
-                log_sender.send((to_user_index, format!("❌ Failed to prepare fresh request: {}", e))).ok();
+                log_sender
+                    .send((
+                        to_user_index,
+                        format!("❌ Failed to prepare fresh request: {}", e),
+                    ))
+                    .ok();
                 return Err(e);
             }
         };
 
-        let response = fresh_request.client
+        let response = fresh_request
+            .client
             .post(&fresh_request.url)
             .headers(fresh_request.headers)
             .body(fresh_request.body)
@@ -1939,45 +2315,67 @@ impl WebbookBot {
         if response.status().is_success() {
             // Success - update seat tracking
             to_user.held_seats.lock().push(seat_id.to_string());
-            
+
             // Update UI
-            assigned_seats_sender.send((from_user_index, format!("REMOVE:{}", seat_id))).ok();
-            assigned_seats_sender.send((to_user_index, seat_id.to_string())).ok();
-            
-            log_sender.send((to_user_index, format!("✅ ATOMIC SUCCESS: {}", seat_id))).ok();
+            assigned_seats_sender
+                .send((from_user_index, format!("REMOVE:{}", seat_id)))
+                .ok();
+            assigned_seats_sender
+                .send((to_user_index, seat_id.to_string()))
+                .ok();
+
+            log_sender
+                .send((to_user_index, format!("✅ ATOMIC SUCCESS: {}", seat_id)))
+                .ok();
             return Ok(true);
         } else {
             let error_text = response.text().await.unwrap_or_default();
-            log_sender.send((to_user_index, format!("❌ Take failed: {} - trying to restore", error_text))).ok();
-            
+            log_sender
+                .send((
+                    to_user_index,
+                    format!("❌ Take failed: {} - trying to restore", error_text),
+                ))
+                .ok();
+
             // Try to restore the seat to original user
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await; // Give server time
-            
-            if let Ok(restore_req) = Self::prepare_take_request_for_transfer(from_user, seat_id).await {
-                let restore_response = restore_req.client
+
+            if let Ok(restore_req) =
+                Self::prepare_take_request_for_transfer(from_user, seat_id).await
+            {
+                let restore_response = restore_req
+                    .client
                     .post(&restore_req.url)
                     .headers(restore_req.headers)
                     .body(restore_req.body)
                     .send()
                     .await;
-                    
+
                 match restore_response {
                     Ok(resp) if resp.status().is_success() => {
                         from_user.held_seats.lock().push(seat_id.to_string());
-                        assigned_seats_sender.send((from_user_index, seat_id.to_string())).ok();
-                        log_sender.send((from_user_index, format!("✅ Restored: {}", seat_id))).ok();
+                        assigned_seats_sender
+                            .send((from_user_index, seat_id.to_string()))
+                            .ok();
+                        log_sender
+                            .send((from_user_index, format!("✅ Restored: {}", seat_id)))
+                            .ok();
                     }
                     _ => {
-                        log_sender.send((from_user_index, format!("⚠️ FAILED TO RESTORE: {}", seat_id))).ok();
+                        log_sender
+                            .send((
+                                from_user_index,
+                                format!("⚠️ FAILED TO RESTORE: {}", seat_id),
+                            ))
+                            .ok();
                     }
                 }
             }
-            
+
             return Err(anyhow::anyhow!("Transfer failed"));
         }
     }
-        
-        
+
     fn build_channel_keys(&self) -> Vec<String> {
         let mut channel_keys = vec!["NO_CHANNEL".to_string()];
 
@@ -2037,12 +2435,19 @@ impl WebbookBot {
                         println!("Event key not available");
                         return;
                     }
-                } else { return; }
-            } else { return; };
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            };
 
             let assigned_seats_sender = match &self.assigned_seats_sender {
                 Some(sender) => sender.clone(),
-                None => { println!("Error: assigned_seats_sender not initialized."); return; }
+                None => {
+                    println!("Error: assigned_seats_sender not initialized.");
+                    return;
+                }
             };
             let log_sender = match &self.log_sender {
                 Some(sender) => sender.clone(),
@@ -2060,20 +2465,26 @@ impl WebbookBot {
                             let event_keys_clone = event_keys.clone();
                             let assigned_sender = assigned_seats_sender.clone();
                             let log_sender_clone = log_sender.clone();
-                            
+
                             rt.spawn(async move {
                                 // --- THIS IS THE FIX ---
                                 // We handle the Result from the function inside the task
-                                if let Err(e) = bot_user_clone.fill_assigned_seats(
-                                    target_seats,
-                                    channel_keys_clone,
-                                    event_keys_clone,
-                                    mpsc::unbounded_channel().0,
-                                    assigned_sender,
-                                    log_sender_clone,
-                                    i,
-                                ).await {
-                                    println!("Error in fill_assigned_seats for user {}: {}", bot_user_clone.email, e);
+                                if let Err(e) = bot_user_clone
+                                    .fill_assigned_seats(
+                                        target_seats,
+                                        channel_keys_clone,
+                                        event_keys_clone,
+                                        mpsc::unbounded_channel().0,
+                                        assigned_sender,
+                                        log_sender_clone,
+                                        i,
+                                    )
+                                    .await
+                                {
+                                    println!(
+                                        "Error in fill_assigned_seats for user {}: {}",
+                                        bot_user_clone.email, e
+                                    );
                                 }
                             });
                         }
@@ -2082,7 +2493,7 @@ impl WebbookBot {
             }
         }
     }
-    
+
     // In impl WebbookBot
     fn get_seats_from_selected_sections(&self) -> Vec<String> {
         let mut all_seats = Vec::new();
@@ -2100,12 +2511,16 @@ impl WebbookBot {
                             }
                         })
                         .collect();
-    
+
                     for seat in channels {
                         for selected_section in &selected_sections {
                             if seat.starts_with(selected_section) {
-                                if seat.len() == selected_section.len() ||
-                                   seat.chars().nth(selected_section.len()).map_or(false, |c| !c.is_ascii_digit()) {
+                                if seat.len() == selected_section.len()
+                                    || seat
+                                        .chars()
+                                        .nth(selected_section.len())
+                                        .map_or(false, |c| !c.is_ascii_digit())
+                                {
                                     all_seats.push(seat.clone());
                                 }
                             }
@@ -2209,12 +2624,14 @@ impl WebbookBot {
                                     user.email,
                                     user.held_seats.len()
                                 );
-                                telegram_sender.send(TelegramMessage {
-                                    text: message,
-                                    chat_id: 4639502335, // Expiry group
-                                }).ok();
+                                telegram_sender
+                                    .send(TelegramMessage {
+                                        text: message,
+                                        chat_id: 4639502335, // Expiry group
+                                    })
+                                    .ok();
                             }
-                            
+
                             // Mark warning as sent for this user
                             self.expiry_warnings_sent.insert(user_index, true);
                         }
@@ -2248,13 +2665,16 @@ impl WebbookBot {
                         self.users[user_index].held_seats.clear();
                     } else if let Some(seat_to_remove) = seat_msg.strip_prefix("REMOVE:") {
                         // Remove a single seat (for transfers)
-                        self.users[user_index].held_seats.retain(|s| s != seat_to_remove);
+                        self.users[user_index]
+                            .held_seats
+                            .retain(|s| s != seat_to_remove);
                     } else {
                         // Add a single seat (for normal takes)
                         self.users[user_index].held_seats.push(seat_msg);
                     }
                     // Update the display count string
-                    self.users[user_index].seats = self.users[user_index].held_seats.len().to_string();
+                    self.users[user_index].seats =
+                        self.users[user_index].held_seats.len().to_string();
                     // --- END OF FIX ---
                 }
             }
@@ -2286,6 +2706,7 @@ impl WebbookBot {
                                 user.seats = "0".to_string();
                                 user.last_update = "10:37:47".to_string();
                                 user.pay_status = "Pay".to_string();
+                                user.payment_completed = false;
                                 new_users.push(user);
                             }
                             Err(e) => println!("Error parsing user: {}", e),
@@ -2326,169 +2747,235 @@ impl WebbookBot {
             }
         }
     }
-    
-    // In impl WebbookBot
 
     // In impl WebbookBot
-fn start_bot(&mut self) {
-    if self.users.is_empty() {
-        println!("Please load users first");
-        return;
-    }
-    if let Err(e) = self.start_node_process() {
-        println!("Failed to start Node.js server: {}", e);
-        return;
-    }
 
-    std::thread::sleep(std::time::Duration::from_secs(2));
-
-    let star_user_limit: usize = self.seats.parse().unwrap_or(0);
-    let plus_user_limit: usize = self.d_seats.parse().unwrap_or(0);
-    for user in self.users.iter_mut() {
-        if user.user_type == "*" {
-            user.max_seats = star_user_limit;
-        } else if user.user_type == "+" {
-            user.max_seats = plus_user_limit;
+    // In impl WebbookBot
+    fn start_bot(&mut self) {
+        if self.users.is_empty() {
+            println!("Please load users first");
+            return;
         }
-    }
-
-    // --- NEW: Automatic 50/50 user split ---
-    let mut star_indices: Vec<usize> = Vec::new();
-    let mut plus_indices: Vec<usize> = Vec::new();
-
-    for (i, user) in self.users.iter().enumerate() {
-        if user.user_type == "*" {
-            star_indices.push(i);
-        } else if user.user_type == "+" {
-            plus_indices.push(i);
+        if let Err(e) = self.start_node_process() {
+            println!("Failed to start Node.js server: {}", e);
+            return;
         }
-    }
 
-    let split_point = (star_indices.len() + 1) / 2; // Handles odd numbers correctly
-    let initial_active_star_indices: Vec<usize> = star_indices.iter().take(split_point).cloned().collect();
-    let waiting_star_indices: Vec<usize> = star_indices.iter().skip(split_point).cloned().collect();
+        std::thread::sleep(std::time::Duration::from_secs(2));
 
-    for &index in &waiting_star_indices {
-        if let Some(user) = self.users.get_mut(index) {
-            user.status = "Waiting".to_string();
+        let star_user_limit: usize = self.seats.parse().unwrap_or(0);
+        let plus_user_limit: usize = self.d_seats.parse().unwrap_or(0);
+        for user in self.users.iter_mut() {
+            if user.user_type == "*" {
+                user.max_seats = star_user_limit;
+            } else if user.user_type == "+" {
+                user.max_seats = plus_user_limit;
+            }
         }
-    }
 
-    let mut users_to_activate_initially = initial_active_star_indices.clone();
-    users_to_activate_initially.extend(plus_indices);
-    // --- END of split logic ---
+        // --- NEW: Automatic 50/50 user split ---
+        let mut star_indices: Vec<usize> = Vec::new();
+        let mut plus_indices: Vec<usize> = Vec::new();
 
-    let users_data: Vec<(String, Option<String>)> = self.users.iter().map(|u| {
-            let proxy = if u.proxy == "No proxy" || u.proxy.is_empty() { None } else { Some(u.proxy.clone()) };
-            (u.email.clone(), proxy)
-        }).collect();
+        for (i, user) in self.users.iter().enumerate() {
+            if user.user_type == "*" {
+                star_indices.push(i);
+            } else if user.user_type == "+" {
+                plus_indices.push(i);
+            }
+        }
 
-    let event_url = self.event_url.clone();
-    let (assigned_seats_sender, assigned_seats_receiver) = mpsc::unbounded_channel();
-    self.assigned_seats_sender = Some(assigned_seats_sender);
-    self.assigned_seats_receiver = Some(assigned_seats_receiver);
-    let (status_sender, status_receiver) = mpsc::unbounded_channel();
-    let (expire_sender, expire_receiver) = mpsc::unbounded_channel::<(usize, usize)>();
-    self.status_receiver = Some(status_receiver);
-    self.expire_receiver = Some(expire_receiver);
+        let split_point = (star_indices.len() + 1) / 2; // Handles odd numbers correctly
+        let initial_active_star_indices: Vec<usize> =
+            star_indices.iter().take(split_point).cloned().collect();
+        let waiting_star_indices: Vec<usize> =
+            star_indices.iter().skip(split_point).cloned().collect();
 
-    if let Some(rt) = &self.rt {
-        let assigned_seats_sender_for_task = self.assigned_seats_sender.as_ref().unwrap().clone();
-        let log_sender_for_task = self.log_sender.as_ref().unwrap().clone();
-        let shared_data = Arc::new(RwLock::new(SharedData::default()));
-        self.shared_data = Some(shared_data.clone());
-        let favorite_team = self.favorite_team.clone();
+        for &index in &waiting_star_indices {
+            if let Some(user) = self.users.get_mut(index) {
+                user.status = "Waiting".to_string();
+            }
+        }
 
-        rt.spawn({ let shared_data = shared_data.clone(); async move { shared_data.write().await.favorite_team = Some(favorite_team); } });
+        let mut users_to_activate_initially = initial_active_star_indices.clone();
+        users_to_activate_initially.extend(plus_indices);
+        // --- END of split logic ---
 
-        let (bot_sender, bot_receiver) = mpsc::unbounded_channel();
-        self.bot_manager_receiver = Some(bot_receiver);
-        let channel_keys = self.build_channel_keys();
+        let users_data: Vec<(String, Option<String>)> = self
+            .users
+            .iter()
+            .map(|u| {
+                let proxy = if u.proxy == "No proxy" || u.proxy.is_empty() {
+                    None
+                } else {
+                    Some(u.proxy.clone())
+                };
+                (u.email.clone(), proxy)
+            })
+            .collect();
 
-        rt.spawn(async move {
-            match BotManager::new(users_data, event_url.clone(), shared_data).await {
-                Ok(bot_manager) => {
-                    let bot_manager_arc = Arc::new(bot_manager);
-                    bot_sender.send(bot_manager_arc.clone()).ok();
-                    // ... Sequential startup logic (unchanged) ...
-                    if bot_manager_arc.extract_seatsio_chart_data().await.is_err() { return; }
-                    if let Ok(event_id) = extract_event_key(&event_url) {
-                        if bot_manager_arc.send_event_detail_request(&event_id).await.is_err() { return; }
-                    } else { return; }
-                    if bot_manager_arc.get_rendering_info().await.is_err() { return; }
+        let event_url = self.event_url.clone();
+        let (assigned_seats_sender, assigned_seats_receiver) = mpsc::unbounded_channel();
+        self.assigned_seats_sender = Some(assigned_seats_sender);
+        self.assigned_seats_receiver = Some(assigned_seats_receiver);
+        let (status_sender, status_receiver) = mpsc::unbounded_channel();
+        let (expire_sender, expire_receiver) = mpsc::unbounded_channel::<(usize, usize)>();
+        self.status_receiver = Some(status_receiver);
+        self.expire_receiver = Some(expire_receiver);
+
+        if let Some(rt) = &self.rt {
+            let assigned_seats_sender_for_task =
+                self.assigned_seats_sender.as_ref().unwrap().clone();
+            let log_sender_for_task = self.log_sender.as_ref().unwrap().clone();
+            let shared_data = Arc::new(RwLock::new(SharedData::default()));
+            self.shared_data = Some(shared_data.clone());
+            let favorite_team = self.favorite_team.clone();
+
+            rt.spawn({
+                let shared_data = shared_data.clone();
+                async move {
+                    shared_data.write().await.favorite_team = Some(favorite_team);
+                }
+            });
+
+            let (bot_sender, bot_receiver) = mpsc::unbounded_channel();
+            self.bot_manager_receiver = Some(bot_receiver);
+            let channel_keys = self.build_channel_keys();
+            let paid_users_clone = self.paid_users.clone();
+            rt.spawn(async move {
+                
+                match BotManager::new(users_data, event_url.clone(), shared_data).await {
                     
-                    let status_sender_clone = status_sender.clone();
-                    let log_sender_clone = log_sender_for_task.clone();
-                    if let Err(e) = bot_manager_arc.start_bot(&users_to_activate_initially, status_sender, log_sender_clone, channel_keys.clone()).await {
-                        println!("Bot error: {}", e);
-                        return;
-                    }
-                    
-                    let second_batch_activated = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    
-                    loop {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        for (i, user) in bot_manager_arc.users.iter().enumerate() {
-                            let expire_time = user.expire_time.load(Ordering::Relaxed);
-                            if expire_time == usize::MAX {
-                                continue;
+                    Ok(bot_manager) => {
+                        let bot_manager_arc = Arc::new(bot_manager);
+                        bot_sender.send(bot_manager_arc.clone()).ok();
+                        
+                        // This part fetches shared event data first, which is correct.
+                        if bot_manager_arc.extract_seatsio_chart_data().await.is_err() { return; }
+                        if let Ok(event_id) = extract_event_key(&event_url) {
+                            if bot_manager_arc.send_event_detail_request(&event_id).await.is_err() { return; }
+                        } else { return; }
+                        if bot_manager_arc.get_rendering_info().await.is_err() { return; }
+            
+                        // --- FIX: The initial user activation is now spawned in the background ---
+                        // This allows the main timer loop below to start immediately.
+                        let status_sender_clone = status_sender.clone();
+                        let log_sender_clone = log_sender_for_task.clone();
+                        let channel_keys_clone = channel_keys.clone();
+                        let bot_manager_clone = bot_manager_arc.clone();
+                        let users_to_activate_clone = users_to_activate_initially.clone();
+            
+                        tokio::spawn(async move {
+                            if let Err(e) = bot_manager_clone
+                                .start_bot(
+                                    &users_to_activate_clone,
+                                    status_sender_clone,
+                                    log_sender_clone,
+                                    channel_keys_clone,
+                                )
+                                .await
+                            {
+                                println!("Bot error during initial activation: {}", e);
                             }
-                            if expire_time > 0 {
-                                let remaining = expire_time.saturating_sub(1);
-                                user.expire_time.store(remaining, Ordering::Relaxed);
-                                expire_sender.send((i, remaining)).ok();
-
-                                // --- PHASE 1: Trigger to activate the second batch ---
-                                if !second_batch_activated.load(Ordering::Relaxed) && remaining <= 200 && initial_active_star_indices.contains(&i) {
-                                    second_batch_activated.store(true, Ordering::Relaxed);
-                                    log_sender_for_task.send((i, "Timer <= 200s. Activating all waiting users now!".to_string())).ok();
-
-                                    // Start all waiting users at once
-                                    if let Err(e) = bot_manager_arc.start_bot(&waiting_star_indices, status_sender_clone.clone(), log_sender_for_task.clone(), channel_keys.clone()).await {
-                                        println!("Error activating second batch: {}", e);
-                                    }
+                        });
+                        // --- END OF FIX ---
+            
+                        // The main timer loop, which was previously blocked, now starts right away.
+                        let second_batch_activated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            for (i, user) in bot_manager_arc.users.iter().enumerate() {
+                                let expire_time = user.expire_time.load(Ordering::Relaxed);
+                                if expire_time == usize::MAX {
+                                    continue;
                                 }
-                            } else if expire_time == 0 {
-                                // --- PHASE 2: Standard refresh logic for ALL users ---
-                                user.expire_time.store(600, Ordering::Relaxed);
-                                
-                                let user_clone = user.clone();
-                                let assigned_seats_sender_clone = assigned_seats_sender_for_task.clone();
-                                let log_sender_clone_task = log_sender_for_task.clone();
-                                let bot_manager_clone = bot_manager_arc.clone();
-                                let channel_keys_clone = channel_keys.clone();
-                                let user_index = i;
-
-                                tokio::spawn(async move {
-                                    let previously_held = { let mut held = user_clone.held_seats.lock(); let seats = held.clone(); held.clear(); seats };
-                                    log_sender_clone_task.send((user_index, format!("â ° Token expired. Refreshing for {} seats...", previously_held.len()))).ok();
-                                    assigned_seats_sender_clone.send((user_index, "".to_string())).ok();
-
-                                    if user_clone.get_webook_hold_token().await.is_ok() {
-                                        user_clone.expire_time.store(600, Ordering::Relaxed);
-                                        log_sender_clone_task.send((user_index, "âœ… New token acquired.".to_string())).ok();
-                                        if let Ok(template) = user_clone.prepare_request_template(channel_keys_clone.clone()).await {
-                                            *user_clone.prepared_request.lock() = Some(template);
-                                        }
-                                        if !previously_held.is_empty() {
-                                            let event_keys = if let Some(key) = bot_manager_clone.shared_data.read().await.event_key.as_ref() { vec![key.clone()] } else { return; };
-                                            user_clone.retake_seats(previously_held, channel_keys_clone, event_keys, assigned_seats_sender_clone, user_index).await.ok();
-                                        }
-                                    } else {
-                                        log_sender_clone_task.send((user_index, "â Œ FAILED to get new token.".to_string())).ok();
-                                        user_clone.expire_time.store(0, Ordering::Relaxed);
+                                let is_paid = paid_users_clone.lock().contains(&i);
+                                if is_paid {
+                                    continue; // If paid, skip them entirely and go to the next user.
+                                }
+                                if expire_time > 0 {
+                                    let remaining = expire_time.saturating_sub(1);
+                                    user.expire_time.store(remaining, Ordering::Relaxed);
+                                    expire_sender.send((i, remaining)).ok();
+            
+                                    // This is the logic for activating the second batch, which is also non-blocking.
+                                    if !second_batch_activated.load(Ordering::Relaxed)
+                                        && remaining <= 200
+                                        && initial_active_star_indices.contains(&i)
+                                    {
+                                        second_batch_activated.store(true, Ordering::Relaxed);
+                                        log_sender_for_task.send((i, "Timer <= 200s. Activating all waiting users now!".to_string())).ok();
+                                        
+                                        let bot_manager_clone = bot_manager_arc.clone();
+                                        let waiting_indices_clone = waiting_star_indices.clone();
+                                        let status_sender_clone_2 = status_sender.clone();
+                                        let log_sender_clone_2 = log_sender_for_task.clone();
+                                        let channel_keys_clone_2 = channel_keys.clone();
+            
+                                        tokio::spawn(async move {
+                                            if let Err(e) = bot_manager_clone
+                                                .start_bot(
+                                                    &waiting_indices_clone,
+                                                    status_sender_clone_2,
+                                                    log_sender_clone_2,
+                                                    channel_keys_clone_2,
+                                                )
+                                                .await
+                                            {
+                                                println!("Error activating second batch: {}", e);
+                                            }
+                                        });
                                     }
-                                });
+                                } else if expire_time == 0 {
+                                    // This is the token refreshing logic for expired users.
+                                    user.expire_time.store(600, Ordering::Relaxed);
+                                    let user_clone = user.clone();
+                                    let assigned_seats_sender_clone = assigned_seats_sender_for_task.clone();
+                                    let log_sender_clone_task = log_sender_for_task.clone();
+                                    let bot_manager_clone = bot_manager_arc.clone();
+                                    let channel_keys_clone = channel_keys.clone();
+                                    let user_index = i;
+                                    tokio::spawn(async move {
+                                        let previously_held = {
+                                            let mut held = user_clone.held_seats.lock();
+                                            let seats = held.clone();
+                                            held.clear();
+                                            seats
+                                        };
+                                        log_sender_clone_task.send((user_index,format!("° Token expired. Refreshing for {} seats...",previously_held.len()))).ok();
+                                        assigned_seats_sender_clone.send((user_index, "".to_string())).ok();
+            
+                                        if user_clone.get_webook_hold_token().await.is_ok() {
+                                            user_clone.expire_time.store(600, Ordering::Relaxed);
+                                            log_sender_clone_task.send((user_index,"âœ… New token acquired.".to_string())).ok();
+                                            if let Ok(template) = user_clone.prepare_request_template(channel_keys_clone.clone()).await {
+                                                *user_clone.prepared_request.lock() = Some(template);
+                                            }
+                                            if !previously_held.is_empty() {
+                                                let event_keys = if let Some(key) = bot_manager_clone.shared_data.read().await.event_key.as_ref() {
+                                                    vec![key.clone()]
+                                                } else {
+                                                    return;
+                                                };
+                                                user_clone.retake_seats(previously_held, channel_keys_clone, event_keys, assigned_seats_sender_clone, user_index).await.ok();
+                                            }
+                                        } else {
+                                            log_sender_clone_task.send((user_index,"â Œ FAILED to get new token.".to_string())).ok();
+                                            user_clone.expire_time.store(0, Ordering::Relaxed);
+                                        }
+                                    });
+                                }
                             }
                         }
                     }
+                    Err(e) => {
+                        println!("Failed to create bot manager: {}", e);
+                    }
                 }
-                Err(e) => { println!("Failed to create bot manager: {}", e); }
-            }
-        });
+            });
+        }
+        self.bot_running = true;
     }
-    self.bot_running = true;
-}
     fn render_top_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             // File loading buttons
@@ -2588,9 +3075,9 @@ fn start_bot(&mut self) {
 
             // Display checkboxes - 10 per line
             // Display checkboxes in scrollable area
-            
+
             let mut sections_to_display: Vec<String> =
-            self.selected_sections.keys().cloned().collect();
+                self.selected_sections.keys().cloned().collect();
             sections_to_display.sort();
 
             let mut selection_changed = false;
@@ -2612,42 +3099,42 @@ fn start_bot(&mut self) {
             ui.label(format!("Sections: {} selected", selected_count));
             // Create scrollable area with fixed height
             egui::ScrollArea::both()
-            .id_source("sections_scroll")  // ADD THIS LINE - unique ID
-            .max_height(200.0)
-            .show(ui, |ui| {
-                // Use a grid for better layout control
-                egui::Grid::new("sections_grid")
-                    .num_columns(10)
-                    .spacing([5.0, 5.0])
-                    .show(ui, |ui| {
-                        for (index, section) in sections_to_display.iter().enumerate() {
-                            if let Some(is_selected) = self.selected_sections.get_mut(section) {
-                                if ui.checkbox(is_selected, section).changed() {
-                                    selection_changed = true;
+                .id_source("sections_scroll") // ADD THIS LINE - unique ID
+                .max_height(200.0)
+                .show(ui, |ui| {
+                    // Use a grid for better layout control
+                    egui::Grid::new("sections_grid")
+                        .num_columns(10)
+                        .spacing([5.0, 5.0])
+                        .show(ui, |ui| {
+                            for (index, section) in sections_to_display.iter().enumerate() {
+                                if let Some(is_selected) = self.selected_sections.get_mut(section) {
+                                    if ui.checkbox(is_selected, section).changed() {
+                                        selection_changed = true;
+                                    }
+                                }
+
+                                // End row after 10 items
+                                if (index + 1) % 10 == 0 {
+                                    ui.end_row();
                                 }
                             }
-                            
-                            // End row after 10 items
-                            if (index + 1) % 10 == 0 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-            });
+                        });
+                });
 
             // If selection changed, redistribute seats
             // If selection changed, redistribute seats AND start scanner
             if selection_changed {
                 println!("selection changed");
-                
+
                 // Update shared selections for scanner
                 {
                     let mut shared = self.selected_sections_shared.lock();
                     *shared = self.selected_sections.clone();
                 }
-                
+
                 self.distribute_seats_to_users();
-                
+
                 let has_selected = self.selected_sections.values().any(|&selected| selected);
                 if has_selected && !self.scanner_running && self.bot_running {
                     self.start_scanner();
@@ -2663,7 +3150,7 @@ fn start_bot(&mut self) {
     fn update_ready_scanner_users_atomic(&self) {
         let mut ready_users = self.ready_scanner_users.lock();
         ready_users.clear();
-        
+
         for (i, user) in self.users.iter().enumerate() {
             // Updated condition to include both '*' and '+' users
             if (user.user_type == "*" || user.user_type == "+") && user.status == "Active" {
@@ -2674,142 +3161,187 @@ fn start_bot(&mut self) {
 
     fn render_user_table(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
-
-    let mut pay_button_clicked_for: Option<usize> = None;
-    let mut pay2_button_clicked_for: Option<usize> = None;
-    let mut logs_button_clicked_for: Option<usize> = None;
-
-    // Calculate dynamic column widths based on available space
-    let available_width = ui.available_width();
-    let email_width = available_width * 0.20;      // 25% for email
-    let type_width = available_width * 0.05;       // 5% for type
-    let proxy_width = available_width * 0.20;      // 20% for proxy
-    let status_width = available_width * 0.10;     // 10% for status
-    let expire_width = available_width * 0.08;     // 8% for expire
-    let seats_width = available_width * 0.08;      // 8% for seats
-    let update_width = available_width * 0.12;     // 12% for last update
-    let pay_width = available_width * 0.06;        // 6% for pay
-    let pay2_width = available_width * 0.06;       // 6% for pay2
-
-    TableBuilder::new(ui)
-        .striped(true)
-        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-        .column(Column::exact(email_width))    // Email
-        .column(Column::exact(type_width))     // Type
-        .column(Column::exact(proxy_width))    // Proxy
-        .column(Column::exact(status_width))   // Status
-        .column(Column::exact(expire_width))   // Expire
-        .column(Column::exact(seats_width))    // Seats
-        .column(Column::exact(update_width))   // Last Update
-        .column(Column::exact(pay_width))      // Pay
-        .column(Column::exact(pay2_width))     // Pay2
-        .header(25.0, |mut header| {
-            header.col(|ui| { ui.heading("Email"); });
-            header.col(|ui| { ui.heading("Type"); });
-            header.col(|ui| { ui.heading("Proxy"); });
-            header.col(|ui| { ui.heading("Status"); });
-            header.col(|ui| { ui.heading("Expire"); });
-            header.col(|ui| { ui.heading("Seats"); });
-            header.col(|ui| { ui.heading("Last Update"); });
-            header.col(|ui| { ui.heading("Pay"); });
-            header.col(|ui| { ui.heading("Pay2"); }); 
-        })
-        .body(|body| {
-            let users = self.users.clone();
-            body.rows(25.0, users.len(), |user_index, mut row| {
+    
+        let mut pay_button_clicked_for: Option<usize> = None;
+        let mut pay2_button_clicked_for: Option<usize> = None;
+        let mut logs_button_clicked_for: Option<usize> = None;
+    
+        let available_width = ui.available_width();
+        // --- START OF FIX: Re-balanced column widths to add the new "Payment Status" column ---
+        let email_width = available_width * 0.25;    // Email
+        let type_width = available_width * 0.05;     // Type
+        let proxy_width = available_width * 0.20;    // Proxy
+        let status_width = available_width * 0.10;   // Status
+        let expire_width = available_width * 0.08;   // Expire
+        let seats_width = available_width * 0.08;    // Seats
+        let pay_width = available_width * 0.08;      // Pay
+        let pay2_width = available_width * 0.08;     // Pay2
+        let payment_status_width = available_width * 0.08; // Payment Status (New)
+    
+        TableBuilder::new(ui)
+            .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            // --- FIX: Defined 10 columns ---
+            .column(Column::exact(email_width))
+            .column(Column::exact(type_width))
+            .column(Column::exact(proxy_width))
+            .column(Column::exact(status_width))
+            .column(Column::exact(expire_width))
+            .column(Column::exact(seats_width))
+            .column(Column::exact(pay_width))
+            .column(Column::exact(pay2_width))
+            .column(Column::exact(payment_status_width)) // Added 10th column definition
+            .header(25.0, |mut header| {
+                header.col(|ui| { ui.heading("Email"); });
+                header.col(|ui| { ui.heading("Type"); });
+                header.col(|ui| { ui.heading("Proxy"); });
+                header.col(|ui| { ui.heading("Status"); });
+                header.col(|ui| { ui.heading("Expire"); });
+                header.col(|ui| { ui.heading("Seats"); });
+                header.col(|ui| { ui.heading("Pay"); });
+                header.col(|ui| { ui.heading("Pay2"); });
+                header.col(|ui| { ui.heading("Payment"); }); // Added 10th header
+            })
+            .body(|body| {
+                let users = self.users.clone();
+                body.rows(25.0, users.len(), |user_index, mut row| {
                     let user = &users[user_index];
                     
-                    row.col(|ui| {
-                        if ui.button(&user.email).clicked() {
-                            logs_button_clicked_for = Some(user_index);
-                        }
-                    });
+                    // --- FIX: The body now correctly renders 10 columns ---
+                    // Columns 1-6 (Email to Seats)
+                    row.col(|ui| { if ui.button(&user.email).clicked() { logs_button_clicked_for = Some(user_index); } });
                     row.col(|ui| { ui.label(&user.user_type); });
-                    row.col(|ui| { 
-                        // Show proxy status with color coding
-                        if user.proxy == "No proxy" || user.proxy.is_empty() {
-                            ui.colored_label(egui::Color32::LIGHT_GRAY, "No proxy");
-                        } else {
-                            ui.label(&user.proxy);
-                        }
-                    });
-                    row.col(|ui| {
-                        let color = match user.status.as_str() {
-                            "Ready" => egui::Color32::GREEN,
-                            "Error" => egui::Color32::RED,
-                            "Active" => egui::Color32::BLUE,
-                            _ => egui::Color32::GRAY,
-                        };
-                        ui.colored_label(color, &user.status);
-                    });
+                    row.col(|ui| { if user.proxy == "No proxy" || user.proxy.is_empty() { ui.colored_label(egui::Color32::LIGHT_GRAY, "No proxy"); } else { ui.label(&user.proxy); } });
+                    row.col(|ui| { let color = match user.status.as_str() { "Active" => egui::Color32::GREEN, "Expired" => egui::Color32::RED, "Waiting" => egui::Color32::KHAKI, "Paid" => egui::Color32::BLUE, _ => egui::Color32::GRAY, }; ui.colored_label(color, &user.status); });
                     row.col(|ui| { ui.label(&user.expire); });
-                    row.col(|ui| { ui.label(&user.seats); });
-                    row.col(|ui| { ui.label(&user.last_update); });
+                    row.col(|ui| { ui.label(&user.held_seats.len().to_string()); }); // Use held_seats.len() for live count
+    
+                    // Column 7 (Pay button)
                     row.col(|ui| {
-                        if ui.button("Pay").clicked() {
+                        if ui.add_enabled(!user.payment_completed, egui::Button::new("Pay")).clicked() {
                             pay_button_clicked_for = Some(user_index);
                         }
                     });
+    
+                    // Column 8 (Pay2 button)
                     row.col(|ui| {
-                        if ui.button("Pay2").clicked() {
-                            pay2_button_clicked_for = Some(user_index); // ADD THIS
+                        if ui.add_enabled(!user.payment_completed, egui::Button::new("Pay2")).clicked() {
+                            pay2_button_clicked_for = Some(user_index);
                         }
+                    });
+    
+                    // Column 9 (Payment Status text)
+                    row.col(|ui| {
+                        ui.label(&user.pay_status);
                     });
                 });
             });
-            // Add this handler after the existing pay button handler:
-            if let Some(user_index) = pay2_button_clicked_for {
-                self.handle_payment_click2(user_index);
-            }
+    
+        if let Some(user_index) = pay2_button_clicked_for {
+            self.handle_payment_click2(user_index);
+        }
         if let Some(user_index) = pay_button_clicked_for {
             self.handle_payment_click(user_index);
         }
-
-        // --- START OF FIX ---
         if let Some(user_index) = logs_button_clicked_for {
-            self.selected_user_index = Some(user_index); // Save the index
-            self.show_logs_modal = true;                 // Show the modal
+            self.selected_user_index = Some(user_index);
+            self.show_logs_modal = true;
         }
-        // --- END OF FIX ---
     }
 
-
     fn handle_payment_click(&mut self, user_index: usize) {
-        if let (Some(bot_manager), Some(rt), Some(log_sender), Some(telegram_sender)) = 
-            (&self.bot_manager, &self.rt, &self.log_sender, &self.telegram_sender) 
-        {
+        if self.users[user_index].payment_completed {
+            // Show dialog or log that payment already completed
+            if let Some(log_sender) = &self.log_sender {
+                log_sender
+                    .send((
+                        user_index,
+                        "⚠️ Payment already completed for this user".to_string(),
+                    ))
+                    .ok();
+            }
+            return;
+        }
+        if let (
+            Some(bot_manager),
+            Some(rt),
+            Some(log_sender),
+            Some(telegram_sender),
+            Some(payment_sender), // Now correctly declared
+        ) = (
+            &self.bot_manager,
+            &self.rt,
+            &self.log_sender,
+            &self.telegram_sender,
+            &self.payment_status_sender, // And sourced from self
+        ) {
             let bot_manager_clone = bot_manager.clone();
             let log_sender_clone = log_sender.clone();
             let telegram_sender_clone = telegram_sender.clone();
+            let payment_sender_clone = payment_sender.clone(); // This now works
             let user_email = self.users[user_index].email.clone();
             let user_type = self.users[user_index].user_type.clone();
             let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
-            log_sender_clone.send((user_index, "💳 Generating payment link...".to_string())).ok();
+            log_sender_clone
+                .send((user_index, "💳 Generating payment link...".to_string()))
+                .ok();
 
             rt.spawn(async move {
                 // --- START OF NEW "CHECK-THEN-FETCH" LOGIC ---
                 let site_key: String;
 
                 // First, check if we already have a key cached in our shared data.
-                let maybe_key = bot_manager_clone.shared_data.read().await.recaptcha_site_key.clone();
+                let maybe_key = bot_manager_clone
+                    .shared_data
+                    .read()
+                    .await
+                    .recaptcha_site_key
+                    .clone();
 
                 if let Some(existing_key) = maybe_key {
                     // If the key exists, use it instantly.
-                    log_sender_clone.send((user_index, "✅ Using cached reCAPTCHA site key.".to_string())).ok();
+                    log_sender_clone
+                        .send((
+                            user_index,
+                            "✅ Using cached reCAPTCHA site key.".to_string(),
+                        ))
+                        .ok();
                     site_key = existing_key;
                 } else {
                     // If no key is cached, ONLY NOW do we try to fetch it from localhost.
-                    log_sender_clone.send((user_index, "🔑 No cached key. Getting reCAPTCHA site key from localhost...".to_string())).ok();
+                    log_sender_clone
+                        .send((
+                            user_index,
+                            "🔑 No cached key. Getting reCAPTCHA site key from localhost..."
+                                .to_string(),
+                        ))
+                        .ok();
                     if let Err(e) = bot_manager_clone.extract_recaptcha_site_key().await {
                         // If localhost is down or fails, cancel the payment operation.
-                        log_sender_clone.send((user_index, format!("❌ Could not get site key from localhost: {}", e))).ok();
+                        log_sender_clone
+                            .send((
+                                user_index,
+                                format!("❌ Could not get site key from localhost: {}", e),
+                            ))
+                            .ok();
                         //telegram_sender_clone.send(format!("⚠️ Payment for {} failed. Could not connect to the local Node.js server.", bot_manager_clone.users[user_index].email)).ok();
                         return;
                     }
-                    
+
                     // After a successful fetch, read the newly cached key.
-                    site_key = bot_manager_clone.shared_data.read().await.recaptcha_site_key.clone().unwrap();
-                    log_sender_clone.send((user_index, "✅ Site key received and cached for future use.".to_string())).ok();
+                    site_key = bot_manager_clone
+                        .shared_data
+                        .read()
+                        .await
+                        .recaptcha_site_key
+                        .clone()
+                        .unwrap();
+                    log_sender_clone
+                        .send((
+                            user_index,
+                            "✅ Site key received and cached for future use.".to_string(),
+                        ))
+                        .ok();
                 }
                 // --- END OF NEW LOGIC ---
 
@@ -2817,24 +3349,36 @@ fn start_bot(&mut self) {
                 let bot_user = &bot_manager_clone.users[user_index];
 
                 let captcha_solver = CaptchaSolver::new();
-                let captcha_solution = match captcha_solver.solve("https://webook.com/", &site_key).await {
-                    Ok(solution) => {
-                        log_sender_clone.send((user_index, "✅ CAPTCHA solved.".to_string())).ok();
-                        solution
-                    },
-                    Err(e) => {
-                        log_sender_clone.send((user_index, format!("❌ CAPTCHA failed: {}", e))).ok();
-                        return;
-                    }
-                };
+                let captcha_solution =
+                    match captcha_solver.solve("https://webook.com/", &site_key).await {
+                        Ok(solution) => {
+                            log_sender_clone
+                                .send((user_index, "✅ CAPTCHA solved.".to_string()))
+                                .ok();
+                            solution
+                        }
+                        Err(e) => {
+                            log_sender_clone
+                                .send((user_index, format!("❌ CAPTCHA failed: {}", e)))
+                                .ok();
+                            return;
+                        }
+                    };
 
                 let selected_seats_value = match bot_user.find_seats().await {
                     Ok(seats) => {
-                        log_sender_clone.send((user_index, "✅ Received seat data from local server.".to_string())).ok();
+                        log_sender_clone
+                            .send((
+                                user_index,
+                                "✅ Received seat data from local server.".to_string(),
+                            ))
+                            .ok();
                         seats
-                    },
+                    }
                     Err(e) => {
-                        log_sender_clone.send((user_index, format!("❌ /findSeats failed: {}", e))).ok();
+                        log_sender_clone
+                            .send((user_index, format!("❌ /findSeats failed: {}", e)))
+                            .ok();
                         return;
                     }
                 };
@@ -2842,11 +3386,21 @@ fn start_bot(&mut self) {
 
                 let token_data = match bot_user.token_manager.get_valid_token(&bot_user.email) {
                     Some(token) => token,
-                    None => { log_sender_clone.send((user_index, "❌ No valid token for payment.".to_string())).ok(); return; }
+                    None => {
+                        log_sender_clone
+                            .send((user_index, "❌ No valid token for payment.".to_string()))
+                            .ok();
+                        return;
+                    }
                 };
                 let event_id = match &bot_user.shared_data.read().await.event_id {
                     Some(id) => id.clone(),
-                    None => { log_sender_clone.send((user_index, "❌ Event ID not found.".to_string())).ok(); return; }
+                    None => {
+                        log_sender_clone
+                            .send((user_index, "❌ Event ID not found.".to_string()))
+                            .ok();
+                        return;
+                    }
                 };
 
                 let checkout_payload = json!({
@@ -2862,11 +3416,17 @@ fn start_bot(&mut self) {
                 });
 
                 let checkout_url = "https://api.webook.com/api/v2/event-seat/checkout?lang=en";
-                let response = bot_user.client.post(checkout_url)
-                    .header("Authorization", format!("Bearer {}", token_data.access_token))
+                let response = bot_user
+                    .client
+                    .post(checkout_url)
+                    .header(
+                        "Authorization",
+                        format!("Bearer {}", token_data.access_token),
+                    )
                     .header("token", &token_data.token)
                     .json(&checkout_payload)
-                    .send().await;
+                    .send()
+                    .await;
 
                 match response {
                     Ok(resp) => {
@@ -2874,13 +3434,30 @@ fn start_bot(&mut self) {
                         let body_text = resp.text().await.unwrap_or_default();
                         if status.is_success() {
                             if let Ok(data) = serde_json::from_str::<Value>(&body_text) {
-                                if let Some(link) = data.get("data").and_then(|d| d.get("redirect_url")).and_then(|l| l.as_str()) {
-                                    log_sender_clone.send((user_index, format!("✅ Payment link: {}", link))).ok();
-                                    let held_seats = bot_manager_clone.users[user_index].held_seats.lock();
+                                if let Some(link) = data
+                                    .get("data")
+                                    .and_then(|d| d.get("redirect_url"))
+                                    .and_then(|l| l.as_str())
+                                {
+                                    log_sender_clone
+                                        .send((user_index, format!("✅ Payment link: {}", link)))
+                                        .ok();
+                                    let held_seats =
+                                        bot_manager_clone.users[user_index].held_seats.lock();
                                     let seats_count = held_seats.len();
                                     let seat_list: Vec<String> = held_seats.clone();
-                                    
-                                    let message = if user_type == "+" && d_seats_limit > 0 && seats_count >= d_seats_limit {
+                                    /*log_sender_clone
+                                        .send((
+                                            user_index,
+                                            "✅ Payment completed - user now inactive".to_string(),
+                                        ))
+                                        .ok();*/
+                                    payment_sender_clone.send(user_index).ok();
+
+                                    let message = if user_type == "+"
+                                        && d_seats_limit > 0
+                                        && seats_count >= d_seats_limit
+                                    {
                                         // Payment required notification
                                         format!(
                                             "⚠️ PAYMENT REQUIRED (LIMIT REACHED)\n\
@@ -2890,9 +3467,7 @@ fn start_bot(&mut self) {
                                             💰 Must pay now!\n\
                                             🔗 Payment: {}\n\
                                             ━━━━━━━━━━━━━━━━━",
-                                            user_email,
-                                            seats_count,
-                                            link
+                                            user_email, seats_count, link
                                         )
                                     } else {
                                         // Regular payment link notification
@@ -2904,27 +3479,38 @@ fn start_bot(&mut self) {
                                             🎫 Seats ({}):\n{}\n\
                                             🔗 Link: {}\n\
                                             ━━━━━━━━━━━━━━━━━",
-                                            user_email,
-                                            seats_count,
-                                            seats_formatted,
-                                            link
+                                            user_email, seats_count, seats_formatted, link
                                         )
                                     };
-                                    
-                                    telegram_sender_clone.send(TelegramMessage {
-                                        text: message,
-                                        chat_id: 4814580777, // Payment group
-                                    }).ok();
+
+                                    telegram_sender_clone
+                                        .send(TelegramMessage {
+                                            text: message,
+                                            chat_id: 4814580777, // Payment group
+                                        })
+                                        .ok();
                                 } else {
-                                    log_sender_clone.send((user_index, format!("❌ Link not found in response: {}", body_text))).ok();
+                                    log_sender_clone
+                                        .send((
+                                            user_index,
+                                            format!("❌ Link not found in response: {}", body_text),
+                                        ))
+                                        .ok();
                                 }
                             }
                         } else {
-                            log_sender_clone.send((user_index, format!("❌ Checkout failed ({}): {}", status, body_text))).ok();
+                            log_sender_clone
+                                .send((
+                                    user_index,
+                                    format!("❌ Checkout failed ({}): {}", status, body_text),
+                                ))
+                                .ok();
                         }
                     }
                     Err(e) => {
-                        log_sender_clone.send((user_index, format!("❌ Checkout request error: {}", e))).ok();
+                        log_sender_clone
+                            .send((user_index, format!("❌ Checkout request error: {}", e)))
+                            .ok();
                     }
                 }
             });
@@ -2932,39 +3518,90 @@ fn start_bot(&mut self) {
     }
 
     fn handle_payment_click2(&mut self, user_index: usize) {
-        if let (Some(bot_manager), Some(rt), Some(log_sender), Some(telegram_sender)) = 
-            (&self.bot_manager, &self.rt, &self.log_sender, &self.telegram_sender) 
-        {
+        if self.users[user_index].payment_completed {
+            if let Some(log_sender) = &self.log_sender {
+                log_sender
+                    .send((
+                        user_index,
+                        "⚠️ Payment already completed for this user".to_string(),
+                    ))
+                    .ok();
+            }
+            return;
+        }
+
+        if let (
+            Some(_bot_manager), // _bot_manager is not used, so prefix with underscore
+            Some(rt),
+            Some(log_sender),
+            Some(telegram_sender),
+            Some(payment_sender), // Now correctly declared
+        ) = (
+            &self.bot_manager,
+            &self.rt,
+            &self.log_sender,
+            &self.telegram_sender,
+            &self.payment_status_sender, // And sourced from self
+        ) {
             let log_sender_clone = log_sender.clone();
             let telegram_sender_clone = telegram_sender.clone();
+            let payment_sender_clone = payment_sender.clone(); // Clone the sender
             let user_email = self.users[user_index].email.clone();
             let user_password = self.users[user_index].password.clone();
             let user_proxy = self.users[user_index].proxy.clone();
             let event_url = self.event_url.clone();
 
-            log_sender_clone.send((user_index, "💳 Generating payment link (Method 2)...".to_string())).ok();
+            log_sender_clone
+                .send((
+                    user_index,
+                    "💳 Generating payment link (Method 2)...".to_string(),
+                ))
+                .ok();
 
             rt.spawn(async move {
-                match Self::get_payment_link_method2(&user_email, &user_password, &user_proxy, &event_url).await {
+                match Self::get_payment_link_method2(
+                    &user_email,
+                    &user_password,
+                    &user_proxy,
+                    &event_url,
+                )
+                .await
+                {
                     Ok(payment_link) => {
-                        log_sender_clone.send((user_index, format!("✅ Payment link (M2): {}", payment_link))).ok();
-                        
+                        log_sender_clone
+                            .send((
+                                user_index,
+                                format!("✅ Payment link (M2): {}", payment_link),
+                            ))
+                            .ok();
+                        /*log_sender_clone
+                            .send((
+                                user_index,
+                                "✅ Payment completed - user now inactive".to_string(),
+                            ))
+                            .ok();*/
+                        payment_sender_clone.send(user_index).ok();
+
+
                         let message = format!(
                             "💳 PAYMENT LINK GENERATED (M2)\n\
                             ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\
                             📧 User: {}\n\
                             🔗 Link: {}\n\
                             ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
-                            user_email,
-                            payment_link
+                            user_email, payment_link
                         );
-                        telegram_sender_clone.send(TelegramMessage {
-                            text: message,
-                            chat_id: 4785839500, // Seat operations group
-                        }).ok();
+                        telegram_sender_clone
+                            .send(TelegramMessage {
+                                text: message,
+                                chat_id: 4785839500, // Seat operations group
+                            })
+                            .ok();
                     }
                     Err(e) => {
-                        log_sender_clone.send((user_index, format!("❌ Payment link (M2) failed: {}", e))).ok();
+                        log_sender_clone
+                            .send((user_index, format!("❌ Payment link (M2) failed: {}", e)))
+                            .ok();
                     }
                 }
             });
@@ -2972,10 +3609,10 @@ fn start_bot(&mut self) {
     }
 
     async fn get_payment_link_method2(
-        email: &str, 
-        password: &str, 
-        proxy: &str, 
-        event_url: &str
+        email: &str,
+        password: &str,
+        proxy: &str,
+        event_url: &str,
     ) -> Result<String> {
         #[derive(Serialize)]
         struct PaymentRequest {
@@ -3003,7 +3640,7 @@ fn start_bot(&mut self) {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300)) // 5 minutes
+            .timeout(std::time::Duration::from_secs(600)) // 5 minutes
             .build()?;
 
         let response = client
@@ -3019,15 +3656,19 @@ fn start_bot(&mut self) {
         let result: PaymentResponse = response.json().await?;
 
         if result.success {
-            result.payment_link.ok_or_else(|| anyhow::anyhow!("No payment link in response"))
+            result
+                .payment_link
+                .ok_or_else(|| anyhow::anyhow!("No payment link in response"))
         } else {
-            Err(anyhow::anyhow!("Payment generation failed: {}", 
-                result.error.unwrap_or_else(|| "Unknown error".to_string())))
+            Err(anyhow::anyhow!(
+                "Payment generation failed: {}",
+                result.error.unwrap_or_else(|| "Unknown error".to_string())
+            ))
         }
     }
     fn render_status_bar(&mut self, ui: &mut egui::Ui) {
         ui.separator();
-    
+
         // Collect all status messages first to avoid borrow conflicts
         let mut status_messages = Vec::new();
         if let Some(receiver) = &mut self.status_receiver {
@@ -3035,7 +3676,7 @@ fn start_bot(&mut self) {
                 status_messages.push(status);
             }
         }
-    
+
         // Now process the collected messages without borrowing conflicts
         for status in status_messages {
             // Handle special ready messages
@@ -3044,9 +3685,10 @@ fn start_bot(&mut self) {
                     if user_index < self.users.len() {
                         self.users[user_index].status = "Active".to_string();
                         self.update_ready_scanner_users_atomic();
-                        
+
                         // Start scanner if conditions met
-                        let has_selected_sections = self.selected_sections.values().any(|&selected| selected);
+                        let has_selected_sections =
+                            self.selected_sections.values().any(|&selected| selected);
                         if has_selected_sections && !self.scanner_running {
                             self.start_scanner();
                         }
@@ -3056,7 +3698,7 @@ fn start_bot(&mut self) {
                 self.sections_status = status;
             }
         }
-    
+
         ui.horizontal(|ui| {
             ui.label(format!("Users: {} |", self.users.len()));
             ui.label(format!("Proxies: {} |", self.proxies.len()));
@@ -3072,17 +3714,21 @@ fn start_bot(&mut self) {
     }
     // In impl WebbookBot
     fn start_scanner(&mut self) {
-        if self.scanner_running || !self.bot_running || self.shared_data.is_none() { return; }
-        
+        if self.scanner_running || !self.bot_running || self.shared_data.is_none() {
+            return;
+        }
+
         // Initialize shared selections with current state
         {
             let mut shared = self.selected_sections_shared.lock();
             *shared = self.selected_sections.clone();
         }
-        
+
         // Check if we have any selected sections
         let has_selections = self.selected_sections.values().any(|&selected| selected);
-        if !has_selections { return; }
+        if !has_selections {
+            return;
+        }
 
         self.scanner_running = true;
         self.reserved_seats_map.lock().clear();
@@ -3095,28 +3741,36 @@ fn start_bot(&mut self) {
         let transfer_ignore_list_clone = self.transfer_ignore_list.clone();
         let pending_scanner_seats_clone = self.pending_scanner_seats.clone();
         let selected_sections_shared_clone = self.selected_sections_shared.clone(); // ADD THIS
-        
+
         if let Some(rt) = &self.rt {
             let shared_data = self.shared_data.clone().unwrap();
             let bot_manager = self.bot_manager.clone();
             let users_data_clone = self.users.clone();
             let ready_scanner_users_clone = self.ready_scanner_users.clone();
             let next_user_index_clone = self.next_user_index.clone();
-            
+
             rt.spawn(async move {
                 if let Err(e) = Self::run_websocket_scanner(
-                    shared_data, bot_manager, selected_sections_shared_clone, // CHANGED
-                    users_data_clone, assigned_seats_sender, log_sender, &telegram_sender,
-                    ready_scanner_users_clone, next_user_index_clone,
-                    reserved_seats_map_clone, transfer_ignore_list_clone,
+                    shared_data,
+                    bot_manager,
+                    selected_sections_shared_clone, // CHANGED
+                    users_data_clone,
+                    assigned_seats_sender,
+                    log_sender,
+                    &telegram_sender,
+                    ready_scanner_users_clone,
+                    next_user_index_clone,
+                    reserved_seats_map_clone,
+                    transfer_ignore_list_clone,
                     pending_scanner_seats_clone,
-                ).await {
+                )
+                .await
+                {
                     println!("Scanner error: {}", e);
                 }
             });
         }
     }
-
 
     fn get_selected_channels(&self) -> Vec<String> {
         self.selected_sections
@@ -3146,14 +3800,28 @@ fn start_bot(&mut self) {
         transfer_ignore_list: Arc<Mutex<HashSet<String>>>,
         pending_scanner_seats: Arc<Mutex<HashMap<usize, usize>>>,
     ) -> Result<()> {
-        loop { // The reconnect loop
+        loop {
+            // The reconnect loop
             match Self::connect_and_listen(
-                &shared_data, &bot_manager, &selected_sections_shared, // CHANGED
-                &users_data, &assigned_seats_sender, &log_sender, &telegram_sender,
-                &ready_scanner_users, &next_user_index, &reserved_seats_map,
-                &transfer_ignore_list, &pending_scanner_seats,
-            ).await {
-                Ok(_) => { println!("WebSocket connection ended normally"); break; }
+                &shared_data,
+                &bot_manager,
+                &selected_sections_shared, // CHANGED
+                &users_data,
+                &assigned_seats_sender,
+                &log_sender,
+                &telegram_sender,
+                &ready_scanner_users,
+                &next_user_index,
+                &reserved_seats_map,
+                &transfer_ignore_list,
+                &pending_scanner_seats,
+            )
+            .await
+            {
+                Ok(_) => {
+                    println!("WebSocket connection ended normally");
+                    break;
+                }
                 Err(e) => {
                     println!("Scanner error: {}", e);
                     //tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -3176,24 +3844,27 @@ fn start_bot(&mut self) {
         transfer_ignore_list: &Arc<Mutex<HashSet<String>>>,
         pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>,
     ) -> Result<()> {
-        use sha1::{Sha1, Digest};
-        use tokio_tungstenite::{connect_async, tungstenite::Message, connect_async_with_config, tungstenite::protocol::WebSocketConfig}; // MODIFIED: Added imports
         use futures_util::{SinkExt, StreamExt};
-    
+        use sha1::{Digest, Sha1};
+        use tokio_tungstenite::{
+            connect_async, connect_async_with_config, tungstenite::protocol::WebSocketConfig,
+            tungstenite::Message,
+        }; // MODIFIED: Added imports
+
         let ws_url = "wss://messaging-eu.seatsio.net/ws";
         let config = WebSocketConfig {
             max_send_queue: Some(1000),
             max_message_size: Some(64 << 20),
             max_frame_size: Some(16 << 20),
             // --- FIX: ADDED MISSING FIELDS ---
-            write_buffer_size: 16 << 20,      // 16MB initial write buffer
-            max_write_buffer_size: 64 << 20,  // 64MB max write buffer
+            write_buffer_size: 16 << 20,     // 16MB initial write buffer
+            max_write_buffer_size: 64 << 20, // 64MB max write buffer
             // --- END FIX ---
             accept_unmasked_frames: false,
         };
         let (ws_stream, _) = connect_async_with_config(ws_url, Some(config), false).await?;
         let (mut write, mut read) = ws_stream.split();
-    
+
         // Subscription logic remains the same
         let workspace_sub = json!({ "type": "SUBSCRIBE", "data": { "channel": WORKSPACE_KEY } });
         write.send(Message::Text(workspace_sub.to_string())).await?;
@@ -3210,11 +3881,13 @@ fn start_bot(&mut self) {
         }
         drop(data);
         println!("Scanner connected and subscribed to channels");
-    
+
         while let Some(msg) = read.next().await {
             let msg = match msg {
                 Ok(msg) => msg,
-                Err(e) => { return Err(anyhow::anyhow!("Read error: {}", e)); }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Read error: {}", e));
+                }
             };
 
             if let Message::Text(text) = msg {
@@ -3231,20 +3904,40 @@ fn start_bot(&mut self) {
                                 let is_in_selected_section = {
                                     let current_selections = selected_sections_shared.lock();
                                     current_selections.iter().any(|(section, &is_selected)| {
-                                        is_selected && seat_id.starts_with(section) &&
-                                        (seat_id.len() == section.len() ||
-                                         seat_id.chars().nth(section.len()).map_or(false, |c| !c.is_ascii_digit()))
+                                        is_selected
+                                            && seat_id.starts_with(section)
+                                            && (seat_id.len() == section.len()
+                                                || seat_id
+                                                    .chars()
+                                                    .nth(section.len())
+                                                    .map_or(false, |c| !c.is_ascii_digit()))
                                     })
                                 };
-                                
+
                                 if !is_ignored && is_in_selected_section {
                                     Self::dispatch_seat_take_task(
-                                        seat_id, "SCANNER", bot_manager, ready_scanner_users, 
-                                        next_user_index, assigned_seats_sender, log_sender, &telegram_sender, users_data,
-                                        pending_scanner_seats
-                                    ).await;
-                                }else if is_ignored {
-                                    log_sender.send((0, format!("🚫 SCANNER: Ignoring {} (transfer in progress)", seat_id))).ok();
+                                        seat_id,
+                                        "SCANNER",
+                                        bot_manager,
+                                        ready_scanner_users,
+                                        next_user_index,
+                                        assigned_seats_sender,
+                                        log_sender,
+                                        &telegram_sender,
+                                        users_data,
+                                        pending_scanner_seats,
+                                    )
+                                    .await;
+                                } else if is_ignored {
+                                    log_sender
+                                        .send((
+                                            0,
+                                            format!(
+                                                "🚫 SCANNER: Ignoring {} (transfer in progress)",
+                                                seat_id
+                                            ),
+                                        ))
+                                        .ok();
                                 }
                             }
                         }
@@ -3252,7 +3945,9 @@ fn start_bot(&mut self) {
                         // --- 2. SPYING (Phase 1) ---
                         if body.status.as_deref() == Some("reservedByToken") {
                             // --- FIX: Add `ref` here as well to borrow the seat label ---
-                            if let (Some(hash), Some(ref seat)) = (body.hold_token_hash, body.object_label) {
+                            if let (Some(hash), Some(ref seat)) =
+                                (body.hold_token_hash, body.object_label)
+                            {
                                 let mut map = reserved_seats_map.lock();
                                 // We clone the borrowed `seat` so the map can own the String.
                                 //println!("{} ==> {}", hash, seat);
@@ -3267,32 +3962,58 @@ fn start_bot(&mut self) {
                                 hasher.update(token.as_bytes());
                                 let hash_result = hasher.finalize();
                                 let hash_hex = hex::encode(hash_result);
-                        
+
                                 let seats_to_snipe = {
                                     let mut map = reserved_seats_map.lock();
                                     map.remove(&hash_hex)
                                 };
-                        
+
                                 if let Some(seats) = seats_to_snipe {
-                                    log_sender.send((0, format!("🎯 SNIPER: Token expired, found {} seats to take.", seats.len()))).ok();
+                                    log_sender
+                                        .send((
+                                            0,
+                                            format!(
+                                                "🎯 SNIPER: Token expired, found {} seats to take.",
+                                                seats.len()
+                                            ),
+                                        ))
+                                        .ok();
                                     for seat_id in seats {
                                         // ADD IGNORE LIST CHECK FOR SNIPER TOO (CRITICAL FIX)
-                                        let is_ignored = transfer_ignore_list.lock().contains(&seat_id);
-                                        
+                                        let is_ignored =
+                                            transfer_ignore_list.lock().contains(&seat_id);
+
                                         let is_in_selected_section = {
-                                            let current_selections = selected_sections_shared.lock();
-                                            current_selections.iter().any(|(section, &is_selected)| {
-                                                is_selected && seat_id.starts_with(section) &&
-                                                (seat_id.len() == section.len() ||
-                                                 seat_id.chars().nth(section.len()).map_or(false, |c| !c.is_ascii_digit()))
-                                            })
+                                            let current_selections =
+                                                selected_sections_shared.lock();
+                                            current_selections.iter().any(
+                                                |(section, &is_selected)| {
+                                                    is_selected
+                                                        && seat_id.starts_with(section)
+                                                        && (seat_id.len() == section.len()
+                                                            || seat_id
+                                                                .chars()
+                                                                .nth(section.len())
+                                                                .map_or(false, |c| {
+                                                                    !c.is_ascii_digit()
+                                                                }))
+                                                },
+                                            )
                                         };
                                         if !is_ignored && is_in_selected_section {
                                             Self::dispatch_seat_take_task(
-                                                &seat_id, "SNIPER", bot_manager, ready_scanner_users, 
-                                                next_user_index, assigned_seats_sender, log_sender, &telegram_sender, users_data,
-                                                pending_scanner_seats
-                                            ).await;
+                                                &seat_id,
+                                                "SNIPER",
+                                                bot_manager,
+                                                ready_scanner_users,
+                                                next_user_index,
+                                                assigned_seats_sender,
+                                                log_sender,
+                                                &telegram_sender,
+                                                users_data,
+                                                pending_scanner_seats,
+                                            )
+                                            .await;
                                         } else if is_ignored {
                                             log_sender.send((0, format!("🚫 SNIPER: Ignoring {} (transfer in progress)", seat_id))).ok();
                                         }
@@ -3321,7 +4042,7 @@ fn start_bot(&mut self) {
                     ui.vertical(|ui| {
                         ui.label("Enter the 5-digit code from Telegram:");
                         ui.add(egui::TextEdit::singleline(&mut code).hint_text("12345"));
-                        
+
                         ui.horizontal(|ui| {
                             if ui.button("Submit").clicked() && !code.is_empty() {
                                 result = Some(code.clone());
@@ -3331,7 +4052,7 @@ fn start_bot(&mut self) {
                                 dialog_open = false;
                             }
                         });
-                        
+
                         ui.label("After submitting, confirm in Telegram app!");
                     });
                 });
@@ -3345,17 +4066,17 @@ impl eframe::App for WebbookBot {
         // Set dark theme
         ctx.set_visuals(egui::Visuals::light());
         self.ctx = Some(ctx.clone());
-        
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
-    
+
             // Top panel with controls
             let top_panel_response = ui.allocate_ui_with_layout(
                 egui::Vec2::new(ui.available_width(), 0.0),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     self.render_top_panel(ui);
-                }
+                },
             );
 
             ui.add_space(10.0);
@@ -3377,17 +4098,17 @@ impl eframe::App for WebbookBot {
                         egui::Layout::top_down(egui::Align::LEFT),
                         |ui| {
                             self.render_user_table(ui);
-                        }
+                        },
                     );
                 });
-    
+
             // Status bar at bottom - reserve the space we calculated
             ui.allocate_ui_with_layout(
                 egui::Vec2::new(ui.available_width(), status_bar_height),
                 egui::Layout::bottom_up(egui::Align::LEFT),
                 |ui| {
                     self.render_status_bar(ui);
-                }
+                },
             );
         });
 
@@ -3403,6 +4124,8 @@ impl eframe::App for WebbookBot {
             self.update_countdowns();
             self.update_assigned_seats();
             self.update_logs();
+            self.update_payment_status(); // ADD THIS LINE
+
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         if self.show_transfer_modal {
@@ -3425,15 +4148,32 @@ impl WebbookBot {
             }
         }
     }
+    // In impl WebbookBot...
+    // In impl WebbookBot
 
+    fn update_payment_status(&mut self) {
+        if let Some(receiver) = &mut self.payment_status_receiver {
+            while let Ok(user_index) = receiver.try_recv() {
+                if user_index < self.users.len() {
+                    self.users[user_index].payment_completed = true;
+                    self.users[user_index].pay_status = "✅ Paid".to_string();
+                    self.users[user_index].status = "Paid".to_string();
+                    
+                    // +++ ADD THIS LINE +++
+                    // Add the user's index to the shared "do not refresh" list.
+                    self.paid_users.lock().insert(user_index);
+                }
+            }
+        }
+    }
     fn show_telegram_dialog_ui(&mut self, ctx: &egui::Context) {
         if let Some(request_type) = &self.telegram_dialog_type {
             let title = match request_type {
                 TelegramRequest::RequestPhone => "Enter Phone Number",
-                TelegramRequest::RequestCode => "Enter Telegram Code", 
+                TelegramRequest::RequestCode => "Enter Telegram Code",
                 TelegramRequest::RequestPassword => "Enter 2FA Password",
             };
-            
+
             let mut dialog_open = true;
             egui::Window::new(title)
                 .collapsible(false)
@@ -3453,7 +4193,7 @@ impl WebbookBot {
                         }
                     });
                 });
-                
+
             if !dialog_open {
                 self.show_telegram_dialog = false;
             }
@@ -3465,7 +4205,10 @@ fn optimize_system_settings() {
     // Set file descriptor limits
     unsafe {
         // --- FIX: CORRECTED rlimit USAGE ---
-        let mut limits = rlimit { rlim_cur: 65536, rlim_max: 65536 };
+        let mut limits = rlimit {
+            rlim_cur: 65536,
+            rlim_max: 65536,
+        };
         if setrlimit(RLIMIT_NOFILE, &limits) != 0 {
             println!("Warning: Failed to set file descriptor limit. May encounter issues under heavy load.");
         }
@@ -3491,4 +4234,4 @@ fn main() -> Result<(), eframe::Error> {
     )
 }
 
-// he can't chaneg seat limitation we he distubuted reverse 
+// he can't chaneg seat limitation we he distubuted reverse
