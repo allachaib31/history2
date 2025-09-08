@@ -292,7 +292,7 @@ impl BotUser {
             shared_data,
             token_manager,
             webook_hold_token: Arc::new(Mutex::new(None)),
-            expire_time: Arc::new(AtomicUsize::new(0)),
+            expire_time: Arc::new(AtomicUsize::new(usize::MAX)), // Use placeholder for "not initialized",
             browser_id: Arc::new(Mutex::new(None)),
             held_seats: Arc::new(Mutex::new(Vec::new())),
             prepared_request: Arc::new(Mutex::new(None)),
@@ -841,7 +841,7 @@ fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
     if segments.len() < 2 {
         anyhow::bail!("Not enough URL segments");
     }
-
+    println!("{:?}",segments);
     Ok(segments[segments.len() - 2].to_string())
 }
 
@@ -1007,7 +1007,7 @@ impl BotManager {
             "https://cdn-eu.seatsio.net/system/public/{}/rendering-info",
             WORKSPACE_KEY
         );
-
+        println!("Rendering info URL: {}", event_key);
         let signature = first_user.generate_signature("").await?;
 
         let response = first_user
@@ -1052,54 +1052,60 @@ impl BotManager {
         Ok(())
     }
     // In impl BotManager
-    // In impl BotManager
     async fn start_bot(
         &self,
+        indices_to_start: &[usize], // MODIFIED: Added this new parameter
         status_sender: mpsc::UnboundedSender<String>,
         log_sender: mpsc::UnboundedSender<(usize, String)>,
         channel_keys: Vec<String>,
     ) -> Result<()> {
         let mut user_tasks = Vec::new();
 
-        for (user_index, user) in self.users.iter().enumerate() {
+        // MODIFIED: Loop over the provided indices instead of all users
+        for &user_index in indices_to_start {
+            // Get the specific user by index, and skip if the index is somehow invalid
+            let user = match self.users.get(user_index) {
+                Some(u) => u,
+                None => continue,
+            };
             user.generate_browser_id();
-            
+
             let user_clone = user.clone();
             let log_sender_clone = log_sender.clone();
             let channel_keys_clone = channel_keys.clone();
-            let status_sender_clone = status_sender.clone(); // --- THIS IS THE FIX ---
+            let status_sender_clone = status_sender.clone();
 
             let task = tokio::spawn(async move {
-                log_sender_clone.send((user_index, "🚀 Bot started".to_string())).ok();
+                log_sender_clone.send((user_index, "ðŸš€ Bot started".to_string())).ok();
 
-                for attempt in 1..=3 {
+                for attempt in 1..=100 {
                     log_sender_clone.send((user_index, format!("Attempt {} - Getting hold token", attempt))).ok();
-                        
+
                     match user_clone.get_webook_hold_token().await {
                         Ok(_) => {
-                            log_sender_clone.send((user_index, "✅ Hold token received.".to_string())).ok();
+                            log_sender_clone.send((user_index, "âœ… Hold token received.".to_string())).ok();
                             match user_clone.prepare_request_template(channel_keys_clone.clone()).await {
                                 Ok(template) => {
                                     *user_clone.prepared_request.lock() = Some(template);
-                                    log_sender_clone.send((user_index, "✅ Request template prepared.".to_string())).ok();
+                                    log_sender_clone.send((user_index, "âœ… Request template prepared.".to_string())).ok();
                                 },
                                 Err(e) => {
-                                    log_sender_clone.send((user_index, format!("❌ FAILED to prepare template: {}", e))).ok();
+                                    log_sender_clone.send((user_index, format!("â Œ FAILED to prepare template: {}", e))).ok();
                                 }
                             }
-                            
+
                             // Use the cloned sender here
                             status_sender_clone.send(format!("USER_READY:{}", user_index)).ok();
                             if user_clone.get_expire_time().await.is_err() {
-                                log_sender_clone.send((user_index, "❌ Error getting expire time.".to_string())).ok();
+                                log_sender_clone.send((user_index, "â Œ Error getting expire time.".to_string())).ok();
                             } else {
-                                log_sender_clone.send((user_index, "✅ Session verified.".to_string())).ok();
-                                
+                                log_sender_clone.send((user_index, "âœ… Session verified.".to_string())).ok();
+
                                 return; // Exit loop on success
                             }
                         }
                         Err(e) => {
-                            log_sender_clone.send((user_index, format!("❌ Attempt {} failed: {}", attempt, e))).ok();
+                            log_sender_clone.send((user_index, format!("â Œ Attempt {} failed: {}", attempt, e))).ok();
                         }
                     }
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -2111,21 +2117,30 @@ impl WebbookBot {
         all_seats
     }
 
+    // In impl WebbookBot
+
     fn distribute_seats_to_users(&mut self) {
         let available_seats = self.get_seats_from_selected_sections();
         let total_seats = available_seats.len();
 
+        // --- THIS IS THE ONLY CHANGE ---
+        // The filter now includes `&& user.status != "Waiting"` to get only active '*' users.
         let star_users: Vec<(usize, &mut User)> = self
             .users
             .iter_mut()
             .enumerate()
-            .filter(|(_, user)| user.user_type == "*")
+            .filter(|(_, user)| user.user_type == "*" && user.status != "Waiting")
             .collect();
+        // --- END CHANGE ---
 
         let user_count = star_users.len();
 
         if total_seats == 0 || user_count == 0 {
-            println!("No seats available or no users with type '*'");
+            println!("No seats available or no active '*' users for distribution.");
+            // Clear target seats for any users that might have had them from a previous run
+            for user in self.users.iter_mut() {
+                user.target_seats.clear();
+            }
             return;
         }
 
@@ -2137,11 +2152,11 @@ impl WebbookBot {
         };
 
         println!(
-            "Available seats: {}, Users with '*' type: {}, Each user gets: {}",
+            "Distributing {} seats among {} active '*' users. ({} seats each)",
             total_seats, user_count, actual_seats_per_user
         );
 
-        // Set target seats (what they should attempt to take)
+        // This part is unchanged and now works correctly with the filtered list
         for (user_index, (_, user)) in star_users.into_iter().enumerate() {
             let start_index = user_index * actual_seats_per_user;
             let end_index =
@@ -2149,21 +2164,15 @@ impl WebbookBot {
 
             if start_index < available_seats.len() {
                 let target_seats: Vec<String> = available_seats[start_index..end_index].to_vec();
-                user.target_seats = target_seats.clone();
-
-                println!(
-                    "User {}: will attempt {} seats",
-                    user.email,
-                    target_seats.len()
-                );
+                user.target_seats = target_seats;
             } else {
                 user.target_seats.clear();
             }
         }
 
-        // Reset for "+" type users
+        // This loop now clears seats for '+' users and any '*' users who are still waiting.
         for user in self.users.iter_mut() {
-            if user.user_type == "+" {
+            if user.user_type == "+" || (user.user_type == "*" && user.status == "Waiting") {
                 user.target_seats.clear();
             }
         }
@@ -2319,197 +2328,167 @@ impl WebbookBot {
     }
     
     // In impl WebbookBot
-    fn start_bot(&mut self) {
-        if self.users.is_empty() {
-            println!("Please load users first");
-            return;
-        }
-        if let Err(e) = self.start_node_process() {
-            println!("Failed to start Node.js server: {}", e);
-            return;
-        }
 
-        // Give Node.js server time to start
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    
-        // Set seat limits for each user type
-        let star_user_limit: usize = self.seats.parse().unwrap_or(0);
-        let plus_user_limit: usize = self.d_seats.parse().unwrap_or(0);
-        for user in self.users.iter_mut() {
-            if user.user_type == "*" {
-                user.max_seats = star_user_limit;
-            } else if user.user_type == "+" {
-                user.max_seats = plus_user_limit;
-            }
-        }
-    
-        // Prepare data and channels for the background tasks
-        let users_data: Vec<(String, Option<String>)> = self.users
-            .iter()
-            .map(|u| {
-                let proxy = if u.proxy == "No proxy" || u.proxy.is_empty() {
-                    None
-                } else {
-                    Some(u.proxy.clone())
-                };
-                (u.email.clone(), proxy)
-            })
-            .collect();
-        let event_url = self.event_url.clone();
-    
-        // Create the single, shared channel for all seat updates
-        let (assigned_seats_sender, assigned_seats_receiver) = mpsc::unbounded_channel();
-        self.assigned_seats_sender = Some(assigned_seats_sender);
-        self.assigned_seats_receiver = Some(assigned_seats_receiver);
-    
-        // Create other communication channels
-        let (status_sender, status_receiver) = mpsc::unbounded_channel();
-        let (expire_sender, expire_receiver) = mpsc::unbounded_channel::<(usize, usize)>();
-        self.status_receiver = Some(status_receiver);
-        self.expire_receiver = Some(expire_receiver);
-    
-        if let Some(rt) = &self.rt {
-            // --- Clone all necessary data BEFORE the main async block ---
-            let assigned_seats_sender_for_task = self.assigned_seats_sender.as_ref().unwrap().clone();
-            let log_sender_for_task = self.log_sender.as_ref().unwrap().clone();
-            let shared_data = Arc::new(RwLock::new(SharedData::default()));
-            self.shared_data = Some(shared_data.clone());
-            let favorite_team = self.favorite_team.clone();
-    
-            // Prepare shared data in a separate, non-blocking task
-            rt.spawn({
-                let shared_data = shared_data.clone();
-                async move {
-                    shared_data.write().await.favorite_team = Some(favorite_team);
-                }
-            });
-    
-            let (bot_sender, bot_receiver) = mpsc::unbounded_channel();
-            self.bot_manager_receiver = Some(bot_receiver);
-            let channel_keys = self.build_channel_keys();
-    
-            // This is the main background task for the bot
-            rt.spawn(async move {
-                match BotManager::new(users_data, event_url.clone(), shared_data).await {
-                    Ok(bot_manager) => {
-                        let bot_manager_arc = Arc::new(bot_manager);
-                        bot_sender.send(bot_manager_arc.clone()).ok();
-    
-                        // --- SEQUENTIAL STARTUP LOGIC ---
-                        log_sender_for_task.send((0, "📊 Extracting chart data...".to_string())).ok();
-                        if let Err(e) = bot_manager_arc.extract_seatsio_chart_data().await {
-                            log_sender_for_task.send((0, format!("❌ Error extracting chart data: {}", e))).ok();
-                            return;
-                        }
-    
-                        if let Ok(event_id) = extract_event_key(&event_url) {
-                            log_sender_for_task.send((0, format!("🗓️ Getting details for event: {}...", event_id))).ok();
-                            if let Err(e) = bot_manager_arc.send_event_detail_request(&event_id).await {
-                                log_sender_for_task.send((0, format!("❌ Error getting event details: {}", e))).ok();
-                                return;
-                            }
-                        } else {
-                            log_sender_for_task.send((0, "❌ Could not extract event key from URL.".to_string())).ok();
-                            return;
-                        }
-    
-                        log_sender_for_task.send((0, "ℹ️ Getting rendering info...".to_string())).ok();
-                        if let Err(e) = bot_manager_arc.get_rendering_info().await {
-                            log_sender_for_task.send((0, format!("❌ Error getting rendering info: {}", e))).ok();
-                            return;
-                        }
-                        log_sender_for_task.send((0, "✅ All event data loaded successfully.".to_string())).ok();
-                        // --- ADD THIS BLOCK ---
-                        log_sender_for_task.send((0, "🔑 Attempting to get reCAPTCHA site key...".to_string())).ok();
-                        if let Err(e) = bot_manager_arc.extract_recaptcha_site_key().await {
-                            // Log a WARNING instead of an error, and DO NOT return.
-                            log_sender_for_task.send((0, format!("⚠️ Could not get site key: {}. Will try again on payment.", e))).ok();
-                        } else {
-                            log_sender_for_task.send((0, "✅ Site key received and cached.".to_string())).ok();
-                        }
-                        // --- END ---
-                        // --- Start initializing users now that data is ready ---
-                        let status_sender_clone = status_sender.clone();
-                        let log_sender_clone = log_sender_for_task.clone();
-                        if let Err(e) = bot_manager_arc.start_bot(status_sender, log_sender_clone, channel_keys.clone()).await {
-                            println!("Bot error: {}", e);
-                        }
-                        
-                        // --- CONCURRENT EXPIRATION LOOP ---
-                        loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                            for (i, user) in bot_manager_arc.users.iter().enumerate() {
-                                let expire_time = user.expire_time.load(Ordering::Relaxed);
-    
-                                if expire_time > 0 {
-                                    let remaining = expire_time.saturating_sub(1);
-                                    user.expire_time.store(remaining, Ordering::Relaxed);
-                                    expire_sender.send((i, remaining)).ok();
-                                } else if expire_time == 0 {
-                                    // Set placeholder to prevent re-triggering while task runs
-                                    user.expire_time.store(600, Ordering::Relaxed);
-    
-                                    // Clone all data needed for the independent background task
-                                    let user_clone = user.clone();
-                                    let assigned_seats_sender_clone = assigned_seats_sender_for_task.clone();
-                                    let status_sender_clone_task = status_sender_clone.clone();
-                                    let log_sender_clone_task = log_sender_for_task.clone();
-                                    let bot_manager_clone = bot_manager_arc.clone();
-                                    let channel_keys_clone = channel_keys.clone();
-                                    let user_index = i;
-    
-                                    // Launch the entire refresh-and-retake process in the background
-                                    tokio::spawn(async move {
-                                        let previously_held = {
-                                            let mut held = user_clone.held_seats.lock();
-                                            let seats = held.clone();
-                                            held.clear();
-                                            seats
-                                        };
-    
-                                        log_sender_clone_task.send((user_index, format!("⏰ Token expired. Refreshing for {} seats...", previously_held.len()))).ok();
-                                        assigned_seats_sender_clone.send((user_index, "".to_string())).ok();
-    
-                                        if user_clone.get_webook_hold_token().await.is_ok() {
-                                            user_clone.expire_time.store(600, Ordering::Relaxed);
-                                            log_sender_clone_task.send((user_index, "✅ New token acquired.".to_string())).ok();
-    
-                                            if let Ok(template) = user_clone.prepare_request_template(channel_keys_clone.clone()).await {
-                                                *user_clone.prepared_request.lock() = Some(template);
-                                            }
-    
-                                            if !previously_held.is_empty() {
-                                                let event_keys = if let Some(key) = bot_manager_clone.shared_data.read().await.event_key.as_ref() {
-                                                    vec![key.clone()]
-                                                } else { return; };
-                                                
-                                                user_clone.retake_seats(
-                                                    previously_held,
-                                                    channel_keys_clone,
-                                                    event_keys,
-                                                    assigned_seats_sender_clone,
-                                                    user_index,
-                                                ).await.ok();
-                                            }
-                                        } else {
-                                            log_sender_clone_task.send((user_index, "❌ FAILED to get new token.".to_string())).ok();
-                                            //user_clone.expire_time.store(300, Ordering::Relaxed);
-                                            user_clone.expire_time.store(0, Ordering::Relaxed); // Allow re-try
-                                        }
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("Failed to create bot manager: {}", e);
-                    }
-                }
-            });
-        }
-        self.bot_running = true;
+    // In impl WebbookBot
+fn start_bot(&mut self) {
+    if self.users.is_empty() {
+        println!("Please load users first");
+        return;
+    }
+    if let Err(e) = self.start_node_process() {
+        println!("Failed to start Node.js server: {}", e);
+        return;
     }
 
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    let star_user_limit: usize = self.seats.parse().unwrap_or(0);
+    let plus_user_limit: usize = self.d_seats.parse().unwrap_or(0);
+    for user in self.users.iter_mut() {
+        if user.user_type == "*" {
+            user.max_seats = star_user_limit;
+        } else if user.user_type == "+" {
+            user.max_seats = plus_user_limit;
+        }
+    }
+
+    // --- NEW: Automatic 50/50 user split ---
+    let mut star_indices: Vec<usize> = Vec::new();
+    let mut plus_indices: Vec<usize> = Vec::new();
+
+    for (i, user) in self.users.iter().enumerate() {
+        if user.user_type == "*" {
+            star_indices.push(i);
+        } else if user.user_type == "+" {
+            plus_indices.push(i);
+        }
+    }
+
+    let split_point = (star_indices.len() + 1) / 2; // Handles odd numbers correctly
+    let initial_active_star_indices: Vec<usize> = star_indices.iter().take(split_point).cloned().collect();
+    let waiting_star_indices: Vec<usize> = star_indices.iter().skip(split_point).cloned().collect();
+
+    for &index in &waiting_star_indices {
+        if let Some(user) = self.users.get_mut(index) {
+            user.status = "Waiting".to_string();
+        }
+    }
+
+    let mut users_to_activate_initially = initial_active_star_indices.clone();
+    users_to_activate_initially.extend(plus_indices);
+    // --- END of split logic ---
+
+    let users_data: Vec<(String, Option<String>)> = self.users.iter().map(|u| {
+            let proxy = if u.proxy == "No proxy" || u.proxy.is_empty() { None } else { Some(u.proxy.clone()) };
+            (u.email.clone(), proxy)
+        }).collect();
+
+    let event_url = self.event_url.clone();
+    let (assigned_seats_sender, assigned_seats_receiver) = mpsc::unbounded_channel();
+    self.assigned_seats_sender = Some(assigned_seats_sender);
+    self.assigned_seats_receiver = Some(assigned_seats_receiver);
+    let (status_sender, status_receiver) = mpsc::unbounded_channel();
+    let (expire_sender, expire_receiver) = mpsc::unbounded_channel::<(usize, usize)>();
+    self.status_receiver = Some(status_receiver);
+    self.expire_receiver = Some(expire_receiver);
+
+    if let Some(rt) = &self.rt {
+        let assigned_seats_sender_for_task = self.assigned_seats_sender.as_ref().unwrap().clone();
+        let log_sender_for_task = self.log_sender.as_ref().unwrap().clone();
+        let shared_data = Arc::new(RwLock::new(SharedData::default()));
+        self.shared_data = Some(shared_data.clone());
+        let favorite_team = self.favorite_team.clone();
+
+        rt.spawn({ let shared_data = shared_data.clone(); async move { shared_data.write().await.favorite_team = Some(favorite_team); } });
+
+        let (bot_sender, bot_receiver) = mpsc::unbounded_channel();
+        self.bot_manager_receiver = Some(bot_receiver);
+        let channel_keys = self.build_channel_keys();
+
+        rt.spawn(async move {
+            match BotManager::new(users_data, event_url.clone(), shared_data).await {
+                Ok(bot_manager) => {
+                    let bot_manager_arc = Arc::new(bot_manager);
+                    bot_sender.send(bot_manager_arc.clone()).ok();
+                    // ... Sequential startup logic (unchanged) ...
+                    if bot_manager_arc.extract_seatsio_chart_data().await.is_err() { return; }
+                    if let Ok(event_id) = extract_event_key(&event_url) {
+                        if bot_manager_arc.send_event_detail_request(&event_id).await.is_err() { return; }
+                    } else { return; }
+                    if bot_manager_arc.get_rendering_info().await.is_err() { return; }
+                    
+                    let status_sender_clone = status_sender.clone();
+                    let log_sender_clone = log_sender_for_task.clone();
+                    if let Err(e) = bot_manager_arc.start_bot(&users_to_activate_initially, status_sender, log_sender_clone, channel_keys.clone()).await {
+                        println!("Bot error: {}", e);
+                        return;
+                    }
+                    
+                    let second_batch_activated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        for (i, user) in bot_manager_arc.users.iter().enumerate() {
+                            let expire_time = user.expire_time.load(Ordering::Relaxed);
+                            if expire_time == usize::MAX {
+                                continue;
+                            }
+                            if expire_time > 0 {
+                                let remaining = expire_time.saturating_sub(1);
+                                user.expire_time.store(remaining, Ordering::Relaxed);
+                                expire_sender.send((i, remaining)).ok();
+
+                                // --- PHASE 1: Trigger to activate the second batch ---
+                                if !second_batch_activated.load(Ordering::Relaxed) && remaining <= 200 && initial_active_star_indices.contains(&i) {
+                                    second_batch_activated.store(true, Ordering::Relaxed);
+                                    log_sender_for_task.send((i, "Timer <= 200s. Activating all waiting users now!".to_string())).ok();
+
+                                    // Start all waiting users at once
+                                    if let Err(e) = bot_manager_arc.start_bot(&waiting_star_indices, status_sender_clone.clone(), log_sender_for_task.clone(), channel_keys.clone()).await {
+                                        println!("Error activating second batch: {}", e);
+                                    }
+                                }
+                            } else if expire_time == 0 {
+                                // --- PHASE 2: Standard refresh logic for ALL users ---
+                                user.expire_time.store(600, Ordering::Relaxed);
+                                
+                                let user_clone = user.clone();
+                                let assigned_seats_sender_clone = assigned_seats_sender_for_task.clone();
+                                let log_sender_clone_task = log_sender_for_task.clone();
+                                let bot_manager_clone = bot_manager_arc.clone();
+                                let channel_keys_clone = channel_keys.clone();
+                                let user_index = i;
+
+                                tokio::spawn(async move {
+                                    let previously_held = { let mut held = user_clone.held_seats.lock(); let seats = held.clone(); held.clear(); seats };
+                                    log_sender_clone_task.send((user_index, format!("â ° Token expired. Refreshing for {} seats...", previously_held.len()))).ok();
+                                    assigned_seats_sender_clone.send((user_index, "".to_string())).ok();
+
+                                    if user_clone.get_webook_hold_token().await.is_ok() {
+                                        user_clone.expire_time.store(600, Ordering::Relaxed);
+                                        log_sender_clone_task.send((user_index, "âœ… New token acquired.".to_string())).ok();
+                                        if let Ok(template) = user_clone.prepare_request_template(channel_keys_clone.clone()).await {
+                                            *user_clone.prepared_request.lock() = Some(template);
+                                        }
+                                        if !previously_held.is_empty() {
+                                            let event_keys = if let Some(key) = bot_manager_clone.shared_data.read().await.event_key.as_ref() { vec![key.clone()] } else { return; };
+                                            user_clone.retake_seats(previously_held, channel_keys_clone, event_keys, assigned_seats_sender_clone, user_index).await.ok();
+                                        }
+                                    } else {
+                                        log_sender_clone_task.send((user_index, "â Œ FAILED to get new token.".to_string())).ok();
+                                        user_clone.expire_time.store(0, Ordering::Relaxed);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(e) => { println!("Failed to create bot manager: {}", e); }
+            }
+        });
+    }
+    self.bot_running = true;
+}
     fn render_top_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             // File loading buttons

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use anyhow::Result;
 
-const API_KEY: &str = "103557152daa870999b42554fa1f2967";
+const API_KEY: &str = "aad614ddfe71bf02f53c9a1d761cc432";
 
 #[derive(Serialize)]
 struct CreateTaskRequest<'a> {
