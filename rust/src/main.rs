@@ -1597,7 +1597,7 @@ impl WebbookBot {
 
         let mut command = Command::new("node");
         command
-            .arg("../../newHistory/newWebokboot/newTest2.js")
+            .arg("./script/newTest2.js")
             .arg(&event_url)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1973,6 +1973,8 @@ impl WebbookBot {
     // In impl WebbookBot
 
     // Improved transfer modal with better UI (matches Go version)
+    // In impl WebbookBot
+
     fn show_transfer_modal(&mut self, ctx: &egui::Context) {
         let mut close_modal = false;
         let mut transfer_details: Option<(usize, usize)> = None;
@@ -1981,64 +1983,62 @@ impl WebbookBot {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                // Get users by type (like Go version)
-                let star_users: Vec<(usize, String, usize)> = self
-                    .users
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, u)| u.user_type == "*")
-                    .map(|(i, u)| (i, u.email.clone(), u.held_seats.len()))
-                    .collect();
+                // --- CHANGE: Create one list of ALL users ---
+                let all_users: Vec<(usize, &User)> = self.users.iter().enumerate().collect();
 
-                let plus_users: Vec<(usize, String, usize)> = self
-                    .users
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, u)| u.user_type == "+")
-                    .map(|(i, u)| (i, u.email.clone(), u.held_seats.len()))
-                    .collect();
+                // --- REMOVED the old separate 'star_users' and 'plus_users' lists ---
 
-                // From user selection with seat count display
+                // "From" user selection now uses the full list
                 ui.horizontal(|ui| {
-                    ui.label("From (*) user:");
+                    ui.label("From user:");
                     egui::ComboBox::from_id_source("from_user")
                         .selected_text(&self.transfer_from_user)
+                        .width(350.0)
                         .show_ui(ui, |ui| {
-                            for (idx, email, seat_count) in &star_users {
-                                let display_text = format!("{} (has {} seats)", email, seat_count);
+                            for (idx, user) in &all_users {
+                                let display_text =
+                                    format!("{} (has {} seats)", user.email, user.held_seats.len());
                                 if ui
                                     .selectable_label(
-                                        self.transfer_from_user == *email,
+                                        self.transfer_from_user == user.email,
                                         &display_text,
                                     )
                                     .clicked()
                                 {
-                                    self.transfer_from_user = email.clone();
+                                    self.transfer_from_user = user.email.clone();
                                 }
                             }
                         });
                 });
 
-                // To user selection with seat count display
+                // "To" user selection also uses the full list
                 ui.horizontal(|ui| {
-                    ui.label("To (+) user:");
+                    ui.label("To user:");
                     egui::ComboBox::from_id_source("to_user")
                         .selected_text(&self.transfer_to_user)
+                        .width(350.0)
                         .show_ui(ui, |ui| {
-                            for (idx, email, seat_count) in &plus_users {
-                                let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+                            for (idx, user) in &all_users {
+                                // --- CHANGE: Use the user's individual max_seats limit ---
+                                let max_seats_display = if user.max_seats == 0 {
+                                    "∞".to_string()
+                                } else {
+                                    user.max_seats.to_string()
+                                };
                                 let display_text = format!(
                                     "{} (has {}/{} seats)",
-                                    email, seat_count, d_seats_limit
+                                    user.email,
+                                    user.held_seats.len(),
+                                    max_seats_display
                                 );
                                 if ui
                                     .selectable_label(
-                                        self.transfer_to_user == *email,
+                                        self.transfer_to_user == user.email,
                                         &display_text,
                                     )
                                     .clicked()
                                 {
-                                    self.transfer_to_user = email.clone();
+                                    self.transfer_to_user = user.email.clone();
                                 }
                             }
                         });
@@ -2046,7 +2046,7 @@ impl WebbookBot {
 
                 ui.separator();
 
-                // Show transfer preview (like Go version)
+                // Transfer preview logic
                 if !self.transfer_from_user.is_empty() && !self.transfer_to_user.is_empty() {
                     if let (Some(from_user), Some(to_user)) = (
                         self.users
@@ -2054,11 +2054,12 @@ impl WebbookBot {
                             .find(|u| u.email == self.transfer_from_user),
                         self.users.iter().find(|u| u.email == self.transfer_to_user),
                     ) {
-                        let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
-                        let can_receive = if d_seats_limit > 0 {
-                            d_seats_limit.saturating_sub(to_user.held_seats.len())
+                        // --- CHANGE: Use the receiving user's actual max_seats ---
+                        let to_user_limit = to_user.max_seats;
+                        let can_receive = if to_user_limit > 0 {
+                            to_user_limit.saturating_sub(to_user.held_seats.len())
                         } else {
-                            from_user.held_seats.len()
+                            from_user.held_seats.len() // Can receive all if limit is 0 (infinite)
                         };
                         let will_transfer = std::cmp::min(from_user.held_seats.len(), can_receive);
 
@@ -2069,10 +2070,11 @@ impl WebbookBot {
                     }
                 }
 
-                // Button logic
+                // Button logic (remains the same)
                 ui.horizontal(|ui| {
-                    let can_transfer =
-                        !self.transfer_from_user.is_empty() && !self.transfer_to_user.is_empty();
+                    let can_transfer = !self.transfer_from_user.is_empty()
+                        && !self.transfer_to_user.is_empty()
+                        && self.transfer_from_user != self.transfer_to_user;
 
                     if ui
                         .add_enabled(can_transfer, egui::Button::new("Transfer"))
@@ -2109,7 +2111,6 @@ impl WebbookBot {
             self.transfer_to_user.clear();
         }
     }
-
     // NEW: Pre-build take request (like Go's prepareTakeSeatRequest)
     async fn prepare_take_request_for_transfer(
         to_user: &BotUser,
@@ -2233,9 +2234,14 @@ impl WebbookBot {
             let from_user = bot_manager.users[from_user_index].clone();
             let to_user = bot_manager.users[to_user_index].clone();
             let seats_to_transfer = from_user.held_seats.lock().clone();
-            let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+
+            let to_user_seat_limit = self.users[to_user_index].max_seats;
+
             let from_user_email = from_user.email.clone();
             let to_user_email = to_user.email.clone();
+            /*let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
+            let from_user_email = from_user.email.clone();
+            let to_user_email = to_user.email.clone();*/
 
             let notify_sender = self.telegram_sender.clone();
 
@@ -2286,11 +2292,16 @@ impl WebbookBot {
                 let mut successfully_transferred = 0;
                 for seat_id in seats_to_transfer {
                     // Check seat limit
-                    if d_seats_limit > 0 && to_user.held_seats.lock().len() >= d_seats_limit {
+                    if to_user_seat_limit > 0
+                        && to_user.held_seats.lock().len() >= to_user_seat_limit
+                    {
                         log_sender
                             .send((
                                 to_user_index,
-                                format!("⚠️ Reached limit of {} seats, stopping", d_seats_limit),
+                                format!(
+                                    "⚠️ Reached limit of {} seats, stopping",
+                                    to_user_seat_limit
+                                ),
                             ))
                             .ok();
                         break;
@@ -3254,7 +3265,7 @@ impl WebbookBot {
                 .show(ui, |ui| {
                     // Use a grid for better layout control
                     egui::Grid::new("sections_grid")
-                        .num_columns(10)
+                        .num_columns(20)
                         .spacing([5.0, 5.0])
                         .show(ui, |ui| {
                             for (index, section) in sections_to_display.iter().enumerate() {
@@ -3265,7 +3276,7 @@ impl WebbookBot {
                                 }
 
                                 // End row after 10 items
-                                if (index + 1) % 10 == 0 {
+                                if (index + 1) % 20 == 0 {
                                     ui.end_row();
                                 }
                             }
@@ -3329,10 +3340,12 @@ impl WebbookBot {
         let pay_width = available_width * 0.07;
         let pay2_width = available_width * 0.07;
         let payment_status_width = available_width * 0.09;
+        let table_height = ui.available_height();
 
         TableBuilder::new(ui)
             .striped(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .max_scroll_height(table_height)
             .column(Column::exact(checkbox_width)) // <-- ADD checkbox column
             .column(Column::exact(email_width))
             .column(Column::exact(type_width))
@@ -3495,7 +3508,7 @@ impl WebbookBot {
         self.initiate_parallel_payment(selected_user_indices);
     }
 
-    // NEW function to orchestrate the parallel payment process
+
     fn initiate_parallel_payment(&mut self, user_indices: Vec<usize>) {
         let mut payloads = Vec::new();
         if let Some(bot_manager) = &self.bot_manager {
@@ -3506,7 +3519,6 @@ impl WebbookBot {
                             ui_user.pay_status = "⏳ Processing...".to_string();
                             self.payment_in_progress.lock().insert(index);
                         }
-
                         payloads.push(ParallelPaymentUserPayload {
                             user_index: index,
                             seats: self.users[index].held_seats.clone(),
@@ -3524,7 +3536,10 @@ impl WebbookBot {
 
         let request_payload = ParallelPaymentRequest { users: payloads };
 
+        // --- FIX: Moved CAPTCHA logic inside the async task below ---
+
         if let (Some(rt), Some(log_sender)) = (&self.rt, &self.log_sender) {
+            // --- Clone all necessary variables for the async task ---
             let bot_manager_clone = self.bot_manager.clone().unwrap();
             let log_sender_clone = log_sender.clone();
             let telegram_sender_clone = self.telegram_sender.clone().unwrap();
@@ -3532,7 +3547,6 @@ impl WebbookBot {
             let payment_in_progress_clone = self.payment_in_progress.clone();
             let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
 
-            // Create maps to pass user info into the async block
             let users_info: HashMap<usize, (String, String)> = self
                 .users
                 .iter()
@@ -3541,6 +3555,25 @@ impl WebbookBot {
                 .collect();
 
             rt.spawn(async move {
+                // --- FIX: CAPTCHA check is now the FIRST step inside the async task ---
+                let site_key_exists = bot_manager_clone.shared_data.read().await.recaptcha_site_key.is_some();
+                if !site_key_exists {
+                    // Log a general message, as this is a one-time check for the batch
+                    log_sender_clone.send((0, "🔑 Captcha site key not found, fetching...".to_string())).ok();
+                    if let Err(e) = bot_manager_clone.extract_recaptcha_site_key().await {
+                        log_sender_clone.send((0, format!("❌ Failed to get site key: {}. Aborting payment.", e))).ok();
+                        // Clean up "in progress" status for all users in this batch
+                        for user in &request_payload.users {
+                            payment_in_progress_clone.lock().remove(&user.user_index);
+                        }
+                        return;
+                    }
+                    log_sender_clone.send((0, "✅ Captcha site key fetched successfully.".to_string())).ok();
+                } else {
+                    log_sender_clone.send((0, "✅ Using cached captcha site key.".to_string())).ok();
+                }
+
+                // --- The rest of the original async logic follows ---
                 let client = reqwest::Client::new();
                 match client
                     .post("http://localhost:3000/findSeatsForUsers")
@@ -3554,9 +3587,7 @@ impl WebbookBot {
                                 Ok(users_with_seats) => {
                                     let mut tasks = Vec::new();
                                     for user_data in users_with_seats {
-                                        if let Some((email, user_type)) =
-                                            users_info.get(&user_data.user_index)
-                                        {
+                                        if let Some((email, user_type)) = users_info.get(&user_data.user_index) {
                                             let task = Self::process_payment_for_user(
                                                 user_data.user_index,
                                                 user_data.selectable,
@@ -3574,10 +3605,7 @@ impl WebbookBot {
                                     }
                                     futures::future::join_all(tasks).await;
                                 }
-                                Err(e) => println!(
-                                    "Error parsing response from /findSeatsForUsers: {}",
-                                    e
-                                ),
+                                Err(e) => println!("Error parsing response from /findSeatsForUsers: {}", e),
                             }
                         } else {
                             println!("HTTP Error from /findSeatsForUsers: {}", response.status());
@@ -3588,8 +3616,8 @@ impl WebbookBot {
             });
         }
     }
+    // In impl WebbookBot
 
-    // This is the REFACTORED payment logic with a 3-attempt retry loop
     async fn process_payment_for_user(
         user_index: usize,
         selectable_seats: Vec<Value>,
@@ -3603,195 +3631,213 @@ impl WebbookBot {
         d_seats_limit: usize,
     ) {
         let bot_user = &bot_manager.users[user_index];
-        /*let site_key = match bot_manager.shared_data.read().await.recaptcha_site_key.clone() {
+        let site_key = match bot_manager.shared_data.read().await.recaptcha_site_key.clone() {
             Some(key) => key,
             None => {
                 log_sender.send((user_index, "❌ No reCAPTCHA site key available.".to_string())).ok();
                 payment_in_progress.lock().remove(&user_index);
                 return;
             }
-        };*/
+        };
+        println!("{}",site_key);
+        // --- 1. CAPTCHA Solving Section with Retry Loop ---
+        let captcha_solution = {
+            let mut solution = None;
+            for attempt in 1..=3 {
+                log_sender
+                    .send((
+                        user_index,
+                        format!("🧩 Solving CAPTCHA (Attempt {}/3)...", attempt),
+                    ))
+                    .ok();
 
-        for attempt in 1..=3 {
-            log_sender
-                .send((user_index, format!("💳 Payment attempt {}/3...", attempt)))
-                .ok();
-
-            let captcha_solver = CaptchaSolver::new();
-            let captcha_solution = match captcha_solver
-                .solve(
-                    "https://webook.com/",
-                    "6LcvYHooAAAAAC-G46bpymJKtIwfDQpg9DsHPMpL",
-                )
-                .await
-            {
-                Ok(solution) => {
-                    log_sender
-                        .send((user_index, "✅ CAPTCHA solved.".to_string()))
-                        .ok();
-                    solution
+                let captcha_solver = CaptchaSolver::new();
+                match captcha_solver
+                    .solve(
+                        "https://webook.com/",
+                        &site_key,
+                    )
+                    .await
+                {
+                    Ok(s) => {
+                        log_sender
+                            .send((user_index, "✅ CAPTCHA solved successfully.".to_string()))
+                            .ok();
+                        solution = Some(s);
+                        break; // --- Success, so we exit the CAPTCHA loop ---
+                    }
+                    Err(e) => {
+                        log_sender
+                            .send((
+                                user_index,
+                                format!("❌ CAPTCHA failed (attempt {}): {}", attempt, e),
+                            ))
+                            .ok();
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        // Loop will continue to the next attempt
+                    }
                 }
-                Err(e) => {
+            }
+            solution
+        };
+
+        // --- 2. Check if CAPTCHA was solved ---
+        // If 'captcha_solution' is None, it means all 3 attempts failed.
+        let captcha_solution = match captcha_solution {
+            Some(s) => s,
+            None => {
+                log_sender
+                    .send((
+                        user_index,
+                        "❌ All CAPTCHA attempts failed. Aborting payment.".to_string(),
+                    ))
+                    .ok();
+                payment_in_progress.lock().remove(&user_index); // Cleanup
+                return; // Exit the function
+            }
+        };
+
+        // --- 3. Payment Processing Section (runs only ONCE) ---
+        // This part is the same as before, but it's no longer inside a loop.
+        log_sender
+            .send((user_index, "💳 Proceeding to payment...".to_string()))
+            .ok();
+
+        let selected_seats_value = match serde_json::to_value(selectable_seats.clone()) {
+            Ok(v) => v,
+            Err(_) => {
+                log_sender
+                    .send((user_index, "❌ Failed to serialize seat data".to_string()))
+                    .ok();
+                payment_in_progress.lock().remove(&user_index);
+                return;
+            }
+        };
+
+        let selected_seats_json_string = selected_seats_value.to_string();
+
+        let token_data = match bot_user.token_manager.get_valid_token(&bot_user.email) {
+            Some(token) => token,
+            None => {
+                log_sender
+                    .send((user_index, "❌ No valid token for payment.".to_string()))
+                    .ok();
+                payment_in_progress.lock().remove(&user_index);
+                return;
+            }
+        };
+        let event_id = match &bot_user.shared_data.read().await.event_id {
+            Some(id) => id.clone(),
+            None => {
+                log_sender
+                    .send((user_index, "❌ Event ID not found.".to_string()))
+                    .ok();
+                payment_in_progress.lock().remove(&user_index);
+                return;
+            }
+        };
+
+        let checkout_payload = json!({
+            "event_id": event_id,
+            "season_id": event_id,
+            "redirect": "https://webook.com/en/payment-success",
+            "redirect_failed": "https://webook.com/en/payment-failed",
+            "booking_source": "rs-web",
+            "lang": "en",
+            "payment_method": "credit_card",
+            "is_wallet": false,
+            "saudi_redeem": null,
+            "is_mada": false,
+            "is_amex": false,
+            "perks": [],
+            "merchandise": [],
+            "addons":[],
+            "vouchers":[],
+            "holdToken":"",
+            "selectedSeats": selected_seats_json_string,
+            "captcha": captcha_solution, // Use the successfully solved captcha
+            "app_source": "rs",
+            "tpp_cart_id": null,
+            "utm_wbk_wa_session_id": token_data.session_id
+        });
+
+        let checkout_url = "https://api.webook.com/api/v2/event-seat/checkout?lang=en";
+        let response = bot_user
+            .client
+            .post(checkout_url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", token_data.access_token),
+            )
+            .header("token", &token_data.token)
+            .json(&checkout_payload)
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let status = resp.status();
+                let body_text = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    if let Ok(data) = serde_json::from_str::<Value>(&body_text) {
+                        if let Some(link) = data
+                            .get("data")
+                            .and_then(|d| d.get("redirect_url"))
+                            .and_then(|l| l.as_str())
+                        {
+                            log_sender
+                                .send((user_index, format!("✅ Payment link: {}", link)))
+                                .ok();
+                            let held_seats = bot_manager.users[user_index].held_seats.lock();
+                            let seats_count = held_seats.len();
+                            let seat_list: Vec<String> = held_seats.clone();
+                            payment_sender.send(user_index).ok();
+
+                            let message = if user_type == "+"
+                                && d_seats_limit > 0
+                                && seats_count >= d_seats_limit
+                            {
+                                format!(
+                                    "⚠️ PAYMENT REQUIRED (LIMIT REACHED)\n━━━━━━━━━━━━━━━━━\n🔧 User: {} (Type: +)\n🎫 Seats: {} (Limit reached)\n💰 Must pay now!\n🔗 Payment: {}\n━━━━━━━━━━━━━━━━━",
+                                    user_email, seats_count, link
+                                )
+                            } else {
+                                let seats_formatted = seat_list.join("\n");
+                                format!(
+                                    "💳 PAYMENT LINK GENERATED\n━━━━━━━━━━━━━━━━━\n🔧 User: {}\n🎫 Seats ({}):\n{}\n🔗 Link: {}\n━━━━━━━━━━━━━━━━━",
+                                    user_email, seats_count, seats_formatted, link
+                                )
+                            };
+                            telegram_sender
+                                .send(TelegramMessage {
+                                    text: message,
+                                    chat_id: 4814580777,
+                                })
+                                .ok();
+                        }
+                    }
+                } else {
                     log_sender
                         .send((
                             user_index,
-                            format!("❌ CAPTCHA failed (attempt {}): {}", attempt, e),
+                            format!("❌ Checkout failed with status {}: {}", status, body_text),
                         ))
-                        .ok();
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    continue; // Next attempt
-                }
-            };
-
-            let selected_seats_value = match serde_json::to_value(selectable_seats.clone()) {
-                Ok(v) => v,
-                Err(_) => {
-                    log_sender
-                        .send((user_index, "❌ Failed to serialize seat data".to_string()))
-                        .ok();
-                    continue;
-                }
-            };
-
-            let selected_seats_json_string = selected_seats_value.to_string();
-
-            let token_data = match bot_user.token_manager.get_valid_token(&bot_user.email) {
-                Some(token) => token,
-                None => {
-                    log_sender
-                        .send((user_index, "❌ No valid token for payment.".to_string()))
-                        .ok();
-                    break;
-                }
-            };
-            let event_id = match &bot_user.shared_data.read().await.event_id {
-                Some(id) => id.clone(),
-                None => {
-                    log_sender
-                        .send((user_index, "❌ Event ID not found.".to_string()))
-                        .ok();
-                    break;
-                }
-            };
-
-            let checkout_payload = json!({
-                "event_id": event_id,
-                "season_id": event_id,
-                "redirect": "https://webook.com/en/payment-success",
-                "redirect_failed": "https://webook.com/en/payment-failed",
-                "booking_source": "rs-web",
-                "lang": "en",
-                "payment_method": "credit_card",
-                "is_wallet": false,
-                "saudi_redeem": null,
-                "is_mada": false,
-                "is_amex": false,
-                "perks": [],
-                "merchandise": [],
-                "addons":[],
-                "vouchers":[],
-                "holdToken":"",
-                "selectedSeats": selected_seats_json_string,
-                "captcha": captcha_solution,
-                "app_source": "rs",
-                "tpp_cart_id": null,
-                "utm_wbk_wa_session_id": token_data.session_id
-            });
-            println!("{}", checkout_payload);
-            println!("=================================================================");
-
-            let checkout_url = "https://api.webook.com/api/v2/event-seat/checkout?lang=en";
-            let response = bot_user
-                .client
-                .post(checkout_url)
-                .header(
-                    "Authorization",
-                    format!("Bearer {}", token_data.access_token),
-                )
-                .header("token", &token_data.token)
-                .json(&checkout_payload)
-                .send()
-                .await;
-
-            match response {
-                Ok(resp) => {
-                    let status = resp.status();
-                    println!("user_index: {} {}", user_index, status);
-                    let body_text = resp.text().await.unwrap_or_default();
-                    println!("{}", body_text);
-                    if status.is_success() {
-                        if let Ok(data) = serde_json::from_str::<Value>(&body_text) {
-                            if let Some(link) = data
-                                .get("data")
-                                .and_then(|d| d.get("redirect_url"))
-                                .and_then(|l| l.as_str())
-                            {
-                                log_sender
-                                    .send((user_index, format!("✅ Payment link: {}", link)))
-                                    .ok();
-                                let held_seats = bot_manager.users[user_index].held_seats.lock();
-                                let seats_count = held_seats.len();
-                                let seat_list: Vec<String> = held_seats.clone();
-                                payment_sender.send(user_index).ok();
-
-                                let message = if user_type == "+"
-                                    && d_seats_limit > 0
-                                    && seats_count >= d_seats_limit
-                                {
-                                    format!(
-                                        "⚠️ PAYMENT REQUIRED (LIMIT REACHED)\n\
-                                        ━━━━━━━━━━━━━━━━━\n\
-                                        🔧 User: {} (Type: +)\n\
-                                        🎫 Seats: {} (Limit reached)\n\
-                                        💰 Must pay now!\n\
-                                        🔗 Payment: {}\n\
-                                        ━━━━━━━━━━━━━━━━━",
-                                        user_email, seats_count, link
-                                    )
-                                } else {
-                                    let seats_formatted = seat_list.join("\n");
-                                    format!(
-                                        "💳 PAYMENT LINK GENERATED\n\
-                                        ━━━━━━━━━━━━━━━━━\n\
-                                        🔧 User: {}\n\
-                                        🎫 Seats ({}):\n{}\n\
-                                        🔗 Link: {}\n\
-                                        ━━━━━━━━━━━━━━━━━",
-                                        user_email, seats_count, seats_formatted, link
-                                    )
-                                };
-                                telegram_sender
-                                    .send(TelegramMessage {
-                                        text: message,
-                                        chat_id: 4814580777, // Payment group
-                                    })
-                                    .ok();
-                                break; // SUCCESS, exit retry loop
-                            }
-                        }
-                        break;
-                    } else {
-                        println!("{:?}", body_text);
-                    }
-                }
-                Err(e) => {
-                    println!("{:?}", e);
-                    log_sender
-                        .send((user_index, format!("❌ Checkout request error: {}", e)))
                         .ok();
                 }
             }
-            if attempt == 3 {
+            Err(e) => {
                 log_sender
-                    .send((user_index, "❌ All payment attempts failed.".to_string()))
+                    .send((user_index, format!("❌ Checkout request error: {}", e)))
                     .ok();
             }
         }
+
+        // Final cleanup
         payment_in_progress.lock().remove(&user_index);
     }
-
+    // This is the REFACTORED payment logic with a 3-attempt retry loop
     // MODIFIED to use the new process_payment_for_user function
-    fn handle_payment_click(&mut self, user_index: usize) {
+    async fn handle_payment_click(&mut self, user_index: usize) {
         if self.users[user_index].payment_completed {
             if let Some(log_sender) = &self.log_sender {
                 log_sender
@@ -3830,22 +3876,21 @@ impl WebbookBot {
             log_sender_clone
                 .send((user_index, "💳 Generating payment link...".to_string()))
                 .ok();
-
+            let site_key_exists = bot_manager_clone.shared_data.read().await.recaptcha_site_key.is_some();
+            if !site_key_exists {
+                log_sender_clone.send((user_index, "🔑 Captcha site key not found, fetching...".to_string())).ok();
+                if let Err(e) = bot_manager_clone.extract_recaptcha_site_key().await {
+                    log_sender_clone.send((user_index, format!("❌ Failed to get site key: {}. Aborting payment.", e))).ok();
+                    payment_in_progress_clone.lock().remove(&user_index);
+                    // TODO: Update UI status back to "Pay" via a channel if desired
+                    return;
+                }
+                log_sender_clone.send((user_index, "✅ Captcha site key fetched successfully.".to_string())).ok();
+            } else {
+                log_sender_clone.send((user_index, "✅ Using cached captcha site key.".to_string())).ok();
+            }
             rt.spawn(async move {
                 // 1. Check for captcha site key, fetch if missing.
-                /*let site_key_exists = bot_manager_clone.shared_data.read().await.recaptcha_site_key.is_some();
-                if !site_key_exists {
-                    log_sender_clone.send((user_index, "🔑 Captcha site key not found, fetching...".to_string())).ok();
-                    if let Err(e) = bot_manager_clone.extract_recaptcha_site_key().await {
-                        log_sender_clone.send((user_index, format!("❌ Failed to get site key: {}. Aborting payment.", e))).ok();
-                        payment_in_progress_clone.lock().remove(&user_index);
-                        // TODO: Update UI status back to "Pay" via a channel if desired
-                        return;
-                    }
-                    log_sender_clone.send((user_index, "✅ Captcha site key fetched successfully.".to_string())).ok();
-                } else {
-                     log_sender_clone.send((user_index, "✅ Using cached captcha site key.".to_string())).ok();
-                }*/
 
                 // 2. Proceed with existing logic
                 let bot_user = &bot_manager_clone.users[user_index];
@@ -4426,25 +4471,30 @@ impl WebbookBot {
         result
     }
 }
+// In main.rs
+
 impl eframe::App for WebbookBot {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Set dark theme
+        // Set theme
         ctx.set_visuals(egui::Visuals::light());
         self.ctx = Some(ctx.clone());
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        // --- CHANGE 1: TOP PANEL for controls ---
+        // This panel will stick to the top.
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 8.0);
+            self.render_top_panel(ui);
+        });
 
-            // Top panel with controls
-            let top_panel_response = ui.allocate_ui_with_layout(
-                egui::Vec2::new(ui.available_width(), 0.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    self.render_top_panel(ui);
-                },
-            );
+        // --- CHANGE 2: BOTTOM PANEL for status bar ---
+        // This panel will stick to the bottom.
+        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
+            self.render_status_bar(ui);
+        });
 
-            ui.add_space(10.0);
+        // --- CHANGE 3: CENTRAL PANEL for the main content (the table) ---
+        // This panel automatically fills all remaining space between the top and bottom panels.
+        egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Pay Selected").clicked() {
                     self.handle_pay_selected_click();
@@ -4452,51 +4502,26 @@ impl eframe::App for WebbookBot {
             });
             ui.separator();
 
-            // Calculate remaining height for table
-            let available_rect = ui.available_rect_before_wrap();
-            let status_bar_height = 30.0; // Reserve space for status bar
-            let table_height = available_rect.height() - status_bar_height - 20.0; // 20.0 for spacing
-
-            // Main table with dynamic sizing
+            // The ScrollArea now lives inside the CentralPanel.
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .id_source("table_scroll")
-                .max_height(table_height)
                 .show(ui, |ui| {
-                    // Make table take full width
-                    ui.allocate_ui_with_layout(
-                        egui::Vec2::new(ui.available_width(), 0.0),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            self.render_user_table(ui);
-                        },
-                    );
+                    self.render_user_table(ui);
                 });
-
-            // Status bar at bottom - reserve the space we calculated
-            ui.allocate_ui_with_layout(
-                egui::Vec2::new(ui.available_width(), status_bar_height),
-                egui::Layout::bottom_up(egui::Align::LEFT),
-                |ui| {
-                    self.render_status_bar(ui);
-                },
-            );
         });
 
-        // Handle telegram dialogs - JUST CALL THE METHODS HERE
+        // --- This logic remains the same ---
         self.handle_telegram_dialogs();
         if self.show_telegram_dialog {
             self.show_telegram_dialog_ui(ctx);
         }
 
-        // ADD THIS BLOCK HERE:
         if self.bot_running {
             self.receive_bot_manager();
             self.update_countdowns();
             self.update_assigned_seats();
             self.update_logs();
-            self.update_payment_status(); // ADD THIS LINE
-
+            self.update_payment_status();
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         if self.show_transfer_modal {
