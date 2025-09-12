@@ -1,0 +1,422 @@
+[
+  {
+    "inSelectableChannel": true,
+    "hashedChannelKey": "f8b8666b96bbdb2916c1eb3e20f042c487c32cae",
+    "label": "107-28-18",
+    "id": "107-28-18",
+    "uuid": "uuid62754",
+    "labels": {
+      "own": "18",
+      "parent": "28",
+      "section": "107",
+      "displayedLabel": "107-28-18"
+    },
+    "disabledBySocialDistancingRules": false,
+    "objectType": "Seat",
+    "selected": true,
+    "accessible": false,
+    "restrictedView": false,
+    "liftUpArmrests": false,
+    "companionSeat": false,
+    "semiAmbulatorySeat": false,
+    "hearingImpaired": false,
+    "plusSize": false,
+    "category": {
+      "label": "CAT 3",
+      "color": "#86B737",
+      "accessible": false,
+      "key": 5,
+      "pricing": {
+        "price": 20,
+        "formattedPrice": "[SAR]20"
+      },
+      "isFiltered": false,
+      "hasSelectableObjects": true,
+      "selectableObjectsStatuses": [
+        "free"
+      ]
+    },
+    "pricing": {
+      "price": 20,
+      "formattedPrice": "[SAR]20"
+    },
+    "selectable": true,
+    "status": "reservedByToken",
+    "forSale": true,
+    "dataPerEvent": {
+      "Al-Ahli-Saudi-FC-Nasaf": {
+        "status": "reservedByToken"
+      }
+    },
+    "seasonStatusOverriddenQuantity": 0,
+    "entrance": "3,GA1,1",
+    "previousStatus": "free",
+    "center": {
+      "x": 8475.220000000001,
+      "y": 4768.08
+    },
+    "isOrphan": false,
+    "parent": {
+      "type": "row"
+    },
+    "seatId": "107-28-18",
+    "chart": {
+      "config": {},
+      "iframe": {},
+      "embedType": "Renderer",
+      "selectedObjectsInput": null,
+      "storage": {
+        "key": "seatsio"
+      },
+      "selectedSeats": [
+        "107-28-18",
+        "107-28-17",
+        "107-28-16"
+      ],
+      "selectedObjects": [
+        "107-28-18",
+        "107-28-17",
+        "107-28-16"
+      ],
+      "holdToken": "e4bf8336-90d1-4e9c-ad14-b765bf662bb9",
+      "reservationToken": "e4bf8336-90d1-4e9c-ad14-b765bf662bb9",
+      "requestIdCtr": 0,
+      "requestCallbacks": {},
+      "requestErrorCallbacks": {},
+      "state": "RENDERED",
+      "initialContainerDimensions": {
+        "width": 974.4,
+        "height": 0
+      },
+      "domElementListener": {
+        "positionInViewportChangedListener": null,
+        "maxSize": 4096,
+        "lastDimensions": {
+          "width": 974.4,
+          "height": 796.6
+        },
+        "lastPositionInViewport": {
+          "top": 180.8000030517578,
+          "bottom": 977.4000396728516,
+          "right": 1049.2000274658203,
+          "left": 74.80000305175781
+        },
+        "stopRequested": true,
+        "elementIsVisible": true,
+        "lastViewportWidth": 1536,
+        "lastViewportHeight": 739
+      },
+      "iframeElementListener": {
+        "widthChangedListener": null,
+        "dimensionsChangedListener": null,
+        "elementMadeVisibleListener": null,
+        "elementMadeInvisibleListener": null,
+        "maxSize": null,
+        "maxSizeExceededListener": null,
+        "lastDimensions": {
+          "width": 974.4,
+          "height": 796.6
+        },
+        "lastPositionInViewport": {
+          "top": 180.8000030517578,
+          "bottom": 977.4000396728516,
+          "right": 1049.2000274658203,
+          "left": 74.80000305175781
+        },
+        "stopRequested": true,
+        "elementIsVisible": null,
+        "lastViewportWidth": 1536,
+        "lastViewportHeight": 739
+      },
+      "errorSentToDataCollector": false,
+      "seatsioLoadedDeferred": {
+        "promise": {}
+      },
+      "containerVisible": {
+        "promise": {}
+      },
+      "renderingStart": "2025-09-12T10:58:39.632Z",
+      "loadingScreen": {}
+    }
+  },
+  {
+    "inSelectableChannel": true,
+    "hashedChannelKey": "f8b8666b96bbdb2916c1eb3e20f042c487c32cae",
+    "label": "107-28-17",
+    "id": "107-28-17",
+    "uuid": "uuid62753",
+    "labels": {
+      "own": "17",
+      "parent": "28",
+      "section": "107",
+      "displayedLabel": "107-28-17"
+    },
+    "disabledBySocialDistancingRules": false,
+    "objectType": "Seat",
+    "selected": true,
+    "accessible": false,
+    "restrictedView": false,
+    "liftUpArmrests": false,
+    "companionSeat": false,
+    "semiAmbulatorySeat": false,
+    "hearingImpaired": false,
+    "plusSize": false,
+    "category": {
+      "label": "CAT 3",
+      "color": "#86B737",
+      "accessible": false,
+      "key": 5,
+      "pricing": {
+        "price": 20,
+        "formattedPrice": "[SAR]20"
+      },
+      "isFiltered": false,
+      "hasSelectableObjects": true,
+      "selectableObjectsStatuses": [
+        "free"
+      ]
+    },
+    "pricing": {
+      "price": 20,
+      "formattedPrice": "[SAR]20"
+    },
+    "selectable": true,
+    "status": "reservedByToken",
+    "forSale": true,
+    "dataPerEvent": {
+      "Al-Ahli-Saudi-FC-Nasaf": {
+        "status": "reservedByToken"
+      }
+    },
+    "seasonStatusOverriddenQuantity": 0,
+    "entrance": "3,GA1,1",
+    "previousStatus": "free",
+    "center": {
+      "x": 8475.220000000001,
+      "y": 4789.08
+    },
+    "isOrphan": false,
+    "parent": {
+      "type": "row"
+    },
+    "seatId": "107-28-17",
+    "chart": {
+      "config": {},
+      "iframe": {},
+      "embedType": "Renderer",
+      "selectedObjectsInput": null,
+      "storage": {
+        "key": "seatsio"
+      },
+      "selectedSeats": [
+        "107-28-18",
+        "107-28-17",
+        "107-28-16"
+      ],
+      "selectedObjects": [
+        "107-28-18",
+        "107-28-17",
+        "107-28-16"
+      ],
+      "holdToken": "e4bf8336-90d1-4e9c-ad14-b765bf662bb9",
+      "reservationToken": "e4bf8336-90d1-4e9c-ad14-b765bf662bb9",
+      "requestIdCtr": 0,
+      "requestCallbacks": {},
+      "requestErrorCallbacks": {},
+      "state": "RENDERED",
+      "initialContainerDimensions": {
+        "width": 974.4,
+        "height": 0
+      },
+      "domElementListener": {
+        "positionInViewportChangedListener": null,
+        "maxSize": 4096,
+        "lastDimensions": {
+          "width": 974.4,
+          "height": 796.6
+        },
+        "lastPositionInViewport": {
+          "top": 180.8000030517578,
+          "bottom": 977.4000396728516,
+          "right": 1049.2000274658203,
+          "left": 74.80000305175781
+        },
+        "stopRequested": true,
+        "elementIsVisible": true,
+        "lastViewportWidth": 1536,
+        "lastViewportHeight": 739
+      },
+      "iframeElementListener": {
+        "widthChangedListener": null,
+        "dimensionsChangedListener": null,
+        "elementMadeVisibleListener": null,
+        "elementMadeInvisibleListener": null,
+        "maxSize": null,
+        "maxSizeExceededListener": null,
+        "lastDimensions": {
+          "width": 974.4,
+          "height": 796.6
+        },
+        "lastPositionInViewport": {
+          "top": 180.8000030517578,
+          "bottom": 977.4000396728516,
+          "right": 1049.2000274658203,
+          "left": 74.80000305175781
+        },
+        "stopRequested": true,
+        "elementIsVisible": null,
+        "lastViewportWidth": 1536,
+        "lastViewportHeight": 739
+      },
+      "errorSentToDataCollector": false,
+      "seatsioLoadedDeferred": {
+        "promise": {}
+      },
+      "containerVisible": {
+        "promise": {}
+      },
+      "renderingStart": "2025-09-12T10:58:39.632Z",
+      "loadingScreen": {}
+    }
+  },
+  {
+    "inSelectableChannel": true,
+    "hashedChannelKey": "f8b8666b96bbdb2916c1eb3e20f042c487c32cae",
+    "label": "107-28-16",
+    "id": "107-28-16",
+    "uuid": "uuid62752",
+    "labels": {
+      "own": "16",
+      "parent": "28",
+      "section": "107",
+      "displayedLabel": "107-28-16"
+    },
+    "disabledBySocialDistancingRules": false,
+    "objectType": "Seat",
+    "selected": true,
+    "accessible": false,
+    "restrictedView": false,
+    "liftUpArmrests": false,
+    "companionSeat": false,
+    "semiAmbulatorySeat": false,
+    "hearingImpaired": false,
+    "plusSize": false,
+    "category": {
+      "label": "CAT 3",
+      "color": "#86B737",
+      "accessible": false,
+      "key": 5,
+      "pricing": {
+        "price": 20,
+        "formattedPrice": "[SAR]20"
+      },
+      "isFiltered": false,
+      "hasSelectableObjects": true,
+      "selectableObjectsStatuses": [
+        "free"
+      ]
+    },
+    "pricing": {
+      "price": 20,
+      "formattedPrice": "[SAR]20"
+    },
+    "selectable": true,
+    "status": "reservedByToken",
+    "forSale": true,
+    "dataPerEvent": {
+      "Al-Ahli-Saudi-FC-Nasaf": {
+        "status": "reservedByToken"
+      }
+    },
+    "seasonStatusOverriddenQuantity": 0,
+    "entrance": "3,GA1,1",
+    "previousStatus": "free",
+    "center": {
+      "x": 8475.220000000001,
+      "y": 4810.08
+    },
+    "isOrphan": false,
+    "parent": {
+      "type": "row"
+    },
+    "seatId": "107-28-16",
+    "chart": {
+      "config": {},
+      "iframe": {},
+      "embedType": "Renderer",
+      "selectedObjectsInput": null,
+      "storage": {
+        "key": "seatsio"
+      },
+      "selectedSeats": [
+        "107-28-18",
+        "107-28-17",
+        "107-28-16"
+      ],
+      "selectedObjects": [
+        "107-28-18",
+        "107-28-17",
+        "107-28-16"
+      ],
+      "holdToken": "e4bf8336-90d1-4e9c-ad14-b765bf662bb9",
+      "reservationToken": "e4bf8336-90d1-4e9c-ad14-b765bf662bb9",
+      "requestIdCtr": 0,
+      "requestCallbacks": {},
+      "requestErrorCallbacks": {},
+      "state": "RENDERED",
+      "initialContainerDimensions": {
+        "width": 974.4,
+        "height": 0
+      },
+      "domElementListener": {
+        "positionInViewportChangedListener": null,
+        "maxSize": 4096,
+        "lastDimensions": {
+          "width": 974.4,
+          "height": 796.6
+        },
+        "lastPositionInViewport": {
+          "top": 180.8000030517578,
+          "bottom": 977.4000396728516,
+          "right": 1049.2000274658203,
+          "left": 74.80000305175781
+        },
+        "stopRequested": true,
+        "elementIsVisible": true,
+        "lastViewportWidth": 1536,
+        "lastViewportHeight": 739
+      },
+      "iframeElementListener": {
+        "widthChangedListener": null,
+        "dimensionsChangedListener": null,
+        "elementMadeVisibleListener": null,
+        "elementMadeInvisibleListener": null,
+        "maxSize": null,
+        "maxSizeExceededListener": null,
+        "lastDimensions": {
+          "width": 974.4,
+          "height": 796.6
+        },
+        "lastPositionInViewport": {
+          "top": 180.8000030517578,
+          "bottom": 977.4000396728516,
+          "right": 1049.2000274658203,
+          "left": 74.80000305175781
+        },
+        "stopRequested": true,
+        "elementIsVisible": null,
+        "lastViewportWidth": 1536,
+        "lastViewportHeight": 739
+      },
+      "errorSentToDataCollector": false,
+      "seatsioLoadedDeferred": {
+        "promise": {}
+      },
+      "containerVisible": {
+        "promise": {}
+      },
+      "renderingStart": "2025-09-12T10:58:39.632Z",
+      "loadingScreen": {}
+    }
+  }
+]
