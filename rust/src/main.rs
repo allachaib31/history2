@@ -2904,12 +2904,12 @@ impl WebbookBot {
             println!("Please load users first");
             return;
         }
-        if let Err(e) = self.start_node_process() {
+        /*if let Err(e) = self.start_node_process() {
             println!("Failed to start Node.js server: {}", e);
             return;
         }
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_secs(2));*/
 
         let star_user_limit: usize = self.seats.parse().unwrap_or(0);
         let plus_user_limit: usize = self.d_seats.parse().unwrap_or(0);
