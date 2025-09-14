@@ -118,8 +118,8 @@ pub struct WebbookBot {
     telegram_input: String,
     telegram_request_receiver: Option<mpsc::UnboundedReceiver<TelegramRequest>>,
     telegram_response_sender: Option<mpsc::UnboundedSender<String>>,
-    payment_status_sender: Option<mpsc::UnboundedSender<usize>>,
-    payment_status_receiver: Option<mpsc::UnboundedReceiver<usize>>,
+    payment_status_sender: Option<mpsc::UnboundedSender<(usize, usize)>>, // (user_index, paid_count)
+    payment_status_receiver: Option<mpsc::UnboundedReceiver<(usize, usize)>>,
     paid_users: Arc<Mutex<HashSet<usize>>>,
     payment_in_progress: Arc<Mutex<HashSet<usize>>>, // <-- ADD THIS LINE
 }
@@ -156,6 +156,10 @@ struct User {
     payment_completed: bool,
     #[serde(skip)] // <-- ADD THIS LINE
     selected: bool,
+    #[serde(skip)]
+    paid_seats: Vec<String>, // Track which seats are already paid for
+    #[serde(skip)] 
+    remaining_seat_limit: usize, 
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -261,6 +265,8 @@ impl Default for User {
             max_seats: 0, // Add this
             payment_completed: false,
             selected: false,
+            paid_seats: Vec::new(),
+            remaining_seat_limit: 0,
         }
     }
 }
@@ -328,6 +334,108 @@ impl BotUser {
             held_seats: Arc::new(Mutex::new(Vec::new())),
             prepared_request: Arc::new(Mutex::new(None)),
         })
+    }
+    // Add this new function to impl BotUser
+    async fn refresh_token_with_retries(
+        &self,
+        log_sender: &mpsc::UnboundedSender<(usize, String)>,
+        user_index: usize,
+        channel_keys: Vec<String>,
+    ) -> bool {
+        // Step 1: Try to get hold token (3 attempts)
+        let mut hold_token_success = false;
+        for attempt in 1..=3 {
+            log_sender
+                .send((
+                    user_index,
+                    format!("🔄 Getting hold token (Attempt {}/3)...", attempt),
+                ))
+                .ok();
+                
+            match self.get_webook_hold_token().await {
+                Ok(_) => {
+                    log_sender
+                        .send((user_index, "✅ Hold token acquired successfully".to_string()))
+                        .ok();
+                    hold_token_success = true;
+                    break;
+                }
+                Err(e) => {
+                    log_sender
+                        .send((
+                            user_index,
+                            format!("❌ Hold token attempt {}/3 failed: {}", attempt, e),
+                        ))
+                        .ok();
+                    if attempt < 3 {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
+        
+        if !hold_token_success {
+            log_sender
+                .send((
+                    user_index,
+                    "❌ All hold token attempts failed. Starting 600s countdown.".to_string(),
+                ))
+                .ok();
+            self.expire_time.store(600, Ordering::Relaxed);
+            return false;
+        }
+        
+        // Step 2: Prepare request template
+        if let Ok(template) = self.prepare_request_template(channel_keys).await {
+            *self.prepared_request.lock() = Some(template);
+            log_sender
+                .send((user_index, "✅ Request template prepared".to_string()))
+                .ok();
+        }
+        
+        // Step 3: Try to get expire time (3 attempts)
+        let mut expire_success = false;
+        for attempt in 1..=3 {
+            log_sender
+                .send((
+                    user_index,
+                    format!("⏰ Getting expire time (Attempt {}/3)...", attempt),
+                ))
+                .ok();
+                
+            match self.get_expire_time().await {
+                Ok(_) => {
+                    log_sender
+                        .send((user_index, "✅ Expire time acquired successfully".to_string()))
+                        .ok();
+                    expire_success = true;
+                    break;
+                }
+                Err(e) => {
+                    log_sender
+                        .send((
+                            user_index,
+                            format!("❌ Expire time attempt {}/3 failed: {}", attempt, e),
+                        ))
+                        .ok();
+                    if attempt < 3 {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+        
+        if !expire_success {
+            log_sender
+                .send((
+                    user_index,
+                    "⚠️ Expire time failed. Starting 600s countdown.".to_string(),
+                ))
+                .ok();
+            self.expire_time.store(600, Ordering::Relaxed);
+        }
+        
+        true // Hold token was successful
     }
     // ADD THIS FUNCTION INSIDE `impl BotUser`
     async fn update_profile(&self, favorite_team_id: &str) -> Result<()> {
@@ -1348,7 +1456,7 @@ impl WebbookBot {
         let (telegram_request_sender, telegram_request_receiver) = mpsc::unbounded_channel();
         let (telegram_response_sender, telegram_response_receiver) = mpsc::unbounded_channel(); // --- ADD THIS ---
         let selected_sections_shared = Arc::new(Mutex::new(HashMap::new()));
-        let (payment_status_sender, payment_status_receiver) = mpsc::unbounded_channel();
+        let (payment_status_sender, payment_status_receiver) = mpsc::unbounded_channel::<(usize, usize)>();
 
         // --- ADD THIS BLOCK to start the Telegram client ---
         rt.spawn(async move {
@@ -1710,10 +1818,15 @@ impl WebbookBot {
                         let is_eligible = if ui_user.user_type == "*" || ui_user.user_type == "+" {
                             let pending_map = pending_scanner_seats.lock();
                             let pending_count = *pending_map.get(&actual_user_index).unwrap_or(&0);
-
-                            // A limit of 0 means infinite seats.
-                            ui_user.max_seats == 0
-                                || (held_count + pending_count) < ui_user.max_seats
+                            
+                            // Calculate effective limit: original limit - paid seats
+                            let effective_limit = if ui_user.paid_seats.is_empty() {
+                                ui_user.max_seats
+                            } else {
+                                ui_user.remaining_seat_limit // This will be set after payment
+                            };
+                            
+                            effective_limit == 0 || (held_count + pending_count) < effective_limit
                         } else {
                             false
                         };
@@ -3448,8 +3561,21 @@ impl WebbookBot {
                         }
                     });
                     row.col(|ui| {
+                        // Calculate unpaid seats for this user
+                        let unpaid_seats_count = user.held_seats
+                            .iter()
+                            .filter(|seat| !user.paid_seats.contains(seat))
+                            .count();
+                        
+                        let button_enabled = !user.payment_completed && unpaid_seats_count > 0;
+                        let button_text = if unpaid_seats_count > 0 {
+                            format!("Pay2 ({})", unpaid_seats_count)
+                        } else {
+                            "Pay2".to_string()
+                        };
+                        
                         if ui
-                            .add_enabled(!user.payment_completed, egui::Button::new("Pay2"))
+                            .add_enabled(button_enabled, egui::Button::new(button_text))
                             .clicked()
                         {
                             pay2_button_clicked_for = Some(user_index);
@@ -3519,9 +3645,15 @@ impl WebbookBot {
                             ui_user.pay_status = "⏳ Processing...".to_string();
                             self.payment_in_progress.lock().insert(index);
                         }
+                        let unpaid_seats: Vec<String> = self.users[index].held_seats
+                            .iter()
+                            .filter(|seat| !self.users[index].paid_seats.contains(seat))
+                            .cloned()
+                            .collect();
+
                         payloads.push(ParallelPaymentUserPayload {
                             user_index: index,
-                            seats: self.users[index].held_seats.clone(),
+                            seats: unpaid_seats, // Use unpaid_seats instead of all held_seats
                             hold_token,
                         });
                     }
@@ -3624,7 +3756,7 @@ impl WebbookBot {
         bot_manager: Arc<BotManager>,
         log_sender: mpsc::UnboundedSender<(usize, String)>,
         telegram_sender: mpsc::UnboundedSender<TelegramMessage>,
-        payment_sender: mpsc::UnboundedSender<usize>,
+        payment_sender: mpsc::UnboundedSender<(usize, usize)>, // <-- Updated to match new channel type
         payment_in_progress: Arc<Mutex<HashSet<usize>>>,
         user_email: String,
         user_type: String,
@@ -3639,7 +3771,7 @@ impl WebbookBot {
                 return;
             }
         };
-        println!("{}",site_key);
+        //println!("{}",site_key);
         // --- 1. CAPTCHA Solving Section with Retry Loop ---
         let captcha_solution = {
             let mut solution = None;
@@ -3702,8 +3834,13 @@ impl WebbookBot {
         log_sender
             .send((user_index, "💳 Proceeding to payment...".to_string()))
             .ok();
-
-        let selected_seats_value = match serde_json::to_value(selectable_seats.clone()) {
+        let total_seats = selectable_seats.len();
+        let original_limit: usize = d_seats_limit; // or get from user.max_seats
+        let seats_to_pay = std::cmp::min(total_seats, original_limit);
+        
+        // Only pay for the first N seats
+        let seats_for_payment: Vec<Value> = selectable_seats.into_iter().take(seats_to_pay).collect();
+        let selected_seats_value = match serde_json::to_value(seats_for_payment) {
             Ok(v) => v,
             Err(_) => {
                 log_sender
@@ -3788,11 +3925,27 @@ impl WebbookBot {
                             log_sender
                                 .send((user_index, format!("✅ Payment link: {}", link)))
                                 .ok();
+                            let bot_user = &bot_manager.users[user_index];
+                            let currently_held = bot_user.held_seats.lock().clone();
                             let held_seats = bot_manager.users[user_index].held_seats.lock();
                             let seats_count = held_seats.len();
                             let seat_list: Vec<String> = held_seats.clone();
-                            payment_sender.send(user_index).ok();
-
+                            let paid_count = seats_to_pay; 
+                            tokio::spawn({
+                                let bot_user_clone = bot_user.clone();
+                                let log_sender_clone = log_sender.clone();
+                                let user_index = user_index;
+                                async move {
+                                    // Use the robust token refresh with retries
+                                    bot_user_clone.refresh_token_with_retries(
+                                        &log_sender_clone,
+                                        user_index,
+                                        vec![], // You may need to pass proper channel_keys here
+                                    ).await;
+                                }
+                            });
+                            
+                            payment_sender.send((user_index, seats_to_pay)).ok(); // Send both values
                             let message = if user_type == "+"
                                 && d_seats_limit > 0
                                 && seats_count >= d_seats_limit
@@ -3944,35 +4097,57 @@ impl WebbookBot {
             }
             return;
         }
+    
+        // Calculate unpaid seats count for Method 2
+        let unpaid_seats_count = self.users[user_index].held_seats
+            .iter()
+            .filter(|seat| !self.users[user_index].paid_seats.contains(seat))
+            .count();
+    
+        if unpaid_seats_count == 0 {
+            if let Some(log_sender) = &self.log_sender {
+                log_sender
+                    .send((
+                        user_index,
+                        "ℹ️ No unpaid seats to process".to_string(),
+                    ))
+                    .ok();
+            }
+            return;
+        }
+    
         self.payment_in_progress.lock().insert(user_index);
         self.users[user_index].pay_status = "⏳ Processing...".to_string();
+        
         if let (
-            Some(_bot_manager), // _bot_manager is not used, so prefix with underscore
+            Some(_bot_manager),
             Some(rt),
             Some(log_sender),
             Some(telegram_sender),
-            Some(payment_sender), // Now correctly declared
+            Some(payment_sender),
         ) = (
             &self.bot_manager,
             &self.rt,
             &self.log_sender,
             &self.telegram_sender,
-            &self.payment_status_sender, // And sourced from self
+            &self.payment_status_sender,
         ) {
             let log_sender_clone = log_sender.clone();
             let telegram_sender_clone = telegram_sender.clone();
-            let payment_sender_clone = payment_sender.clone(); // Clone the sender
+            let payment_sender_clone = payment_sender.clone();
             let user_email = self.users[user_index].email.clone();
             let user_password = self.users[user_index].password.clone();
             let user_proxy = self.users[user_index].proxy.clone();
             let event_url = self.event_url.clone();
-
+            let unpaid_count = unpaid_seats_count; // Store the count for the async task
+    
             log_sender_clone
                 .send((
                     user_index,
-                    "💳 Generating payment link (Method 2)...".to_string(),
+                    format!("💳 Generating payment link (Method 2) for {} unpaid seats...", unpaid_count),
                 ))
                 .ok();
+                
             let payment_in_progress_clone = self.payment_in_progress.clone();
             rt.spawn(async move {
                 match Self::get_payment_link_method2(
@@ -3990,26 +4165,23 @@ impl WebbookBot {
                                 format!("✅ Payment link (M2): {}", payment_link),
                             ))
                             .ok();
-                        /*log_sender_clone
-                        .send((
-                            user_index,
-                            "✅ Payment completed - user now inactive".to_string(),
-                        ))
-                        .ok();*/
-                        payment_sender_clone.send(user_index).ok();
-
+                        
+                        // Send the actual count of unpaid seats that were processed
+                        payment_sender_clone.send((user_index, unpaid_count)).ok();
+    
                         let message = format!(
                             "💳 PAYMENT LINK GENERATED (M2)\n\
                             ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n\
                             📧 User: {}\n\
+                            🎫 Unpaid Seats: {}\n\
                             🔗 Link: {}\n\
                             ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
-                            user_email, payment_link
+                            user_email, unpaid_count, payment_link
                         );
                         telegram_sender_clone
                             .send(TelegramMessage {
                                 text: message,
-                                chat_id: 4785839500, // Seat operations group
+                                chat_id: 4785839500,
                             })
                             .ok();
                     }
@@ -4023,7 +4195,6 @@ impl WebbookBot {
             });
         }
     }
-
     async fn get_payment_link_method2(
         email: &str,
         password: &str,
@@ -4549,15 +4720,47 @@ impl WebbookBot {
 
     fn update_payment_status(&mut self) {
         if let Some(receiver) = &mut self.payment_status_receiver {
-            while let Ok(user_index) = receiver.try_recv() {
+            while let Ok((user_index, paid_count)) = receiver.try_recv() {
                 if user_index < self.users.len() {
-                    self.users[user_index].payment_completed = true;
-                    self.users[user_index].pay_status = "✅ Paid".to_string();
-                    self.users[user_index].status = "Paid".to_string();
-
-                    // +++ ADD THIS LINE +++
-                    // Add the user's index to the shared "do not refresh" list.
-                    self.paid_users.lock().insert(user_index);
+                    let original_limit = self.users[user_index].max_seats;
+                    self.users[user_index].remaining_seat_limit = original_limit.saturating_sub(paid_count);
+                    
+                    // Track paid seats (add newly paid seats to existing paid seats)
+                    let current_held = self.users[user_index].held_seats.clone();
+                    let unpaid_seats: Vec<String> = current_held
+                        .iter()
+                        .filter(|seat| !self.users[user_index].paid_seats.contains(seat))
+                        .cloned()
+                        .collect();
+                    
+                    // Add the newly paid seats (first N unpaid seats)
+                    let newly_paid: Vec<String> = unpaid_seats.into_iter().take(paid_count).collect();
+                    self.users[user_index].paid_seats.extend(newly_paid);
+                    
+                    // Update status - never mark as completed, always allow more payments
+                    let total_unpaid = self.users[user_index].held_seats
+                        .iter()
+                        .filter(|seat| !self.users[user_index].paid_seats.contains(seat))
+                        .count();
+                    
+                    if total_unpaid == 0 {
+                        self.users[user_index].pay_status = "✅ All Paid".to_string();
+                    } else {
+                        self.users[user_index].pay_status = "✅ Partial Paid".to_string();
+                    }
+                    
+                    // Never mark payment_completed as true - always allow more payments
+                    // self.users[user_index].payment_completed = false; // Keep this false
+                    
+                    // Auto-deselect
+                    self.users[user_index].selected = false;
+                    self.select_all_users = self.users.iter().all(|u| u.selected);
+    
+                    // Only add to paid_users if they reach their maximum limit AND have no unpaid seats
+                    let at_limit = original_limit > 0 && self.users[user_index].held_seats.len() >= original_limit;
+                    if at_limit && total_unpaid == 0 {
+                        self.paid_users.lock().insert(user_index);
+                    }
                 }
             }
         }
