@@ -67,6 +67,7 @@ struct ParallelPaymentResponseUser {
 #[derive(Default)]
 pub struct WebbookBot {
     // Form fields
+    section_input: String, 
     event_url: String,
     seats: String,
     d_seats: String,
@@ -1479,6 +1480,7 @@ impl WebbookBot {
             }
         });
         let app = Self {
+            section_input: String::new(),
             event_url: "".to_string(),
             seats: "1".to_string(),
             d_seats: "1".to_string(),
@@ -3325,7 +3327,23 @@ impl WebbookBot {
         // In render_top_panel, replace the sections checkbox part:
         ui.vertical(|ui| {
             ui.label("Sections:");
-
+        
+            // ADD THIS NEW SECTION - Input field for quick section selection
+            ui.horizontal(|ui| {
+                ui.label("Quick select:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.section_input)
+                        .hint_text("103, 102, W3, ...")
+                        .desired_width(200.0)
+                );
+                if ui.button("Apply").clicked() {
+                    self.apply_section_input();
+                }
+                if ui.button("Clear Input").clicked() {
+                    self.section_input.clear();
+                }
+            });
+        
             if let Some(shared_data_arc) = &self.shared_data {
                 if let Ok(shared_data) = shared_data_arc.try_read() {
                     if let Some(channels) = &shared_data.channels {
@@ -3337,7 +3355,7 @@ impl WebbookBot {
                                     unique_sections.insert(prefix.to_string());
                                 }
                             }
-
+        
                             // Initialize checkboxes only once
                             for section in unique_sections {
                                 self.selected_sections.insert(section, false);
@@ -3346,14 +3364,12 @@ impl WebbookBot {
                     }
                 }
             }
-
-            // Display checkboxes - 10 per line
-            // Display checkboxes in scrollable area
-
+        
+            // Rest of the existing sections UI code...
             let mut sections_to_display: Vec<String> =
                 self.selected_sections.keys().cloned().collect();
             sections_to_display.sort();
-
+        
             let mut selection_changed = false;
             ui.horizontal(|ui| {
                 if ui.button("Select All").clicked() {
@@ -3371,9 +3387,10 @@ impl WebbookBot {
             });
             let selected_count = self.selected_sections.values().filter(|&&v| v).count();
             ui.label(format!("Sections: {} selected", selected_count));
+            
             // Create scrollable area with fixed height
             egui::ScrollArea::both()
-                .id_source("sections_scroll") // ADD THIS LINE - unique ID
+                .id_source("sections_scroll")
                 .max_height(200.0)
                 .show(ui, |ui| {
                     // Use a grid for better layout control
@@ -3387,28 +3404,27 @@ impl WebbookBot {
                                         selection_changed = true;
                                     }
                                 }
-
-                                // End row after 10 items
+        
+                                // End row after 20 items
                                 if (index + 1) % 20 == 0 {
                                     ui.end_row();
                                 }
                             }
                         });
                 });
-
+        
             // If selection changed, redistribute seats
-            // If selection changed, redistribute seats AND start scanner
             if selection_changed {
                 println!("selection changed");
-
+        
                 // Update shared selections for scanner
                 {
                     let mut shared = self.selected_sections_shared.lock();
                     *shared = self.selected_sections.clone();
                 }
-
+        
                 self.distribute_seats_to_users();
-
+        
                 let has_selected = self.selected_sections.values().any(|&selected| selected);
                 if has_selected && !self.scanner_running && self.bot_running {
                     self.start_scanner();
@@ -3424,19 +3440,91 @@ impl WebbookBot {
     fn update_ready_scanner_users_atomic(&self) {
         let mut ready_users = self.ready_scanner_users.lock();
         ready_users.clear();
-
+    
         for (i, user) in self.users.iter().enumerate() {
-            // Updated condition to include both '*' and '+' users
-            if (user.user_type == "*" || user.user_type == "+") && user.status == "Active" {
+            // Include users that are Active OR just reloaded (pay_status contains "Reloading")
+            if (user.user_type == "*" || user.user_type == "+") && 
+               (user.status == "Active" || user.pay_status == "Reloading...") {
                 ready_users.push(i);
             }
         }
     }
 
+    fn apply_section_input(&mut self) {
+        if self.section_input.trim().is_empty() {
+            return;
+        }
+    
+        // Parse the input - split by comma and trim whitespace
+        let sections_to_select: Vec<String> = self.section_input
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    
+        if sections_to_select.is_empty() {
+            return;
+        }
+    
+        let mut found_sections = Vec::new();
+        let mut not_found = Vec::new();
+        let mut selection_changed = false;
+    
+        // Check each input section against available sections - EXACT MATCH ONLY
+        for input_section in sections_to_select {
+            let mut found = false;
+            
+            // Look for EXACT match only (case-insensitive)
+            for (section_name, is_selected) in self.selected_sections.iter_mut() {
+                if section_name.eq_ignore_ascii_case(&input_section) {
+                    if !*is_selected {
+                        *is_selected = true;
+                        selection_changed = true;
+                        found_sections.push(section_name.clone());
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            
+            if !found {
+                not_found.push(input_section);
+            }
+        }
+    
+        // Log results
+        if !found_sections.is_empty() {
+            println!("✅ Selected sections: {}", found_sections.join(", "));
+        }
+        if !not_found.is_empty() {
+            println!("❌ Sections not found: {}", not_found.join(", "));
+        }
+    
+        // If any sections were changed, trigger the update logic
+        if selection_changed {
+            // Update shared selections for scanner
+            {
+                let mut shared = self.selected_sections_shared.lock();
+                *shared = self.selected_sections.clone();
+            }
+    
+            self.distribute_seats_to_users();
+    
+            let has_selected = self.selected_sections.values().any(|&selected| selected);
+            if has_selected && !self.scanner_running && self.bot_running {
+                self.start_scanner();
+            } else if !has_selected && self.scanner_running {
+                self.scanner_running = false;
+            }
+        }
+    
+        // Clear the input after applying
+        self.section_input.clear();
+    }
     fn render_user_table(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
 
-        let mut pay_button_clicked_for: Option<usize> = None;
+        let mut reload_button_clicked_for: Option<usize> = None; // Changed from pay_button_clicked_for
         let mut pay2_button_clicked_for: Option<usize> = None;
         let mut logs_button_clicked_for: Option<usize> = None;
         let mut toggle_selection_for: Option<usize> = None; // To handle checkbox clicks
@@ -3471,11 +3559,33 @@ impl WebbookBot {
             .column(Column::exact(payment_status_width))
             .header(25.0, |mut header| {
                 // Header for the new checkbox column
+                                // In the header section, update the select all checkbox:
+                // In the header section, update the select all checkbox:
                 header.col(|ui| {
-                    if ui.checkbox(&mut self.select_all_users, "").changed() {
-                        for user in &mut self.users {
-                            user.selected = self.select_all_users;
+                    // Count how many users can be selected (haven't paid all seats)
+                    let selectable_users: Vec<_> = self.users.iter()
+                        .filter(|user| !self.has_user_paid_all_seats(user))
+                        .collect();
+                    
+                    let all_selectable_selected = selectable_users.iter()
+                        .all(|user| user.selected);
+                    
+                    let mut select_all_state = all_selectable_selected && !selectable_users.is_empty();
+                    
+                    if ui.checkbox(&mut select_all_state, "").changed() {
+                        // Pre-calculate which users have paid all seats to avoid borrowing conflict
+                        let users_paid_all: Vec<bool> = self.users.iter()
+                            .map(|user| self.has_user_paid_all_seats(user))
+                            .collect();
+                        
+                        // Only affect users who haven't paid all seats
+                        for (user, &has_paid_all) in self.users.iter_mut().zip(users_paid_all.iter()) {
+                            if !has_paid_all {
+                                user.selected = select_all_state;
+                            }
                         }
+                        // Update the main select_all_users flag
+                        self.select_all_users = select_all_state;
                     }
                 });
                 // Other headers
@@ -3498,7 +3608,7 @@ impl WebbookBot {
                     ui.heading("Seats");
                 });
                 header.col(|ui| {
-                    ui.heading("Pay");
+                    ui.heading("Reload"); // Changed from "Pay"
                 });
                 header.col(|ui| {
                     ui.heading("Pay2");
@@ -3513,10 +3623,24 @@ impl WebbookBot {
                     let user = &users[user_index];
 
                     // Body for the new checkbox column
+                    // In the table body section, update the checkbox column:
+                    // In the table body section, update the checkbox column:
                     row.col(|ui| {
+                        let user = &users[user_index];
+                        let has_paid_all = self.has_user_paid_all_seats(user);
                         let mut is_selected = user.selected;
-                        if ui.checkbox(&mut is_selected, "").clicked() {
-                            toggle_selection_for = Some(user_index);
+                        
+                        // Disable checkbox if user has paid all seats
+                        let checkbox_enabled = !has_paid_all;
+                        
+                        if checkbox_enabled {
+                            if ui.checkbox(&mut is_selected, "").clicked() {
+                                toggle_selection_for = Some(user_index);
+                            }
+                        } else {
+                            // Show disabled checkbox with tooltip
+                            ui.add_enabled(false, egui::Checkbox::new(&mut is_selected, ""))
+                                .on_hover_text("User has paid for all allocated seats. Click 'Reload' to re-enable.");
                         }
                     });
 
@@ -3553,11 +3677,8 @@ impl WebbookBot {
                         ui.label(&user.held_seats.len().to_string());
                     });
                     row.col(|ui| {
-                        if ui
-                            .add_enabled(!user.payment_completed, egui::Button::new("Pay"))
-                            .clicked()
-                        {
-                            pay_button_clicked_for = Some(user_index);
+                        if ui.button("Reload").clicked() { // Changed from "Pay"
+                            reload_button_clicked_for = Some(user_index); // Changed variable name
                         }
                     });
                     row.col(|ui| {
@@ -3581,8 +3702,26 @@ impl WebbookBot {
                             pay2_button_clicked_for = Some(user_index);
                         }
                     });
+                    // In the payment status column, add visual indication:
                     row.col(|ui| {
-                        ui.label(&user.pay_status);
+                        let user = &users[user_index];
+                        if self.has_user_paid_all_seats(user) {
+                            ui.colored_label(egui::Color32::BLUE, "✅ All Paid");
+                        } else {
+                            // Color-code different payment statuses
+                            let (color, text) = match user.pay_status.as_str() {
+                                status if status.contains("Processing") => (egui::Color32::YELLOW, &user.pay_status),
+                                status if status.contains("Failed") => (egui::Color32::RED, &user.pay_status),
+                                status if status.contains("Error") => (egui::Color32::RED, &user.pay_status),
+                                status if status.contains("Reloading") => (egui::Color32::LIGHT_BLUE, &user.pay_status),
+                                status if status.contains("Partial Paid") => (egui::Color32::GREEN, &user.pay_status),
+                                status if status.contains("✅") => (egui::Color32::GREEN, &user.pay_status),
+                                "Pay" => (egui::Color32::GRAY, &user.pay_status),
+                                _ => (egui::Color32::WHITE, &user.pay_status), // Default color
+                            };
+                            
+                            ui.colored_label(color, text);
+                        }
                     });
                 });
             });
@@ -3590,11 +3729,37 @@ impl WebbookBot {
         // Apply the selection change after the table has been drawn
         if let Some(user_index) = toggle_selection_for {
             if let Some(user) = self.users.get_mut(user_index) {
-                user.selected = !user.selected;
-                if !user.selected {
-                    self.select_all_users = false;
+                // Pre-calculate if user has paid all seats before mutable borrow
+                let has_paid_all = if user.max_seats == 0 {
+                    false // Unlimited seats, never "paid all"
                 } else {
-                    self.select_all_users = self.users.iter().all(|u| u.selected);
+                    user.paid_seats.len() >= user.max_seats
+                };
+                
+                // Only allow toggle if user hasn't paid all seats
+                if !has_paid_all {
+                    user.selected = !user.selected;
+                    let is_selected = user.selected; // Store the selection state
+                    
+                    // Drop the mutable borrow before calling other functions
+                    drop(user);
+                    
+                    // Update select_all_users based on selectable users only
+                    let selectable_users: Vec<_> = self.users.iter()
+                        .filter(|u| {
+                            if u.max_seats == 0 {
+                                true // Unlimited seats, always selectable
+                            } else {
+                                u.paid_seats.len() < u.max_seats // Selectable if not paid all
+                            }
+                        })
+                        .collect();
+                    
+                    if !is_selected {
+                        self.select_all_users = false;
+                    } else {
+                        self.select_all_users = selectable_users.iter().all(|u| u.selected);
+                    }
                 }
             }
         }
@@ -3602,8 +3767,8 @@ impl WebbookBot {
         if let Some(user_index) = pay2_button_clicked_for {
             self.handle_payment_click2(user_index);
         }
-        if let Some(user_index) = pay_button_clicked_for {
-            self.handle_payment_click(user_index);
+        if let Some(user_index) = reload_button_clicked_for { // Changed from pay_button_clicked_for
+            self.handle_reload_click(user_index); // Changed function name
         }
         if let Some(user_index) = logs_button_clicked_for {
             self.selected_user_index = Some(user_index);
@@ -3976,12 +4141,14 @@ impl WebbookBot {
                             format!("❌ Checkout failed with status {}: {}", status, body_text),
                         ))
                         .ok();
+                    payment_sender.send((user_index, usize::MAX)).ok(); 
                 }
             }
             Err(e) => {
                 log_sender
                     .send((user_index, format!("❌ Checkout request error: {}", e)))
                     .ok();
+                payment_sender.send((user_index, usize::MAX)).ok(); 
             }
         }
 
@@ -3990,101 +4157,83 @@ impl WebbookBot {
     }
     // This is the REFACTORED payment logic with a 3-attempt retry loop
     // MODIFIED to use the new process_payment_for_user function
-    async fn handle_payment_click(&mut self, user_index: usize) {
-        if self.users[user_index].payment_completed {
-            if let Some(log_sender) = &self.log_sender {
-                log_sender
-                    .send((
-                        user_index,
-                        "⚠️ Payment already completed for this user".to_string(),
-                    ))
+    
+    // Replace the entire handle_payment_click function with this:
+fn handle_reload_click(&mut self, user_index: usize) {
+    if let (Some(bot_manager), Some(rt), Some(log_sender)) = (
+        &self.bot_manager,
+        &self.rt,
+        &self.log_sender,
+    ) {
+        // Reset user data immediately in UI
+        if let Some(user) = self.users.get_mut(user_index) {
+            user.held_seats.clear();
+            user.paid_seats.clear();
+            user.seats = "0".to_string();
+            user.pay_status = "Reloading...".to_string();
+            user.payment_completed = false;
+            user.remaining_seat_limit = user.max_seats;
+            user.logs.clear();
+            user.selected = false; // Reset selection state
+        }
+
+        // Remove from paid users list
+        self.paid_users.lock().remove(&user_index);
+        self.payment_in_progress.lock().remove(&user_index);
+
+        // Update UI immediately
+        if let Some(sender) = &self.assigned_seats_sender {
+            sender.send((user_index, "".to_string())).ok(); // Clear seats in UI
+        }
+
+        let bot_manager_clone = bot_manager.clone();
+        let log_sender_clone = log_sender.clone();
+        let channel_keys = self.build_channel_keys();
+        let user_email = self.users[user_index].email.clone();
+
+        rt.spawn(async move {
+            if let Some(bot_user) = bot_manager_clone.users.get(user_index) {
+                log_sender_clone
+                    .send((user_index, "🔄 Starting user reload...".to_string()))
                     .ok();
-            }
-            return;
-        }
-        self.payment_in_progress.lock().insert(user_index);
-        self.users[user_index].pay_status = "⏳ Processing...".to_string();
-        if let (
-            Some(bot_manager),
-            Some(rt),
-            Some(log_sender),
-            Some(telegram_sender),
-            Some(payment_sender), // Now correctly declared
-        ) = (
-            &self.bot_manager,
-            &self.rt,
-            &self.log_sender,
-            &self.telegram_sender,
-            &self.payment_status_sender, // And sourced from self
-        ) {
-            let bot_manager_clone = bot_manager.clone();
-            let log_sender_clone = log_sender.clone();
-            let telegram_sender_clone = telegram_sender.clone();
-            let payment_sender_clone = payment_sender.clone();
-            let payment_in_progress_clone = self.payment_in_progress.clone();
-            let user_email = self.users[user_index].email.clone();
-            let user_type = self.users[user_index].user_type.clone();
-            let d_seats_limit: usize = self.d_seats.parse().unwrap_or(0);
 
-            log_sender_clone
-                .send((user_index, "💳 Generating payment link...".to_string()))
-                .ok();
-            let site_key_exists = bot_manager_clone.shared_data.read().await.recaptcha_site_key.is_some();
-            if !site_key_exists {
-                log_sender_clone.send((user_index, "🔑 Captcha site key not found, fetching...".to_string())).ok();
-                if let Err(e) = bot_manager_clone.extract_recaptcha_site_key().await {
-                    log_sender_clone.send((user_index, format!("❌ Failed to get site key: {}. Aborting payment.", e))).ok();
-                    payment_in_progress_clone.lock().remove(&user_index);
-                    // TODO: Update UI status back to "Pay" via a channel if desired
-                    return;
+                // Step 1: Clear bot user's held seats
+                bot_user.held_seats.lock().clear();
+                
+                // Step 2: Reset expire time
+                bot_user.expire_time.store(usize::MAX, Ordering::Relaxed);
+
+                // Step 3: Generate new browser ID
+                {
+                    let mut browser_id = bot_user.browser_id.lock();
+                    let new_id = format!("{:016x}", rand::random::<u64>());
+                    *browser_id = Some(new_id);
                 }
-                log_sender_clone.send((user_index, "✅ Captcha site key fetched successfully.".to_string())).ok();
-            } else {
-                log_sender_clone.send((user_index, "✅ Using cached captcha site key.".to_string())).ok();
-            }
-            rt.spawn(async move {
-                // 1. Check for captcha site key, fetch if missing.
 
-                // 2. Proceed with existing logic
-                let bot_user = &bot_manager_clone.users[user_index];
-                let selectable_seats_value = match bot_user.find_seats().await {
-                    Ok(seats) => {
-                        log_sender_clone
-                            .send((
-                                user_index,
-                                "✅ Received seat data from local server.".to_string(),
-                            ))
-                            .ok();
-                        seats
-                    }
-                    Err(e) => {
-                        log_sender_clone
-                            .send((user_index, format!("❌ /findSeats failed: {}", e)))
-                            .ok();
-                        payment_in_progress_clone.lock().remove(&user_index);
-                        return;
-                    }
-                };
+                log_sender_clone
+                    .send((user_index, "🆔 Generated new browser ID".to_string()))
+                    .ok();
 
-                let selectable_seats: Vec<Value> =
-                    serde_json::from_value(selectable_seats_value).unwrap_or_default();
-
-                Self::process_payment_for_user(
+                // Step 4: Use the robust token refresh system
+                let success = bot_user.refresh_token_with_retries(
+                    &log_sender_clone,
                     user_index,
-                    selectable_seats,
-                    bot_manager_clone,
-                    log_sender_clone,
-                    telegram_sender_clone,
-                    payment_sender_clone,
-                    payment_in_progress_clone,
-                    user_email,
-                    user_type,
-                    d_seats_limit,
-                )
-                .await;
-            });
-        }
+                    channel_keys,
+                ).await;
+
+                if success {
+                    log_sender_clone
+                        .send((user_index, "✅ User reload completed successfully!".to_string()))
+                        .ok();
+                } else {
+                    log_sender_clone
+                        .send((user_index, "⚠️ User reload completed with warnings".to_string()))
+                        .ok();
+                }
+            }
+        });
     }
+}
     fn handle_payment_click2(&mut self, user_index: usize) {
         if self.users[user_index].payment_completed {
             if let Some(log_sender) = &self.log_sender {
@@ -4189,6 +4338,7 @@ impl WebbookBot {
                         log_sender_clone
                             .send((user_index, format!("❌ Payment link (M2) failed: {}", e)))
                             .ok();
+                        payment_sender_clone.send((user_index, 0)).ok();
                     }
                 }
                 payment_in_progress_clone.lock().remove(&user_index);
@@ -4271,9 +4421,14 @@ impl WebbookBot {
                 if let Ok(user_index) = status[11..].parse::<usize>() {
                     if user_index < self.users.len() {
                         self.users[user_index].status = "Active".to_string();
+                        
+                        // If user was reloading, reset their pay status
+                        if self.users[user_index].pay_status == "Reloading..." {
+                            self.users[user_index].pay_status = "Pay".to_string();
+                        }
+                        
                         self.update_ready_scanner_users_atomic();
-
-                        // Start scanner if conditions met
+            
                         let has_selected_sections =
                             self.selected_sections.values().any(|&selected| selected);
                         if has_selected_sections && !self.scanner_running {
@@ -4281,7 +4436,7 @@ impl WebbookBot {
                         }
                     }
                 }
-            } else {
+            }else {
                 self.sections_status = status;
             }
         }
@@ -4715,13 +4870,30 @@ impl WebbookBot {
             }
         }
     }
-    // In impl WebbookBot...
-    // In impl WebbookBot
+    fn has_user_paid_all_seats(&self, user: &User) -> bool {
+        if user.max_seats == 0 {
+            return false; // Unlimited seats, never "paid all"
+        }
+        user.paid_seats.len() >= user.max_seats
+    }
 
     fn update_payment_status(&mut self) {
         if let Some(receiver) = &mut self.payment_status_receiver {
             while let Ok((user_index, paid_count)) = receiver.try_recv() {
                 if user_index < self.users.len() {
+                    if paid_count == usize::MAX {
+                        // Handle failure case
+                        self.users[user_index].pay_status = "❌ Payment Failed".to_string();
+                        self.payment_in_progress.lock().remove(&user_index);
+                    } else if paid_count == 0 {
+                        // Handle method2 failure or no seats to pay
+                        if self.users[user_index].held_seats.is_empty() {
+                            self.users[user_index].pay_status = "❌ No Seats to Pay".to_string();
+                        } else {
+                            self.users[user_index].pay_status = "❌ Payment Failed".to_string();
+                        }
+                        self.payment_in_progress.lock().remove(&user_index);
+                    } else {
                     let original_limit = self.users[user_index].max_seats;
                     self.users[user_index].remaining_seat_limit = original_limit.saturating_sub(paid_count);
                     
@@ -4761,6 +4933,7 @@ impl WebbookBot {
                     if at_limit && total_unpaid == 0 {
                         self.paid_users.lock().insert(user_index);
                     }
+                }
                 }
             }
         }
