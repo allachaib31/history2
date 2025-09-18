@@ -1068,8 +1068,9 @@ async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<()>
         .body(final_payload)
         .send()
         .await?;
-
+    println!("Ultra-fast take seat response: {}", response.status());
     if response.status().is_success() {
+        println!("{:?}", response.text().await?);
         bot_user.held_seats.lock().push(seat_id.to_string());
         Ok(())
     } else {
@@ -2923,10 +2924,13 @@ impl WebbookBot {
         if let Some(receiver) = &mut self.assigned_seats_receiver {
             while let Ok((user_index, seat_msg)) = receiver.try_recv() {
                 if user_index < self.users.len() {
-                    // --- START OF FIX ---
                     if seat_msg.is_empty() {
                         // Clear all seats (for token expiration)
                         self.users[user_index].held_seats.clear();
+                    } else if seat_msg == "CLEAR_UNPAID" {
+                        // NEW: Clear only unpaid seats, keep paid ones
+                        let user = &mut self.users[user_index];
+                        user.held_seats.retain(|seat| user.paid_seats.contains(seat));
                     } else if let Some(seat_to_remove) = seat_msg.strip_prefix("REMOVE:") {
                         // Remove a single seat (for transfers)
                         self.users[user_index]
@@ -2939,7 +2943,6 @@ impl WebbookBot {
                     // Update the display count string
                     self.users[user_index].seats =
                         self.users[user_index].held_seats.len().to_string();
-                    // --- END OF FIX ---
                 }
             }
         }
@@ -3087,6 +3090,7 @@ impl WebbookBot {
             self.bot_manager_receiver = Some(bot_receiver);
             let channel_keys = self.build_channel_keys();
             let paid_users_clone = self.paid_users.clone();
+            let users_data_clone = self.users.clone();
             rt.spawn(async move {
                 match BotManager::new(users_data, event_url.clone(), shared_data).await {
                     Ok(bot_manager) => {
@@ -3163,29 +3167,71 @@ impl WebbookBot {
                                     let bot_manager_clone = bot_manager_arc.clone();
                                     let channel_keys_clone = channel_keys.clone();
                                     let user_index = i;
+                                    let users_data_clone = users_data_clone.clone();
 
                                     tokio::spawn(async move {
+                                        // Get user's paid seats from UI layer for proper seat preservation
+                                        let ui_user_paid_seats = if let Some(ui_user) = users_data_clone.get(user_index) {
+                                            ui_user.paid_seats.clone()
+                                        } else {
+                                            Vec::new()
+                                        };
+                                    
                                         let previously_held = {
                                             let mut held = user_clone.held_seats.lock();
-                                            let seats = held.clone();
-                                            held.clear();
-                                            seats
+                                            let all_seats = held.clone();
+                                            
+                                            // CRITICAL FIX: Preserve paid seats during token refresh
+                                            if !ui_user_paid_seats.is_empty() {
+                                                // Keep only paid seats, clear unpaid ones
+                                                let kept_seats: Vec<String> = all_seats.iter()
+                                                    .filter(|seat| ui_user_paid_seats.contains(seat))
+                                                    .cloned()
+                                                    .collect();
+                                                
+                                                *held = kept_seats.clone();
+                                                
+                                                log_sender_clone_task
+                                                    .send((
+                                                        user_index,
+                                                        format!("💰 Preserved {} paid seats during refresh", kept_seats.len()),
+                                                    ))
+                                                    .ok();
+                                                
+                                                // Return only unpaid seats for potential retaking
+                                                all_seats.into_iter()
+                                                    .filter(|seat| !ui_user_paid_seats.contains(seat))
+                                                    .collect()
+                                            } else {
+                                                // No paid seats - clear everything (original behavior)
+                                                held.clear();
+                                                log_sender_clone_task
+                                                    .send((
+                                                        user_index,
+                                                        "🔄 No paid seats - clearing all seats for refresh".to_string(),
+                                                    ))
+                                                    .ok();
+                                                all_seats
+                                            }
                                         };
-
+                                    
                                         log_sender_clone_task
                                             .send((
                                                 user_index,
                                                 format!(
-                                                    "⏰ Token expired. Refreshing for {} seats...",
+                                                    "⏰ Token expired. Refreshing for {} unpaid seats...",
                                                     previously_held.len()
                                                 ),
                                             ))
                                             .ok();
-
-                                        assigned_seats_sender_clone
-                                            .send((user_index, "".to_string()))
-                                            .ok();
-
+                                    
+                                        // Clear unpaid seats from UI (paid seats are preserved)
+                                        if previously_held.len() > 0 {
+                                            assigned_seats_sender_clone
+                                                .send((user_index, "CLEAR_UNPAID".to_string()))
+                                                .ok();
+                                        }
+                                    
                                         if user_clone.get_webook_hold_token().await.is_ok() {
                                             user_clone.expire_time.store(600, Ordering::Relaxed);
                                             log_sender_clone_task
@@ -3194,17 +3240,15 @@ impl WebbookBot {
                                                     "✅ New token acquired.".to_string(),
                                                 ))
                                                 .ok();
-
+                                    
                                             if let Ok(template) = user_clone
-                                                .prepare_request_template(
-                                                    channel_keys_clone.clone(),
-                                                )
+                                                .prepare_request_template(channel_keys_clone.clone())
                                                 .await
                                             {
-                                                *user_clone.prepared_request.lock() =
-                                                    Some(template);
+                                                *user_clone.prepared_request.lock() = Some(template);
                                             }
-
+                                    
+                                            // Only retake unpaid seats (not paid ones)
                                             if !previously_held.is_empty() {
                                                 let event_keys = if let Some(key) =
                                                     bot_manager_clone
@@ -3218,7 +3262,14 @@ impl WebbookBot {
                                                 } else {
                                                     return;
                                                 };
-
+                                    
+                                                log_sender_clone_task
+                                                    .send((
+                                                        user_index,
+                                                        format!("🔄 Attempting to retake {} unpaid seats", previously_held.len()),
+                                                    ))
+                                                    .ok();
+                                    
                                                 user_clone
                                                     .retake_seats(
                                                         previously_held,
@@ -3228,6 +3279,13 @@ impl WebbookBot {
                                                         user_index,
                                                     )
                                                     .await
+                                                    .ok();
+                                            } else {
+                                                log_sender_clone_task
+                                                    .send((
+                                                        user_index,
+                                                        "✅ Token refreshed - all seats were paid, nothing to retake".to_string(),
+                                                    ))
                                                     .ok();
                                             }
                                         } else {
@@ -4628,7 +4686,7 @@ fn handle_reload_click(&mut self, user_index: usize) {
                 if let Ok(messages) = serde_json::from_str::<Vec<ScannerMessage>>(&text) {
                     for scanner_msg in messages {
                         let body = scanner_msg.message.body;
-                        //println!("{:?}", body);
+                        println!("{:?}", body);
                         // --- 1. FREE SEAT (Standard Scanner) ---
                         if body.status.as_deref() == Some("free") {
                             if let Some(ref seat_id) = body.object_label {
