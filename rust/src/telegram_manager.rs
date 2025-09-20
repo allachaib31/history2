@@ -1,27 +1,33 @@
 use std::io::{self, BufRead, Write};
+// --- ADD THIS TO YOUR `use` STATEMENTS ---
+use std::path::PathBuf;
+// -----------------------------------------
 use grammers_client::{Client, Config, SignInError};
 use grammers_session::Session;
 use grammers_tl_types::enums::InputPeer;
-use grammers_tl_types::functions::messages::SendMessage; // --- ADD THIS ---
+use grammers_tl_types::functions::messages::SendMessage;
 use grammers_tl_types::types::InputPeerChat;
 use tokio::sync::mpsc;
 
-// Your constants remain the same
 const API_ID: i32 = 21955613;
 const API_HASH: &str = "8cc201109a0697c1e42e70bc942931a7";
-const SESSION_FILE: &str = "telegram.session";
-const CHAT_ID: i64 = 4785839500;
+// We no longer use the SESSION_FILE constant here.
+
 #[derive(Debug)]
 pub struct TelegramMessage {
     pub text: String,
     pub chat_id: i64,
 }
+
 pub struct TelegramManager {
     client: Client,
-    receiver: mpsc::UnboundedReceiver<TelegramMessage>, // Changed from String
+    receiver: mpsc::UnboundedReceiver<TelegramMessage>,
     gui_request_sender: Option<mpsc::UnboundedSender<TelegramRequest>>,
     gui_response_receiver: Option<mpsc::UnboundedReceiver<String>>,
+    // --- ADD THIS FIELD ---
+    session_file_path: PathBuf,
 }
+
 #[derive(Debug)]
 pub enum TelegramRequest {
     RequestPhone,
@@ -29,28 +35,61 @@ pub enum TelegramRequest {
     RequestPassword,
 }
 
+// --- NEW HELPER FUNCTION ---
+// This function creates a stable path like `C:\Users\YourUser\.my_telegram_bot\telegram.session`
+fn get_session_path() -> Result<PathBuf, io::Error> {
+    // Get the user's home directory. This works on both Windows and Linux.
+    let mut path = dirs::home_dir().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "Could not find home directory")
+    })?;
+
+    // Create a hidden folder for our app's data.
+    path.push(".my_telegram_bot");
+    
+    // Create the directory if it doesn't exist.
+    std::fs::create_dir_all(&path)?;
+
+    // Add the session file name to the path.
+    path.push("telegram.session");
+    
+    Ok(path)
+}
+// ----------------------------
+
+
 impl TelegramManager {
     pub async fn new(
-        receiver: mpsc::UnboundedReceiver<TelegramMessage>, // Changed from String
+        receiver: mpsc::UnboundedReceiver<TelegramMessage>,
         gui_request_sender: mpsc::UnboundedSender<TelegramRequest>,
         gui_response_receiver: mpsc::UnboundedReceiver<String>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        // --- THE FIX IS HERE ---
+        // 1. Get the stable, absolute path for the session file.
+        let session_path = get_session_path()?;
+        println!("Using session file at: {:?}", session_path);
+
         let client = Client::connect(Config {
-            session: Session::load_file_or_create(SESSION_FILE)?,
+            // 2. Load the session from that specific path.
+            session: Session::load_file_or_create(&session_path)?,
             api_id: API_ID,
             api_hash: API_HASH.to_string(),
             params: Default::default(),
         }).await?;
 
-        Ok(Self { 
-            client, 
+        Ok(Self {
+            client,
             receiver,
             gui_request_sender: Some(gui_request_sender),
             gui_response_receiver: Some(gui_response_receiver),
+            // 3. Store the path so we can save to it later.
+            session_file_path: session_path,
         })
     }
 
-    async fn request_from_gui(&mut self, request_type: TelegramRequest) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn request_from_gui(
+        &mut self,
+        request_type: TelegramRequest,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(sender) = &self.gui_request_sender {
             sender.send(request_type)?;
         }
@@ -63,23 +102,18 @@ impl TelegramManager {
         
         Err("Failed to get response from GUI".into())
     }
-    // In impl TelegramManager
+
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !self.client.is_authorized().await? {
             println!("Telegram: Not signed in. Please follow the prompts.");
-            
-            // REPLACE: let phone = prompt("Enter your phone number (e.g., +1234567890): ")?;
+
             let phone = self.request_from_gui(TelegramRequest::RequestPhone).await?;
-            
             let token = self.client.request_login_code(&phone).await?;
-            
-            // REPLACE: let code = prompt("Enter the code you received: ")?;
             let code = self.request_from_gui(TelegramRequest::RequestCode).await?;
-            
+
             let signed_in = self.client.sign_in(&token, &code).await;
             match signed_in {
                 Err(SignInError::PasswordRequired(password_token)) => {
-                    // REPLACE: let password = prompt("Enter your 2FA password: ")?;
                     let password = self.request_from_gui(TelegramRequest::RequestPassword).await?;
                     self.client.check_password(password_token, &password).await?;
                 }
@@ -88,18 +122,19 @@ impl TelegramManager {
             }
             
             println!("Telegram: Signed in successfully!");
-            self.client.session().save_to_file(SESSION_FILE)?;
+            // --- FIX ---
+            // Save the session to the stable path we stored earlier.
+            self.client.session().save_to_file(&self.session_file_path)?;
         } else {
             println!("Telegram: Already signed in.");
         }
         
+        // The rest of the function remains the same.
         while let Some(telegram_msg) = self.receiver.recv().await {
             let request = SendMessage {
-                peer: InputPeer::Chat(InputPeerChat { chat_id: telegram_msg.chat_id }), // Use dynamic chat_id
-                message: telegram_msg.text, // Use text from struct
+                peer: InputPeer::Chat(InputPeerChat { chat_id: telegram_msg.chat_id }),
+                message: telegram_msg.text,
                 random_id: rand::random(),
-        
-                // Manually set all other fields to their default values
                 no_webpage: false,
                 silent: false,
                 background: false,
@@ -113,7 +148,7 @@ impl TelegramManager {
                 reply_markup: None,
                 send_as: None,
                 quick_reply_shortcut: None,
-                effect: None, // --- ADD THIS MISSING LINE ---
+                effect: None,
             };
             
             if let Err(e) = self.client.invoke(&request).await {
@@ -123,17 +158,4 @@ impl TelegramManager {
         
         Ok(())
     }
-}
-
-fn prompt(message: &str) -> io::Result<String> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    stdout.write_all(message.as_bytes())?;
-    stdout.flush()?;
-
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
-    let mut line = String::new();
-    stdin.read_line(&mut line)?;
-    Ok(line.trim().to_string())
 }

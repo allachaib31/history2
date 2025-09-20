@@ -23,7 +23,7 @@ use captcha_solver::CaptchaSolver;
 use std::process::{Child, Command, Stdio};
 use telegram_manager::TelegramMessage;
 use telegram_manager::TelegramRequest;
-use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::WebSocketConfig};
+use tokio::sync::oneshot;
 
 const WORKSPACE_KEY: &str = "3d443a0c-83b8-4a11-8c57-3db9d116ef76";
 #[derive(Clone)] // <-- ADD THIS LINE
@@ -64,7 +64,7 @@ struct ParallelPaymentResponseUser {
     selectable: Vec<Value>, // This will hold the rich seat data from Node.js
 }
 
-#[derive(Default)]
+
 pub struct WebbookBot {
     // Form fields
     section_input: String, 
@@ -123,6 +123,9 @@ pub struct WebbookBot {
     payment_status_receiver: Option<mpsc::UnboundedReceiver<(usize, usize)>>,
     paid_users: Arc<Mutex<HashSet<usize>>>,
     payment_in_progress: Arc<Mutex<HashSet<usize>>>, // <-- ADD THIS LINE
+    // Add these two fields to the WebbookBot struct
+    paid_seats_query_sender: mpsc::UnboundedSender<(usize, oneshot::Sender<Vec<String>>)>,
+    paid_seats_query_receiver: mpsc::UnboundedReceiver<(usize, oneshot::Sender<Vec<String>>)>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -208,6 +211,7 @@ struct BotUser {
     browser_id: Arc<Mutex<Option<String>>>,
     held_seats: Arc<Mutex<Vec<String>>>,
     prepared_request: Arc<Mutex<Option<PreparedSeatRequest>>>, // ADD THIS
+    signature_calculator: Arc<SignatureCalculator>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,6 +243,56 @@ struct BotManager {
     token_manager: Arc<TokenManager>,
     users: Vec<BotUser>,
     event_url: String,
+}
+
+pub struct SignatureCalculator {
+    // The sender side of a channel to send jobs TO the crypto thread.
+    sender: mpsc::Sender<(String, oneshot::Sender<String>)>,
+}
+
+impl SignatureCalculator {
+    pub fn new() -> Self {
+        let (sender, mut receiver) =
+            mpsc::channel::<(String, oneshot::Sender<String>)>(100); // Buffer of 100 jobs
+
+        // Spawn a new OS thread, not a tokio task. This is for CPU-bound work.
+        std::thread::spawn(move || {
+            // The thread's main loop. It just waits for jobs.
+            while let Some((payload, response_sender)) = receiver.blocking_recv() {
+                // Perform the expensive SHA256 calculation here.
+                let mut hasher = Sha256::new();
+                hasher.update(payload.as_bytes());
+                let result = hasher.finalize();
+                let signature = hex::encode(result);
+
+                // Send the result back to the waiting async task.
+                let _ = response_sender.send(signature);
+            }
+        });
+
+        Self { sender }
+    }
+
+    // The async function that our bot will call.
+    // It sends the job to the thread and waits for the result without blocking.
+    pub async fn calculate(&self, payload: String) -> Result<String> {
+        // Create a "one-time" channel to get the response back.
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        // Send the payload and the response sender to the crypto thread.
+        self.sender
+            .send((payload, response_sender))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send to crypto thread: {}", e))?;
+
+        // Await the result from the crypto thread.
+        // This pauses the current task, but the Tokio runtime is free to work on other things.
+        let signature = response_receiver
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to receive from crypto thread: {}", e))?;
+            
+        Ok(signature)
+    }
 }
 // ADD THIS ENTIRE BLOCK
 impl Drop for WebbookBot {
@@ -297,14 +351,19 @@ impl TokenManager {
 }
 
 impl BotUser {
+        // In impl BotUser
     fn new(
         email: String,
-        proxy_url: String, // Keep as String to avoid breaking existing code
+        proxy_url: String,
         shared_data: Arc<RwLock<SharedData>>,
         token_manager: Arc<TokenManager>,
+        // --- NEW PARAMETER ---
+        signature_calculator: Arc<SignatureCalculator>,
     ) -> Result<Self> {
         let no_proxy = reqwest::NoProxy::from_string("localhost,127.0.0.1");
 
+        // This client builder is already perfect for connection pinning.
+        // Each user gets their own client, which maintains its own pool of warm connections.
         let mut client_builder = Client::builder()
             .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
             .pool_max_idle_per_host(100)
@@ -315,7 +374,6 @@ impl BotUser {
             .tcp_keepalive(std::time::Duration::from_secs(60))
             .tcp_nodelay(true);
 
-        // Only add proxy if provided and not empty/sentinel value
         if !proxy_url.is_empty() && proxy_url != "No proxy" {
             let proxy = Proxy::all(&proxy_url)?.no_proxy(no_proxy);
             client_builder = client_builder.proxy(proxy);
@@ -330,12 +388,73 @@ impl BotUser {
             shared_data,
             token_manager,
             webook_hold_token: Arc::new(Mutex::new(None)),
-            expire_time: Arc::new(AtomicUsize::new(usize::MAX)), // Use placeholder for "not initialized",
+            expire_time: Arc::new(AtomicUsize::new(usize::MAX)),
             browser_id: Arc::new(Mutex::new(None)),
             held_seats: Arc::new(Mutex::new(Vec::new())),
             prepared_request: Arc::new(Mutex::new(None)),
+            // --- ASSIGN THE NEW FIELD ---
+            signature_calculator,
         })
     }
+    
+        // In impl BotUser
+// In impl BotUser
+// In impl BotUser
+async fn prewarm_connection(&self) -> Result<()> {
+    // --- THIS IS THE NEW "MIMIC" METHOD ---
+
+    // 1. Get all the data needed to build a legitimate `get_expire_time` request.
+    let hold_token = self
+        .webook_hold_token
+        .lock()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Hold token not available for pre-warm"))?;
+
+    let browser_id = self
+        .browser_id
+        .lock()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("Browser ID not generated for pre-warm"))?;
+
+    // 2. Generate a valid signature, just like the real request does.
+    let signature = self.generate_signature("").await?;
+
+    // 3. Build the full, specific URL that we know works.
+    let url = format!(
+        "https://cdn-eu.seatsio.net/system/public/{}/hold-tokens/{}",
+        WORKSPACE_KEY, hold_token
+    );
+
+    // 4. Send the request. We don't care about the response body, only that it succeeds
+    // at the network level, which forces the connection to open.
+    let response = self
+        .client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+        .header("x-browser-id", browser_id)
+        .header("x-client-tool", "Renderer")
+        .header("x-signature", signature)
+        .send()
+        .await;
+
+    // 5. Check the result. As long as we didn't get a network error (like a proxy failure),
+    // the connection was established. We can even ignore HTTP errors like 403 here,
+    // because the TCP/TLS handshake was still completed.
+    match response {
+        Ok(_) => {
+            println!("🔥 Connection pre-warmed successfully for user {}", self.email);
+            Ok(())
+        }
+        Err(e) => {
+            // This will only trigger on a major network or proxy error.
+            println!(
+                "⚠️  Pre-warm FAILED for {} with a network error: {}",
+                self.email, e
+            );
+            Err(e.into())
+        }
+    }
+}
     // Add this new function to impl BotUser
     async fn refresh_token_with_retries(
         &self,
@@ -512,29 +631,31 @@ impl BotUser {
         Ok(serde_json::to_value(selected_seats)?)
     }
 
-    // NEW FUNCTION: Pre-builds everything except the seat ID.
-    // Call this function once after the user's hold token is acquired.
+        // This function is part of `impl BotUser`
     async fn prepare_request_template(
         &self,
         channel_keys: Vec<String>,
     ) -> Result<PreparedSeatRequest> {
+        // Get the user's unique hold token, which is essential for the request.
         let hold_token = self
             .webook_hold_token
             .lock()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No hold token"))?;
 
+        // Access the shared event data (like event key, team info, etc.).
         let shared_data = self.shared_data.read().await;
 
-        // BUILD CHANNEL KEYS PROPERLY HERE
+        // --- Channel Key Pre-Building ---
+        // Build the final, complete list of channel keys. This is done only once here.
         let mut final_channel_keys = vec!["NO_CHANNEL".to_string()];
 
-        // Add common channel keys
+        // Add common keys that apply to everyone.
         if let Some(common_keys) = &shared_data.channel_key_common {
             final_channel_keys.extend(common_keys.clone());
         }
 
-        // Add team-specific keys based on favorite team
+        // Add team-specific keys based on the user's favorite team.
         if let Some(favorite_team) = &shared_data.favorite_team {
             if let Some(channel_key_obj) = &shared_data.channel_key {
                 let team_to_use = match favorite_team.as_str() {
@@ -559,7 +680,8 @@ impl BotUser {
             }
         }
 
-        // Use final_channel_keys instead of the parameter
+        // --- Body Template Pre-Building ---
+        // Create the JSON structure, inserting the final channel keys and the seat placeholder.
         let request_body_template = json!({
             "events": if let Some(event_key) = &shared_data.event_key {
                 vec![event_key.clone()]
@@ -567,14 +689,16 @@ impl BotUser {
                 return Err(anyhow::anyhow!("No event key available"));
             },
             "holdToken": hold_token,
-            "objects": [{"objectId": "__SEAT_ID_PLACEHOLDER__"}],
-            "channelKeys": final_channel_keys,  // USE THE PROPERLY BUILT KEYS
+            "objects": [{"objectId": "__SEAT_ID_PLACEHOLDER__"}], // The critical placeholder
+            "channelKeys": final_channel_keys, // The pre-built keys are baked in
             "validateEventsLinkedToSameChart": true
         });
 
+        // Convert the JSON to a simple String. This is the template.
         let json_payload_template = request_body_template.to_string();
-        println!("{:?}", json_payload_template);
 
+        // --- Headers Pre-Building ---
+        // Create the HeaderMap with all static headers that do not change.
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("accept", "*/*".parse()?);
         headers.insert("content-type", "application/json".parse()?);
@@ -583,6 +707,7 @@ impl BotUser {
             headers.insert("x-browser-id", browser_id.parse()?);
         }
 
+        // Return the completed, launch-ready template.
         Ok(PreparedSeatRequest {
             url: format!(
                 "https://cdn-eu.seatsio.net/system/public/{}/events/groups/actions/hold-objects",
@@ -593,8 +718,6 @@ impl BotUser {
             client: self.client.clone(),
         })
     }
-
-    // ULTRA-FAST execution - no building, just fire!
 
     async fn release_seat(&self, seat_id: &str, event_keys: &[String]) -> Result<bool> {
         let hold_token = self
@@ -669,7 +792,9 @@ impl BotUser {
         _event_keys: Vec<String>,   // No longer needed
         assigned_seats_sender: mpsc::UnboundedSender<(usize, String)>,
         user_index: usize,
+        max_seats: usize, // <-- ADD THIS PARAMETER
     ) -> Result<()> {
+        // Located in: impl BotUser
         if seats_to_retake.is_empty() {
             return Ok(());
         }
@@ -690,19 +815,42 @@ impl BotUser {
                 let seat_id_clone = seat.clone();
 
                 // Spawn a new task for this single seat.
+               // Replace the entire tokio::spawn block with this one
                 tokio::spawn(async move {
-                    // Use the same ultra-fast path as the scanner
-                    match take_seat_direct_final(&bot_user_clone, &seat_id_clone).await {
-                        Ok(_) => {
-                            // Send successful seat to UI thread
+                    if let Ok(true) = take_seat_direct_final(&bot_user_clone, &seat_id_clone).await {
+                        // --- START OF FIX ---
+                        
+                        let mut seat_was_added = false;
+
+                        // Create a new scope `{}` to ensure the lock is dropped immediately after.
+                        {
+                            let mut held_seats = bot_user_clone.held_seats.lock();
+
+                            // First, decide if we are within the limit.
+                            if max_seats == 0 || held_seats.len() < max_seats {
+                                // If so, add the seat immediately while we have the lock.
+                                held_seats.push(seat_id_clone.clone());
+                                seat_was_added = true;
+                            }
+                            // The lock on `held_seats` is automatically released here at the end of the scope.
+                        }
+
+                        // Now, act on our decision *after* the lock has been released.
+                        if seat_was_added {
+                            // The seat was added successfully, now we can update the UI.
                             assigned_seats_sender_clone
-                                .send((user_index, seat_id_clone))
+                                .send((user_index, seat_id_clone.clone()))
                                 .ok();
                             println!("🚀 RETAKE SUCCESS: {} by {}", seat, bot_user_clone.email);
+                        } else {
+                            // We were over the limit. Now it's safe to perform async operations.
+                            println!("🔶 Over limit during retake! Releasing seat {}", seat_id_clone);
+                            let event_key = bot_user_clone.shared_data.read().await.event_key.clone().unwrap_or_default();
+                            bot_user_clone.release_seat(&seat_id_clone, &[event_key]).await.ok();
                         }
-                        Err(e) => {
-                            println!("✗ RETAKE FAILED for {}: {}", seat, e);
-                        }
+                        // --- END OF FIX ---
+                    } else {
+                        println!("✗ RETAKE FAILED for {}: {}", seat, bot_user_clone.email);
                     }
                 })
             })
@@ -1023,7 +1171,9 @@ impl BotUser {
         }
     }
 
+        // In impl BotUser
     async fn generate_signature(&self, request_body: &str) -> Result<String> {
+        // Get the chart token, as before.
         let shared_data = self.shared_data.read().await;
         let chart_token = shared_data
             .chart_token
@@ -1033,34 +1183,35 @@ impl BotUser {
         let reversed_token: String = chart_token.chars().rev().collect();
         let data_to_hash = format!("{}{}", reversed_token, request_body);
 
-        let mut hasher = Sha256::new();
-        hasher.update(data_to_hash.as_bytes());
-        let result = hasher.finalize();
-
-        Ok(hex::encode(result))
+        // --- THE CHANGE ---
+        // Instead of calculating here, we send the job to our dedicated crypto thread
+        // and await the result without blocking the tokio runtime.
+        self.signature_calculator.calculate(data_to_hash).await
     }
 }
 
-// CHANGE take_seat_direct_final to use ZERO JSON serialization:
-async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<()> {
+// This is a global function
+async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<bool> {
+    // 1. Get the pre-built template. (No change here)
     let prepared = bot_user
         .prepared_request
         .lock()
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Request template not ready"))?;
 
-    // ULTRA-FAST string replacement (no JSON parsing)
+    // 2. Create the final payload with string replacement. (No change here)
     let final_payload = prepared
         .json_payload_template
         .replace("__SEAT_ID_PLACEHOLDER__", seat_id);
 
-    // MINIMAL signature generation
+    // 3. Generate the signature. (No change here)
     let signature = bot_user.generate_signature(&final_payload).await?;
 
+    // 4. Prepare headers. (No change here)
     let mut headers = prepared.headers.clone();
     headers.insert("x-signature", signature.parse()?);
 
-    // FIRE IMMEDIATELY - no error parsing
+    // 5. Fire the request. (No change here)
     let response = prepared
         .client
         .post(&prepared.url)
@@ -1068,13 +1219,15 @@ async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<()>
         .body(final_payload)
         .send()
         .await?;
-    println!("Ultra-fast take seat response: {}", response.status());
+        
+    // 6. *** NEW LOGIC ***
+    // Instead of modifying the held_seats list, just return true/false.
     if response.status().is_success() {
-        println!("{:?}", response.text().await?);
-        bot_user.held_seats.lock().push(seat_id.to_string());
-        Ok(())
+        // Successfully held the seat on the server.
+        Ok(true)
     } else {
-        Err(anyhow::anyhow!("Failed: {}", response.status()))
+        // Failed to hold the seat.
+        Ok(false)
     }
 }
 fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
@@ -1092,8 +1245,9 @@ fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
 }
 
 impl BotManager {
+    // In impl BotManager
     async fn new(
-        users_data: Vec<(String, Option<String>)>, // Changed from Vec<(String, String)>
+        users_data: Vec<(String, Option<String>)>,
         event_url: String,
         shared_data: Arc<RwLock<SharedData>>,
     ) -> Result<Self> {
@@ -1103,16 +1257,21 @@ impl BotManager {
         }
         let token_manager = Arc::new(token_manager);
 
+        // --- FIX Part 1: Create the SignatureCalculator once for the whole application ---
+        let signature_calculator = Arc::new(SignatureCalculator::new());
+
         let mut users = Vec::new();
         for (email, proxy) in users_data {
-            // proxy is now Option<String>
-            // Convert Option<String> to String for BotUser::new
             let proxy_string = proxy.unwrap_or_else(|| "No proxy".to_string());
+            
+            // --- FIX Part 2: Pass the calculator to every new BotUser ---
+            // We clone the Arc, which is very cheap and just increases the reference count.
             let user = BotUser::new(
                 email,
                 proxy_string,
                 shared_data.clone(),
                 token_manager.clone(),
+                signature_calculator.clone(), // Add the missing 5th argument here
             )?;
             users.push(user);
         }
@@ -1376,67 +1535,37 @@ impl BotManager {
                 // Drop the read lock so other tasks can access shared_data
                 drop(shared_data);
                 for attempt in 1..=100 {
-                    log_sender_clone
-                        .send((
-                            user_index,
-                            format!("Attempt {} - Getting hold token", attempt),
-                        ))
-                        .ok();
-
+                    log_sender_clone.send((user_index, format!("Attempt {} - Getting hold token", attempt))).ok();
+    
                     match user_clone.get_webook_hold_token().await {
                         Ok(_) => {
-                            log_sender_clone
-                                .send((user_index, "âœ… Hold token received.".to_string()))
-                                .ok();
-                            match user_clone
-                                .prepare_request_template(channel_keys_clone.clone())
-                                .await
-                            {
-                                Ok(template) => {
-                                    *user_clone.prepared_request.lock() = Some(template);
-                                    log_sender_clone
-                                        .send((
-                                            user_index,
-                                            "âœ… Request template prepared.".to_string(),
-                                        ))
-                                        .ok();
-                                }
-                                Err(e) => {
-                                    log_sender_clone
-                                        .send((
-                                            user_index,
-                                            format!("â Œ FAILED to prepare template: {}", e),
-                                        ))
-                                        .ok();
-                                }
-                            }
-
-                            // Use the cloned sender here
-                            status_sender_clone
-                                .send(format!("USER_READY:{}", user_index))
-                                .ok();
-                            if user_clone.get_expire_time().await.is_err() {
-                                log_sender_clone
-                                    .send((
-                                        user_index,
-                                        "â Œ Error getting expire time.".to_string(),
-                                    ))
-                                    .ok();
+                            log_sender_clone.send((user_index, "✅ Hold token received.".to_string())).ok();
+    
+                            if let Ok(template) = user_clone.prepare_request_template(channel_keys_clone.clone()).await {
+                                *user_clone.prepared_request.lock() = Some(template);
+                                log_sender_clone.send((user_index, "✅ Request template prepared.".to_string())).ok();
                             } else {
-                                log_sender_clone
-                                    .send((user_index, "âœ… Session verified.".to_string()))
-                                    .ok();
-
+                                log_sender_clone.send((user_index, "❌ FAILED to prepare template".to_string())).ok();
+                            }
+    
+                            // --- NEW LOGIC: PRE-WARM THE CONNECTION ---
+                            // Right after the template is ready, establish the connection.
+                            if let Err(e) = user_clone.prewarm_connection().await {
+                                log_sender_clone.send((user_index, format!("⚠️ Failed to pre-warm connection: {}", e))).ok();
+                            }
+                            // --- END NEW LOGIC ---
+    
+                            status_sender_clone.send(format!("USER_READY:{}", user_index)).ok();
+    
+                            if user_clone.get_expire_time().await.is_err() {
+                                log_sender_clone.send((user_index, "❌ Error getting expire time.".to_string())).ok();
+                            } else {
+                                log_sender_clone.send((user_index, "✅ Session verified. Ready to scan.".to_string())).ok();
                                 return; // Exit loop on success
                             }
                         }
                         Err(e) => {
-                            log_sender_clone
-                                .send((
-                                    user_index,
-                                    format!("â Œ Attempt {} failed: {}", attempt, e),
-                                ))
-                                .ok();
+                            log_sender_clone.send((user_index, format!("❌ Attempt {} failed: {}", attempt, e))).ok();
                         }
                     }
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -1459,7 +1588,9 @@ impl WebbookBot {
         let (telegram_response_sender, telegram_response_receiver) = mpsc::unbounded_channel(); // --- ADD THIS ---
         let selected_sections_shared = Arc::new(Mutex::new(HashMap::new()));
         let (payment_status_sender, payment_status_receiver) = mpsc::unbounded_channel::<(usize, usize)>();
-
+    
+        // --- ADD THIS BLOCK ---
+        let (psq_tx, psq_rx) = mpsc::unbounded_channel();
         // --- ADD THIS BLOCK to start the Telegram client ---
         rt.spawn(async move {
             match TelegramManager::new(
@@ -1533,6 +1664,10 @@ impl WebbookBot {
             payment_status_receiver: Some(payment_status_receiver),
             paid_users: Arc::new(Mutex::new(HashSet::new())),
             payment_in_progress: Arc::new(Mutex::new(HashSet::new())), // <-- ADD THIS LINE
+            
+            // --- ADD THESE TWO LINES AT THE END OF THE STRUCT INITIALIZATION ---
+            paid_seats_query_sender: psq_tx,
+            paid_seats_query_receiver: psq_rx,
         };
         app
     }
@@ -1781,7 +1916,7 @@ impl WebbookBot {
         }
     }
 
-    // in impl WebbookBot
+        // in impl WebbookBot
     async fn dispatch_seat_take_task(
         seat_id: &str,
         log_prefix: &str,
@@ -1791,259 +1926,101 @@ impl WebbookBot {
         log_sender: &mpsc::UnboundedSender<(usize, String)>,
         telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
         ui_users: &Vec<User>,
-        pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>,
+        _pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>, // No longer needed in hot path
         payment_in_progress: &Arc<Mutex<HashSet<usize>>>,
     ) {
         if let Some(manager) = bot_manager {
-            let ready_users_indices = ready_scanner_users.lock();
+            let ready_users_indices = ready_scanner_users.lock().clone();
             if ready_users_indices.is_empty() {
                 return;
             }
 
-            // Sequentially iterate through ready users from the start each time.
-            for &actual_user_index in ready_users_indices.iter() {
+            for &actual_user_index in &ready_users_indices {
                 let is_paying = payment_in_progress.lock().contains(&actual_user_index);
                 if is_paying {
-                    continue; // Skip user if payment is in progress.
+                    continue;
                 }
 
                 if let (Some(ui_user), Some(bot_user)) = (
                     ui_users.get(actual_user_index),
                     manager.users.get(actual_user_index),
                 ) {
-                    let is_truly_ready = bot_user.webook_hold_token.lock().is_some()
-                        && bot_user.expire_time.load(Ordering::Relaxed) > 0;
+                    let is_below_limit = if ui_user.max_seats == 0 {
+                        true // Unlimited seats
+                    } else {
+                        bot_user.held_seats.lock().len() < ui_user.max_seats
+                    };
 
-                    if is_truly_ready {
-                        let held_count = bot_user.held_seats.lock().len();
+                    if is_below_limit {
+                        // Clone all data needed for the new, completely independent task.
+                        let bot_user_clone = bot_user.clone();
+                        let sender_clone = assigned_seats_sender.clone();
+                        let log_sender_clone = log_sender.clone();
+                        let telegram_sender_clone = telegram_sender.clone();
+                        let seat_id_clone = seat_id.to_string();
+                        let log_prefix_clone = log_prefix.to_string();
+                        let user_email = ui_user.email.clone();
+                        let max_seats_limit = ui_user.max_seats;
 
-                        // Check if the user is eligible and has not reached their seat limit.
-                        let is_eligible = if ui_user.user_type == "*" || ui_user.user_type == "+" {
-                            let pending_map = pending_scanner_seats.lock();
-                            let pending_count = *pending_map.get(&actual_user_index).unwrap_or(&0);
-                            
-                            // Calculate effective limit: original limit - paid seats
-                            let effective_limit = if ui_user.paid_seats.is_empty() {
-                                ui_user.max_seats
-                            } else {
-                                ui_user.remaining_seat_limit // This will be set after payment
-                            };
-                            
-                            effective_limit == 0 || (held_count + pending_count) < effective_limit
-                        } else {
-                            false
-                        };
+                        // Spawn the task. This happens instantly without waiting.
+                        tokio::spawn(async move {
+                            // Attempt to take the seat using the updated function.
+                            if let Ok(true) = take_seat_direct_final(&bot_user_clone, &seat_id_clone).await {
+                                
+                                let was_released;
 
-                        if is_eligible {
-                            // Increment pending seats if a limit is set.
-                            if ui_user.max_seats > 0 {
-                                let mut pending_map = pending_scanner_seats.lock();
-                                *pending_map.entry(actual_user_index).or_insert(0) += 1;
-                            }
+                                // ** THE FIX IS HERE **
+                                // This block `{...}` creates a new scope. The lock on `held_seats`
+                                // is automatically released at the end of this block.
+                                {
+                                    let mut held_seats = bot_user_clone.held_seats.lock();
+                                    held_seats.push(seat_id_clone.clone());
+                                    
+                                    if max_seats_limit > 0 && held_seats.len() > max_seats_limit {
+                                        // We are over the limit, remove from our list.
+                                        held_seats.pop(); 
+                                        was_released = true; // Mark that it was released.
+                                        
+                                        log_sender_clone.send((actual_user_index, format!("🔶 Over limit! Releasing seat {}", seat_id_clone))).ok();
+                                        
+                                        // --- FIX 2: Create NEW clones specifically for the release task ---
+                                        // This allows the outer task to keep its own copies of the variables.
+                                        let bot_user_for_release = bot_user_clone.clone();
+                                        let seat_id_for_release = seat_id_clone.clone();
+                                        
+                                        tokio::spawn(async move {
+                                            let event_key = bot_user_for_release.shared_data.read().await.event_key.clone().unwrap_or_default();
+                                            bot_user_for_release.release_seat(&seat_id_for_release, &[event_key]).await.ok();
+                                        });
+                                    } else {
+                                        was_released = false; // We are within the limit.
+                                    }
+                                } // <- The lock on `held_seats` is released here.
 
-                            // Clone data for the spawned task.
-                            let pending_scanner_seats_clone = pending_scanner_seats.clone();
-                            let bot_user_clone = bot_user.clone();
-                            let max_seats_clone = ui_user.max_seats;
-                            let sender_clone = assigned_seats_sender.clone();
-                            let log_sender_clone = log_sender.clone();
-                            let telegram_sender_clone = telegram_sender.clone();
-                            let seat_id_clone = seat_id.to_string();
-                            let log_prefix_clone = log_prefix.to_string();
-                            let user_email = ui_user.email.clone();
-
-                            // Spawn the task to take the seat.
-                            tokio::spawn(async move {
-                                let result =
-                                    take_seat_direct_final(&bot_user_clone, &seat_id_clone).await;
-
-                                // Decrement pending seats if a limit was in place.
-                                if max_seats_clone > 0 {
-                                    pending_scanner_seats_clone
-                                        .lock()
-                                        .entry(actual_user_index)
-                                        .and_modify(|c| *c -= 1);
-                                }
-
-                                // Handle success notifications.
-                                if result.is_ok() {
-                                    sender_clone
-                                        .send((actual_user_index, seat_id_clone.clone()))
-                                        .ok();
-                                    log_sender_clone
-                                        .send((
-                                            actual_user_index,
-                                            format!(
-                                                "🚀 {}: Booked {}",
-                                                log_prefix_clone, seat_id_clone
-                                            ),
-                                        ))
-                                        .ok();
+                                // Now we can safely use the variables again.
+                                if !was_released {
+                                    sender_clone.send((actual_user_index, seat_id_clone.clone())).ok();
+                                    log_sender_clone.send((actual_user_index, format!("🚀 {}: Booked {}", log_prefix_clone, seat_id_clone))).ok();
+                                    
+                                    // Get a new lock to read the final count.
                                     let total_held = bot_user_clone.held_seats.lock().len();
                                     let message = format!(
-                                        "🎫 SEAT TAKING ✅ SUCCESS\n\
-                                         ━━━━━━━━━━━━━━━━━\n\
-                                         🔧 Account: {}\n\
-                                         💺 Seats Taken: 1\n\
-                                         📊 Total Held: {}/{}\n\
-                                         ━━━━━━━━━━━━━━━━━",
+                                        "🎫 SEAT TAKING ✅ SUCCESS\n━━━━━━━━━━━━━━━━━\n🔧 Account: {}\n💺 Seat: {}\n📊 Total Held: {}/{}",
                                         user_email,
+                                        seat_id_clone, // This variable was not moved, so it's safe to use.
                                         total_held,
-                                        if max_seats_clone == 0 {
-                                            "∞".to_string()
-                                        } else {
-                                            max_seats_clone.to_string()
-                                        }
+                                        if max_seats_limit == 0 { "∞".to_string() } else { max_seats_limit.to_string() }
                                     );
-                                    telegram_sender_clone
-                                        .send(TelegramMessage {
-                                            text: message,
-                                            chat_id: 4785839500, // Seat operations group
-                                        })
-                                        .ok();
+                                    telegram_sender_clone.send(TelegramMessage { text: message, chat_id: 4785839500 }).ok();
                                 }
-                            });
-                            // Exit immediately after dispatching the task to the first eligible user.
-                            return;
-                        }
+                            }
+                        });
                     }
                 }
             }
         }
     }
-    // In impl WebbookBot
-    /*async fn dispatch_seat_take_task(
-        seat_id: &str,
-        log_prefix: &str,
-        bot_manager: &Option<Arc<BotManager>>,
-        ready_scanner_users: &Arc<Mutex<Vec<usize>>>,
-        next_user_index: &Arc<AtomicUsize>,
-        assigned_seats_sender: &mpsc::UnboundedSender<(usize, String)>,
-        log_sender: &mpsc::UnboundedSender<(usize, String)>,
-        telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
-        ui_users: &Vec<User>,
-        pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>,
-    ) {
-        if let Some(manager) = bot_manager {
-            let ready_users_indices = ready_scanner_users.lock();
-            let num_ready = ready_users_indices.len();
-            if num_ready == 0 {
-                return;
-            }
-
-            let start_index = next_user_index.load(Ordering::Relaxed);
-
-            for i in 0..num_ready {
-                let pool_index = (start_index + i) % num_ready;
-                let actual_user_index = ready_users_indices[pool_index];
-
-                if let (Some(ui_user), Some(bot_user)) = (
-                    ui_users.get(actual_user_index),
-                    manager.users.get(actual_user_index),
-                ) {
-                    let is_truly_ready = bot_user.webook_hold_token.lock().is_some()
-                        && bot_user.expire_time.load(Ordering::Relaxed) > 0;
-
-                    if is_truly_ready {
-                        let held_count = bot_user.held_seats.lock().len();
-
-                        // --- FIX 1: UPDATED ELIGIBILITY LOGIC ---
-                        // This now correctly separates the logic for '*' and '+' users.
-                        let is_eligible = if ui_user.user_type == "*" {
-                            true // '*' users are ALWAYS eligible.
-                        } else if ui_user.user_type == "+" {
-                            // For '+' users, we MUST check pending seats against their limit.
-                            let pending_map = pending_scanner_seats.lock();
-                            let pending_count = *pending_map.get(&actual_user_index).unwrap_or(&0);
-                            ui_user.max_seats > 0
-                                && (held_count + pending_count) < ui_user.max_seats
-                        } else {
-                            false
-                        };
-
-                        if is_eligible {
-                            // --- FIX 2: CONDITIONAL PENDING SEAT INCREMENT ---
-                            // ONLY increment the pending count if the user is a '+' type.
-                            if ui_user.user_type == "+" {
-                                let mut pending_map = pending_scanner_seats.lock();
-                                *pending_map.entry(actual_user_index).or_insert(0) += 1;
-                            }
-
-                            next_user_index.store((pool_index + 1) % num_ready, Ordering::Relaxed);
-
-                            // Clone necessary data for the spawned task
-                            let pending_scanner_seats_clone = pending_scanner_seats.clone();
-                            let bot_user_clone = bot_user.clone();
-                            let user_type_clone = ui_user.user_type.clone(); // Clone user type for the task
-                                                                             // ... clone other variables
-                            let sender_clone = assigned_seats_sender.clone();
-                            let log_sender_clone = log_sender.clone();
-                            let telegram_sender_clone = telegram_sender.clone();
-                            let seat_id_clone = seat_id.to_string();
-                            let log_prefix_clone = log_prefix.to_string();
-                            let user_email = ui_user.email.clone();
-                            let max_seats = ui_user.max_seats;
-
-                            tokio::spawn(async move {
-                                // The slow network operation
-                                let result =
-                                    take_seat_direct_final(&bot_user_clone, &seat_id_clone).await;
-
-                                // --- FIX 3: CONDITIONAL PENDING SEAT DECREMENT ---
-                                // ONLY decrement the pending count if it was a '+' type user.
-                                if user_type_clone == "+" {
-                                    pending_scanner_seats_clone
-                                        .lock()
-                                        .entry(actual_user_index)
-                                        .and_modify(|c| *c -= 1);
-                                }
-
-                                // Handle success notification
-                                if result.is_ok() {
-                                    sender_clone
-                                        .send((actual_user_index, seat_id_clone.clone()))
-                                        .ok();
-                                    log_sender_clone
-                                        .send((
-                                            actual_user_index,
-                                            format!(
-                                                "🚀 {}: Booked {}",
-                                                log_prefix_clone, seat_id_clone
-                                            ),
-                                        ))
-                                        .ok();
-                                    let total_held = bot_user_clone.held_seats.lock().len();
-                                    let message = format!(
-                                        "🎫 SEAT TAKING ✅ SUCCESS\n\
-                                        ━━━━━━━━━━━━━━━━━\n\
-                                        🔧 Account: {}\n\
-                                        💺 Seats Taken: 1\n\
-                                        📊 Total Held: {}/{}\n\
-                                        ━━━━━━━━━━━━━━━━━",
-                                        user_email,
-                                        total_held,
-                                        if max_seats == 0 {
-                                            "∞".to_string()
-                                        } else {
-                                            max_seats.to_string()
-                                        }
-                                    );
-                                    telegram_sender_clone
-                                        .send(TelegramMessage {
-                                            text: message,
-                                            chat_id: 4785839500, // Seat operations group
-                                        })
-                                        .ok();
-                                }
-                            });
-                            return; // Exit after dispatching to one user.
-                        }
-                    }
-                }
-            }
-        }
-    }*/
-
+   
     fn show_logs_modal(&mut self, ctx: &egui::Context) {
         if let Some(user_index) = self.selected_user_index {
             // Get the user's current data
@@ -2724,21 +2701,38 @@ impl WebbookBot {
             if let Some(rt) = &self.rt {
                 for i in 0..self.users.len() {
                     let user = &self.users[i];
+                    // Located inside: impl WebbookBot -> fn fill_seats
+                    // ... inside the for loop ...
                     if user.user_type == "*" && !user.target_seats.is_empty() {
                         if let Some(bot_user) = bot_manager.users.get(i) {
+                            // --- START FIX: Respect user's seat limit ---
+                            let current_held_count = bot_user.held_seats.lock().len();
+                            let max_seats = user.max_seats;
+                            
+                            let seats_to_take = if max_seats > 0 {
+                                max_seats.saturating_sub(current_held_count)
+                            } else {
+                                user.target_seats.len() // Unlimited seats, take all assigned
+                            };
+
+                            if seats_to_take == 0 {
+                                continue; // Skip if user is already at their limit
+                            }
+
+                            // Take only the number of seats needed to reach the limit
+                            let target_seats: Vec<String> = user.target_seats.iter().take(seats_to_take).cloned().collect();
+                            // --- END FIX ---
+
                             let bot_user_clone = bot_user.clone();
-                            let target_seats = user.target_seats.clone();
                             let channel_keys_clone = channel_keys.clone();
                             let event_keys_clone = event_keys.clone();
                             let assigned_sender = assigned_seats_sender.clone();
                             let log_sender_clone = log_sender.clone();
 
                             rt.spawn(async move {
-                                // --- THIS IS THE FIX ---
-                                // We handle the Result from the function inside the task
                                 if let Err(e) = bot_user_clone
                                     .fill_assigned_seats(
-                                        target_seats,
+                                        target_seats, // Use the new limited list
                                         channel_keys_clone,
                                         event_keys_clone,
                                         mpsc::unbounded_channel().0,
@@ -3091,7 +3085,7 @@ impl WebbookBot {
             let channel_keys = self.build_channel_keys();
             let paid_users_clone = self.paid_users.clone();
             let users_data_clone = self.users.clone();
-            rt.spawn(async move {
+            let paid_seats_query_sender_for_loop = self.paid_seats_query_sender.clone();            rt.spawn(async move {
                 match BotManager::new(users_data, event_url.clone(), shared_data).await {
                     Ok(bot_manager) => {
                         let bot_manager_arc = Arc::new(bot_manager);
@@ -3169,13 +3163,22 @@ impl WebbookBot {
                                     let user_index = i;
                                     let users_data_clone = users_data_clone.clone();
 
+                                    let paid_seats_query_sender_clone = paid_seats_query_sender_for_loop.clone();
+
                                     tokio::spawn(async move {
-                                        // Get user's paid seats from UI layer for proper seat preservation
-                                        let ui_user_paid_seats = if let Some(ui_user) = users_data_clone.get(user_index) {
-                                            ui_user.paid_seats.clone()
-                                        } else {
+                                        // This `async move` block now takes ownership of the NEW clone,
+                                        // leaving the original `paid_seats_query_sender_for_loop` untouched for the next loop iteration.
+                                        
+                                        // ... your "Ask for data" logic will now work correctly ...
+                                        let (response_tx, response_rx) = oneshot::channel();
+                                        paid_seats_query_sender_clone.send((user_index, response_tx)).ok();
+
+                                        // Wait for the main thread to send back the up-to-date list.
+                                        let ui_user_paid_seats = response_rx.await.unwrap_or_else(|_| {
+                                            println!("Warning: Failed to receive paid seats list from main thread.");
                                             Vec::new()
-                                        };
+                                        });
+                                        // --- END ---
                                     
                                         let previously_held = {
                                             let mut held = user_clone.held_seats.lock();
@@ -3250,36 +3253,61 @@ impl WebbookBot {
                                     
                                             // Only retake unpaid seats (not paid ones)
                                             if !previously_held.is_empty() {
-                                                let event_keys = if let Some(key) =
-                                                    bot_manager_clone
-                                                        .shared_data
-                                                        .read()
-                                                        .await
-                                                        .event_key
-                                                        .as_ref()
-                                                {
-                                                    vec![key.clone()]
+                                                // --- START FIX: Respect seat limit during retake ---
+                                                let ui_user = &users_data_clone[user_index];
+                                                let max_seats = ui_user.max_seats;
+                                                
+                                                let seats_to_retake = if max_seats > 0 {
+                                                    // Count how many seats are already held (e.g., paid ones that were preserved)
+                                                    let already_held_count = user_clone.held_seats.lock().len();
+                                                    let remaining_capacity = max_seats.saturating_sub(already_held_count);
+                                                    // Only take enough `previously_held` seats to fill the remaining capacity
+                                                    previously_held.into_iter().take(remaining_capacity).collect()
                                                 } else {
-                                                    return;
+                                                    previously_held // Unlimited seats, retake all
                                                 };
-                                    
-                                                log_sender_clone_task
-                                                    .send((
-                                                        user_index,
-                                                        format!("🔄 Attempting to retake {} unpaid seats", previously_held.len()),
-                                                    ))
-                                                    .ok();
-                                    
-                                                user_clone
-                                                    .retake_seats(
-                                                        previously_held,
-                                                        channel_keys_clone,
-                                                        event_keys,
-                                                        assigned_seats_sender_clone,
-                                                        user_index,
-                                                    )
-                                                    .await
-                                                    .ok();
+                                                // --- END FIX ---
+                                            
+                                                if !seats_to_retake.is_empty() {
+                                                    let event_keys = if let Some(key) =
+                                                        bot_manager_clone
+                                                            .shared_data
+                                                            .read()
+                                                            .await
+                                                            .event_key
+                                                            .as_ref()
+                                                    {
+                                                        vec![key.clone()]
+                                                    } else {
+                                                        return;
+                                                    };
+                                            
+                                                    log_sender_clone_task
+                                                        .send((
+                                                            user_index,
+                                                            format!("🔄 Attempting to retake {} unpaid seats (limit respected)", seats_to_retake.len()),
+                                                        ))
+                                                        .ok();
+                                            
+                                                    user_clone
+                                                        .retake_seats(
+                                                            seats_to_retake, // Use the new limited list
+                                                            channel_keys_clone,
+                                                            event_keys,
+                                                            assigned_seats_sender_clone,
+                                                            user_index,
+                                                            ui_user.max_seats, // <-- ADD THE MISSING ARGUMENT HERE
+                                                        )
+                                                        .await
+                                                        .ok();
+                                                } else {
+                                                    log_sender_clone_task
+                                                        .send((
+                                                            user_index,
+                                                            "✅ Token refreshed - user is at seat limit, nothing to retake".to_string(),
+                                                        ))
+                                                        .ok();
+                                                }
                                             } else {
                                                 log_sender_clone_task
                                                     .send((
@@ -3309,6 +3337,17 @@ impl WebbookBot {
             });
         }
         self.bot_running = true;
+    }
+    // Add this new function inside the main `impl WebbookBot` block
+    fn handle_paid_seats_queries(&mut self) {
+        while let Ok((user_index, response_sender)) = self.paid_seats_query_receiver.try_recv() {
+            let paid_seats = self.users.get(user_index)
+                .map(|u| u.paid_seats.clone())
+                .unwrap_or_default();
+            
+            // Send the current list of paid seats back to the background task
+            let _ = response_sender.send(paid_seats);
+        }
     }
     fn render_top_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -4749,6 +4788,7 @@ fn handle_reload_click(&mut self, user_index: usize) {
                         }
 
                         // --- 3. SNIPING (Phase 2) ---
+                        // Located inside the `connect_and_listen` function's main loop
                         if body.message_type.as_deref() == Some("HOLD_TOKEN_EXPIRED") {
                             if let Some(token) = body.hold_token {
                                 let mut hasher = Sha1::new();
@@ -4762,55 +4802,86 @@ fn handle_reload_click(&mut self, user_index: usize) {
                                 };
 
                                 if let Some(seats) = seats_to_snipe {
-                                    log_sender
-                                        .send((
-                                            0,
-                                            format!(
-                                                "🎯 SNIPER: Token expired, found {} seats to take.",
-                                                seats.len()
-                                            ),
-                                        ))
-                                        .ok();
-                                    for seat_id in seats {
-                                        // ADD IGNORE LIST CHECK FOR SNIPER TOO (CRITICAL FIX)
-                                        let is_ignored =
-                                            transfer_ignore_list.lock().contains(&seat_id);
+                                    // --- START: New pre-emptive check ---
+                                    let is_there_capacity_among_ready_users = {
+                                        let ready_users_indices = ready_scanner_users.lock();
+                                        // Check if any of the ready users have space for at least one seat.
+                                        ready_users_indices.iter().any(|&user_index| {
+                                            if let (Some(ui_user), Some(bot_user)) = (
+                                                users_data.get(user_index),
+                                                bot_manager.as_ref().and_then(|m| m.users.get(user_index)),
+                                            ) {
+                                                let current_held = bot_user.held_seats.lock().len();
+                                                let limit = ui_user.max_seats;
+                                                // A user has capacity if their limit is 0 (unlimited) OR they are below their limit.
+                                                limit == 0 || current_held < limit
+                                            } else {
+                                                false // User index is invalid, so no capacity.
+                                            }
+                                        })
+                                    };
+                                    // --- END: New pre-emptive check ---
 
-                                        let is_in_selected_section = {
-                                            let current_selections =
-                                                selected_sections_shared.lock();
-                                            current_selections.iter().any(
-                                                |(section, &is_selected)| {
+                                    // Now, only proceed if there's at least one user who can receive a seat.
+                                    if is_there_capacity_among_ready_users {
+                                        log_sender
+                                            .send((
+                                                0,
+                                                format!(
+                                                    "🎯 SNIPER: Token expired, found {} seats to take.",
+                                                    seats.len()
+                                                ),
+                                            ))
+                                            .ok();
+                                        for seat_id in seats {
+                                            let is_ignored = transfer_ignore_list.lock().contains(&seat_id);
+
+                                            let is_in_selected_section = {
+                                                let current_selections = selected_sections_shared.lock();
+                                                current_selections.iter().any(|(section, &is_selected)| {
                                                     is_selected
                                                         && seat_id.starts_with(section)
                                                         && (seat_id.len() == section.len()
                                                             || seat_id
                                                                 .chars()
                                                                 .nth(section.len())
-                                                                .map_or(false, |c| {
-                                                                    !c.is_ascii_digit()
-                                                                }))
-                                                },
-                                            )
-                                        };
-                                        if !is_ignored && is_in_selected_section {
-                                            Self::dispatch_seat_take_task(
-                                                &seat_id,
-                                                "SNIPER",
-                                                bot_manager,
-                                                ready_scanner_users,
-                                                //next_user_index,
-                                                assigned_seats_sender,
-                                                log_sender,
-                                                &telegram_sender,
-                                                users_data,
-                                                pending_scanner_seats,
-                                                payment_in_progress_clone,
-                                            )
-                                            .await;
-                                        } else if is_ignored {
-                                            log_sender.send((0, format!("🚫 SNIPER: Ignoring {} (transfer in progress)", seat_id))).ok();
+                                                                .map_or(false, |c| !c.is_ascii_digit()))
+                                                })
+                                            };
+                                            if !is_ignored && is_in_selected_section {
+                                                Self::dispatch_seat_take_task(
+                                                    &seat_id,
+                                                    "SNIPER",
+                                                    bot_manager,
+                                                    ready_scanner_users,
+                                                    assigned_seats_sender,
+                                                    log_sender,
+                                                    &telegram_sender,
+                                                    users_data,
+                                                    pending_scanner_seats,
+                                                    payment_in_progress_clone,
+                                                )
+                                                .await;
+                                            } else if is_ignored {
+                                                log_sender
+                                                    .send((
+                                                        0,
+                                                        format!("🚫 SNIPER: Ignoring {} (transfer in progress)", seat_id),
+                                                    ))
+                                                    .ok();
+                                            }
                                         }
+                                    } else {
+                                        // This log message is new, it explains why the sniper isn't taking the seats.
+                                        log_sender
+                                            .send((
+                                                0,
+                                                format!(
+                                                    "🎯 SNIPER: Found {} seats, but all active users are at their limit. Skipping.",
+                                                    seats.len()
+                                                ),
+                                            ))
+                                            .ok();
                                     }
                                 }
                             }
@@ -4859,9 +4930,15 @@ fn handle_reload_click(&mut self, user_index: usize) {
 
 impl eframe::App for WebbookBot {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+                // --- START OF FIX ---
+        // Add this line to constantly synchronize the scanner's ready list with the UI state.
+        self.update_ready_scanner_users_atomic();
+        // --- END OF FIX ---
+
         // Set theme
         ctx.set_visuals(egui::Visuals::light());
         self.ctx = Some(ctx.clone());
+
 
         // --- CHANGE 1: TOP PANEL for controls ---
         // This panel will stick to the top.
@@ -4906,6 +4983,8 @@ impl eframe::App for WebbookBot {
             self.update_assigned_seats();
             self.update_logs();
             self.update_payment_status();
+            self.handle_paid_seats_queries();
+
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
         if self.show_transfer_modal {
