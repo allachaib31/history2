@@ -63,8 +63,11 @@ struct ParallelPaymentResponseUser {
     user_index: usize,
     selectable: Vec<Value>, // This will hold the rich seat data from Node.js
 }
-
-
+// Add this enum near the top of main.rs
+enum SeatTakeStatus {
+    Success,
+    Failure(Option<reqwest::StatusCode>),
+}
 pub struct WebbookBot {
     // Form fields
     section_input: String, 
@@ -99,7 +102,7 @@ pub struct WebbookBot {
     // ADD these fields:
     reserved_seats_map: Arc<Mutex<HashMap<String, Vec<String>>>>, // holdTokenHash -> seats
     ready_scanner_users: Arc<Mutex<Vec<usize>>>,                  // Indices of ready users
-    // next_user_index: Arc<AtomicUsize>,
+    next_user_index: Arc<AtomicUsize>,
     show_transfer_modal: bool,
     transfer_from_user: String,
     transfer_to_user: String,
@@ -126,6 +129,7 @@ pub struct WebbookBot {
     // Add these two fields to the WebbookBot struct
     paid_seats_query_sender: mpsc::UnboundedSender<(usize, oneshot::Sender<Vec<String>>)>,
     paid_seats_query_receiver: mpsc::UnboundedReceiver<(usize, oneshot::Sender<Vec<String>>)>,
+    cooldown_until: Arc<Mutex<HashMap<usize, std::time::Instant>>>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -817,7 +821,7 @@ async fn prewarm_connection(&self) -> Result<()> {
                 // Spawn a new task for this single seat.
                // Replace the entire tokio::spawn block with this one
                 tokio::spawn(async move {
-                    if let Ok(true) = take_seat_direct_final(&bot_user_clone, &seat_id_clone).await {
+                    if let Ok(SeatTakeStatus::Success) = take_seat_direct_final(&bot_user_clone, &seat_id_clone).await {
                         // --- START OF FIX ---
                         
                         let mut seat_was_added = false;
@@ -1191,27 +1195,23 @@ async fn prewarm_connection(&self) -> Result<()> {
 }
 
 // This is a global function
-async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<bool> {
-    // 1. Get the pre-built template. (No change here)
+// REPLACE the entire take_seat_direct_final function with this
+async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<SeatTakeStatus> {
     let prepared = bot_user
         .prepared_request
         .lock()
         .clone()
         .ok_or_else(|| anyhow::anyhow!("Request template not ready"))?;
 
-    // 2. Create the final payload with string replacement. (No change here)
     let final_payload = prepared
         .json_payload_template
         .replace("__SEAT_ID_PLACEHOLDER__", seat_id);
 
-    // 3. Generate the signature. (No change here)
     let signature = bot_user.generate_signature(&final_payload).await?;
 
-    // 4. Prepare headers. (No change here)
     let mut headers = prepared.headers.clone();
     headers.insert("x-signature", signature.parse()?);
 
-    // 5. Fire the request. (No change here)
     let response = prepared
         .client
         .post(&prepared.url)
@@ -1220,14 +1220,12 @@ async fn take_seat_direct_final(bot_user: &BotUser, seat_id: &str) -> Result<boo
         .send()
         .await?;
         
-    // 6. *** NEW LOGIC ***
-    // Instead of modifying the held_seats list, just return true/false.
-    if response.status().is_success() {
-        // Successfully held the seat on the server.
-        Ok(true)
+    let status = response.status();
+    if status.is_success() {
+        Ok(SeatTakeStatus::Success)
     } else {
-        // Failed to hold the seat.
-        Ok(false)
+        // Now we return the specific status code on failure
+        Ok(SeatTakeStatus::Failure(Some(status)))
     }
 }
 fn extract_event_key(event_url: &str) -> anyhow::Result<String> {
@@ -1349,7 +1347,7 @@ impl BotManager {
     }
 
     async fn send_event_detail_request(&self, event_id: &str) -> Result<()> {
-        println!("send_event_detail_request");
+        println!("send_event_detail_request {}", event_id);
 
         let first_user = &self.users[0]; // Use first user
         let token_data = self
@@ -1641,7 +1639,7 @@ impl WebbookBot {
             scanner_running: false,
             reserved_seats_map: Arc::new(Mutex::new(HashMap::new())),
             ready_scanner_users: Arc::new(Mutex::new(Vec::new())), // <-- Corrected line
-            //next_user_index: Arc::new(AtomicUsize::new(0)),
+            next_user_index: Arc::new(AtomicUsize::new(0)),
             show_transfer_modal: false,
             selected_user_index: None,
             transfer_from_user: String::new(),
@@ -1668,6 +1666,8 @@ impl WebbookBot {
             // --- ADD THESE TWO LINES AT THE END OF THE STRUCT INITIALIZATION ---
             paid_seats_query_sender: psq_tx,
             paid_seats_query_receiver: psq_rx,
+            cooldown_until: Arc::new(Mutex::new(HashMap::new())),
+
         };
         app
     }
@@ -1916,7 +1916,7 @@ impl WebbookBot {
         }
     }
 
-        // in impl WebbookBot
+    // REPLACE the entire dispatch_seat_take_task function with this new version
     async fn dispatch_seat_take_task(
         seat_id: &str,
         log_prefix: &str,
@@ -1926,101 +1926,124 @@ impl WebbookBot {
         log_sender: &mpsc::UnboundedSender<(usize, String)>,
         telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
         ui_users: &Vec<User>,
-        _pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>, // No longer needed in hot path
         payment_in_progress: &Arc<Mutex<HashSet<usize>>>,
+        next_user_index: &Arc<AtomicUsize>,
+        cooldown_until: &Arc<Mutex<HashMap<usize, std::time::Instant>>>, // <-- NEW PARAMETER
     ) {
-        if let Some(manager) = bot_manager {
-            let ready_users_indices = ready_scanner_users.lock().clone();
-            if ready_users_indices.is_empty() {
-                return;
+        let manager = match bot_manager {
+            Some(m) => m,
+            None => return,
+        };
+
+        let ready_users_indices = ready_scanner_users.lock();
+        if ready_users_indices.is_empty() {
+            return;
+        }
+
+        let start_index = next_user_index.load(Ordering::Relaxed);
+        let num_ready_users = ready_users_indices.len();
+
+        for i in 0..num_ready_users {
+            let current_offset = (start_index + i) % num_ready_users;
+            let actual_user_index = ready_users_indices[current_offset];
+
+            // --- 1. NEW COOLDOWN CHECK ---
+            let is_in_cooldown = {
+                let cooldown_map = cooldown_until.lock();
+                if let Some(end_time) = cooldown_map.get(&actual_user_index) {
+                    std::time::Instant::now() < *end_time
+                } else {
+                    false
+                }
+            };
+            if is_in_cooldown {
+                continue; // Skip this user, they are in a timeout.
+            }
+            // --- END COOLDOWN CHECK ---
+
+            let is_paying = payment_in_progress.lock().contains(&actual_user_index);
+            if is_paying {
+                continue;
             }
 
-            for &actual_user_index in &ready_users_indices {
-                let is_paying = payment_in_progress.lock().contains(&actual_user_index);
-                if is_paying {
-                    continue;
-                }
+            if let (Some(ui_user), Some(bot_user)) = (
+                ui_users.get(actual_user_index),
+                manager.users.get(actual_user_index),
+            ) {
+                let is_below_limit =
+                    ui_user.max_seats == 0 || bot_user.held_seats.lock().len() < ui_user.max_seats;
 
-                if let (Some(ui_user), Some(bot_user)) = (
-                    ui_users.get(actual_user_index),
-                    manager.users.get(actual_user_index),
-                ) {
-                    let is_below_limit = if ui_user.max_seats == 0 {
-                        true // Unlimited seats
-                    } else {
-                        bot_user.held_seats.lock().len() < ui_user.max_seats
-                    };
+                if is_below_limit {
+                    next_user_index.store((current_offset + 1) % num_ready_users, Ordering::Relaxed);
 
-                    if is_below_limit {
-                        // Clone all data needed for the new, completely independent task.
-                        let bot_user_clone = bot_user.clone();
-                        let sender_clone = assigned_seats_sender.clone();
-                        let log_sender_clone = log_sender.clone();
-                        let telegram_sender_clone = telegram_sender.clone();
-                        let seat_id_clone = seat_id.to_string();
-                        let log_prefix_clone = log_prefix.to_string();
-                        let user_email = ui_user.email.clone();
-                        let max_seats_limit = ui_user.max_seats;
+                    let bot_user_clone = bot_user.clone();
+                    let sender_clone = assigned_seats_sender.clone();
+                    let log_sender_clone = log_sender.clone();
+                    let telegram_sender_clone = telegram_sender.clone();
+                    let cooldown_until_clone = cooldown_until.clone(); // Clone Arc for the task
+                    let seat_id_clone = seat_id.to_string();
+                    let log_prefix_clone = log_prefix.to_string();
+                    let user_email = ui_user.email.clone();
+                    let max_seats_limit = ui_user.max_seats;
 
-                        // Spawn the task. This happens instantly without waiting.
-                        tokio::spawn(async move {
-                            // Attempt to take the seat using the updated function.
-                            if let Ok(true) = take_seat_direct_final(&bot_user_clone, &seat_id_clone).await {
-                                
+                    tokio::spawn(async move {
+                        // --- 2. MODIFIED LOGIC TO HANDLE 403 ---
+                        match take_seat_direct_final(&bot_user_clone, &seat_id_clone).await {
+                            Ok(SeatTakeStatus::Success) => {
+                                // This is the original success logic, no changes here
                                 let was_released;
-
-                                // ** THE FIX IS HERE **
-                                // This block `{...}` creates a new scope. The lock on `held_seats`
-                                // is automatically released at the end of this block.
                                 {
                                     let mut held_seats = bot_user_clone.held_seats.lock();
                                     held_seats.push(seat_id_clone.clone());
-                                    
                                     if max_seats_limit > 0 && held_seats.len() > max_seats_limit {
-                                        // We are over the limit, remove from our list.
-                                        held_seats.pop(); 
-                                        was_released = true; // Mark that it was released.
-                                        
+                                        held_seats.pop();
+                                        was_released = true;
                                         log_sender_clone.send((actual_user_index, format!("🔶 Over limit! Releasing seat {}", seat_id_clone))).ok();
-                                        
-                                        // --- FIX 2: Create NEW clones specifically for the release task ---
-                                        // This allows the outer task to keep its own copies of the variables.
                                         let bot_user_for_release = bot_user_clone.clone();
                                         let seat_id_for_release = seat_id_clone.clone();
-                                        
                                         tokio::spawn(async move {
                                             let event_key = bot_user_for_release.shared_data.read().await.event_key.clone().unwrap_or_default();
                                             bot_user_for_release.release_seat(&seat_id_for_release, &[event_key]).await.ok();
                                         });
                                     } else {
-                                        was_released = false; // We are within the limit.
+                                        was_released = false;
                                     }
-                                } // <- The lock on `held_seats` is released here.
-
-                                // Now we can safely use the variables again.
+                                }
                                 if !was_released {
                                     sender_clone.send((actual_user_index, seat_id_clone.clone())).ok();
                                     log_sender_clone.send((actual_user_index, format!("🚀 {}: Booked {}", log_prefix_clone, seat_id_clone))).ok();
-                                    
-                                    // Get a new lock to read the final count.
                                     let total_held = bot_user_clone.held_seats.lock().len();
                                     let message = format!(
                                         "🎫 SEAT TAKING ✅ SUCCESS\n━━━━━━━━━━━━━━━━━\n🔧 Account: {}\n💺 Seat: {}\n📊 Total Held: {}/{}",
                                         user_email,
-                                        seat_id_clone, // This variable was not moved, so it's safe to use.
+                                        seat_id_clone,
                                         total_held,
                                         if max_seats_limit == 0 { "∞".to_string() } else { max_seats_limit.to_string() }
                                     );
                                     telegram_sender_clone.send(TelegramMessage { text: message, chat_id: 4785839500 }).ok();
                                 }
                             }
-                        });
-                    }
+                            Ok(SeatTakeStatus::Failure(Some(status))) if status.as_u16() == 403 => {
+                                // --- THIS IS THE NEW COOLDOWN LOGIC ---
+                                log_sender_clone.send((actual_user_index, format!("🔴 Got 403 Forbidden for seat {}. Cooling down for 1 minute.", seat_id_clone))).ok();
+                                let cooldown_duration = std::time::Duration::from_secs(60);
+                                cooldown_until_clone.lock().insert(
+                                    actual_user_index,
+                                    std::time::Instant::now() + cooldown_duration
+                                );
+                            }
+                            _ => {
+                                // This handles other errors (e.g., 404 Not Found, 500 Server Error)
+                                // We don't apply a cooldown for these.
+                            }
+                        }
+                    });
+                    return;
                 }
             }
         }
     }
-   
+    
     fn show_logs_modal(&mut self, ctx: &egui::Context) {
         if let Some(user_index) = self.selected_user_index {
             // Get the user's current data
@@ -3620,14 +3643,15 @@ impl WebbookBot {
     }
     fn render_user_table(&mut self, ui: &mut egui::Ui) {
         use egui_extras::{Column, TableBuilder};
-
-        let mut reload_button_clicked_for: Option<usize> = None; // Changed from pay_button_clicked_for
+    
+        let mut reload_button_clicked_for: Option<usize> = None;
         let mut pay2_button_clicked_for: Option<usize> = None;
         let mut logs_button_clicked_for: Option<usize> = None;
-        let mut toggle_selection_for: Option<usize> = None; // To handle checkbox clicks
-
+        let mut toggle_selection_for: Option<usize> = None;
+        let mut delete_button_clicked_for: Option<usize> = None; // Add this line
+    
         let available_width = ui.available_width();
-        // Adjusted column widths for the new checkbox column
+        let delete_width = available_width * 0.04; // Add this line
         let checkbox_width = available_width * 0.04;
         let email_width = available_width * 0.22;
         let type_width = available_width * 0.05;
@@ -3639,53 +3663,27 @@ impl WebbookBot {
         let pay2_width = available_width * 0.07;
         let payment_status_width = available_width * 0.09;
         let table_height = ui.available_height();
-
+    
         TableBuilder::new(ui)
             .striped(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .max_scroll_height(table_height)
-            .column(Column::exact(checkbox_width)) // <-- ADD checkbox column
+            .column(Column::exact(delete_width)) // Add this column first
             .column(Column::exact(email_width))
             .column(Column::exact(type_width))
             .column(Column::exact(proxy_width))
             .column(Column::exact(status_width))
             .column(Column::exact(expire_width))
             .column(Column::exact(seats_width))
+            .column(Column::exact(checkbox_width))
             .column(Column::exact(pay_width))
             .column(Column::exact(pay2_width))
             .column(Column::exact(payment_status_width))
             .header(25.0, |mut header| {
-                // Header for the new checkbox column
-                                // In the header section, update the select all checkbox:
-                // In the header section, update the select all checkbox:
                 header.col(|ui| {
-                    // Count how many users can be selected (haven't paid all seats)
-                    let selectable_users: Vec<_> = self.users.iter()
-                        .filter(|user| !self.has_user_paid_all_seats(user))
-                        .collect();
-                    
-                    let all_selectable_selected = selectable_users.iter()
-                        .all(|user| user.selected);
-                    
-                    let mut select_all_state = all_selectable_selected && !selectable_users.is_empty();
-                    
-                    if ui.checkbox(&mut select_all_state, "").changed() {
-                        // Pre-calculate which users have paid all seats to avoid borrowing conflict
-                        let users_paid_all: Vec<bool> = self.users.iter()
-                            .map(|user| self.has_user_paid_all_seats(user))
-                            .collect();
-                        
-                        // Only affect users who haven't paid all seats
-                        for (user, &has_paid_all) in self.users.iter_mut().zip(users_paid_all.iter()) {
-                            if !has_paid_all {
-                                user.selected = select_all_state;
-                            }
-                        }
-                        // Update the main select_all_users flag
-                        self.select_all_users = select_all_state;
-                    }
+                    ui.heading("🗑"); // Add a header for the delete column
                 });
-                // Other headers
+                // Header code remains the same
                 header.col(|ui| {
                     ui.heading("Email");
                 });
@@ -3705,7 +3703,30 @@ impl WebbookBot {
                     ui.heading("Seats");
                 });
                 header.col(|ui| {
-                    ui.heading("Reload"); // Changed from "Pay"
+                    let selectable_users: Vec<_> = self.users.iter()
+                        .filter(|user| !self.has_user_paid_all_seats(user))
+                        .collect();
+                    
+                    let all_selectable_selected = selectable_users.iter()
+                        .all(|user| user.selected);
+                    
+                    let mut select_all_state = all_selectable_selected && !selectable_users.is_empty();
+                    
+                    if ui.checkbox(&mut select_all_state, "").changed() {
+                        let users_paid_all: Vec<bool> = self.users.iter()
+                            .map(|user| self.has_user_paid_all_seats(user))
+                            .collect();
+                        
+                        for (user, &has_paid_all) in self.users.iter_mut().zip(users_paid_all.iter()) {
+                            if !has_paid_all {
+                                user.selected = select_all_state;
+                            }
+                        }
+                        self.select_all_users = select_all_state;
+                    }
+                });
+                header.col(|ui| {
+                    ui.heading("Reload");
                 });
                 header.col(|ui| {
                     ui.heading("Pay2");
@@ -3718,46 +3739,79 @@ impl WebbookBot {
                 let users = self.users.clone();
                 body.rows(25.0, users.len(), |user_index, mut row| {
                     let user = &users[user_index];
-
-                    // Body for the new checkbox column
-                    // In the table body section, update the checkbox column:
-                    // In the table body section, update the checkbox column:
                     row.col(|ui| {
-                        let user = &users[user_index];
-                        let has_paid_all = self.has_user_paid_all_seats(user);
-                        let mut is_selected = user.selected;
-                        
-                        // Disable checkbox if user has paid all seats
-                        let checkbox_enabled = !has_paid_all;
-                        
-                        if checkbox_enabled {
-                            if ui.checkbox(&mut is_selected, "").clicked() {
-                                toggle_selection_for = Some(user_index);
-                            }
-                        } else {
-                            // Show disabled checkbox with tooltip
-                            ui.add_enabled(false, egui::Checkbox::new(&mut is_selected, ""))
-                                .on_hover_text("User has paid for all allocated seats. Click 'Reload' to re-enable.");
+                        if ui.button("🗑️").on_hover_text("Delete user").clicked() {
+                            delete_button_clicked_for = Some(user_index);
                         }
                     });
-
-                    // Other columns
+                    // Email column
                     row.col(|ui| {
+                        // Create a proper hover-sensitive area
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_email").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
                         if ui.button(&user.email).clicked() {
                             logs_button_clicked_for = Some(user_index);
                         }
                     });
+    
+                    // Type column
                     row.col(|ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_type").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
                         ui.label(&user.user_type);
                     });
+    
+                    // Proxy column
                     row.col(|ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_proxy").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
                         if user.proxy == "No proxy" || user.proxy.is_empty() {
                             ui.colored_label(egui::Color32::LIGHT_GRAY, "No proxy");
                         } else {
                             ui.label(&user.proxy);
                         }
                     });
+    
+                    // Status column
                     row.col(|ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_status").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
                         let color = match user.status.as_str() {
                             "Active" => egui::Color32::GREEN,
                             "Expired" => egui::Color32::RED,
@@ -3767,19 +3821,99 @@ impl WebbookBot {
                         };
                         ui.colored_label(color, &user.status);
                     });
+    
+                    // Expire column
                     row.col(|ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_expire").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
                         ui.label(&user.expire);
                     });
+    
+                    // Seats column
                     row.col(|ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_seats").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
                         ui.label(&user.held_seats.len().to_string());
                     });
+    
+                    // Checkbox column
                     row.col(|ui| {
-                        if ui.button("Reload").clicked() { // Changed from "Pay"
-                            reload_button_clicked_for = Some(user_index); // Changed variable name
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_checkbox").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
+                        let user = &users[user_index];
+                        let has_paid_all = self.has_user_paid_all_seats(user);
+                        let mut is_selected = user.selected;
+                        
+                        let checkbox_enabled = !has_paid_all;
+                        
+                        if checkbox_enabled {
+                            if ui.checkbox(&mut is_selected, "").clicked() {
+                                toggle_selection_for = Some(user_index);
+                            }
+                        } else {
+                            ui.add_enabled(false, egui::Checkbox::new(&mut is_selected, ""))
+                                .on_hover_text("User has paid for all allocated seats. Click 'Reload' to re-enable.");
                         }
                     });
+    
+                    // Reload button column
                     row.col(|ui| {
-                        // Calculate unpaid seats for this user
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_reload").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
+                        if ui.button("Reload").clicked() {
+                            reload_button_clicked_for = Some(user_index);
+                        }
+                    });
+    
+                    // Pay2 button column
+                    row.col(|ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_pay2").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
                         let unpaid_seats_count = user.held_seats
                             .iter()
                             .filter(|seat| !user.paid_seats.contains(seat))
@@ -3799,13 +3933,24 @@ impl WebbookBot {
                             pay2_button_clicked_for = Some(user_index);
                         }
                     });
-                    // In the payment status column, add visual indication:
+    
+                    // Payment status column
                     row.col(|ui| {
+                        let rect = ui.available_rect_before_wrap();
+                        let response = ui.interact(rect, ui.id().with("hover_payment").with(user_index), egui::Sense::hover());
+                        
+                        if response.hovered() {
+                            ui.painter().rect_filled(
+                                rect,
+                                egui::Rounding::same(2.0),
+                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 25), // Orange hover
+                            );
+                        }
+                        
                         let user = &users[user_index];
                         if self.has_user_paid_all_seats(user) {
                             ui.colored_label(egui::Color32::BLUE, "✅ All Paid");
                         } else {
-                            // Color-code different payment statuses
                             let (color, text) = match user.pay_status.as_str() {
                                 status if status.contains("Processing") => (egui::Color32::YELLOW, &user.pay_status),
                                 status if status.contains("Failed") => (egui::Color32::RED, &user.pay_status),
@@ -3814,7 +3959,7 @@ impl WebbookBot {
                                 status if status.contains("Partial Paid") => (egui::Color32::GREEN, &user.pay_status),
                                 status if status.contains("✅") => (egui::Color32::GREEN, &user.pay_status),
                                 "Pay" => (egui::Color32::GRAY, &user.pay_status),
-                                _ => (egui::Color32::WHITE, &user.pay_status), // Default color
+                                _ => (egui::Color32::WHITE, &user.pay_status),
                             };
                             
                             ui.colored_label(color, text);
@@ -3822,32 +3967,28 @@ impl WebbookBot {
                     });
                 });
             });
-
-        // Apply the selection change after the table has been drawn
+    
+        // Handle button clicks (rest of the code remains the same)
         if let Some(user_index) = toggle_selection_for {
             if let Some(user) = self.users.get_mut(user_index) {
-                // Pre-calculate if user has paid all seats before mutable borrow
                 let has_paid_all = if user.max_seats == 0 {
-                    false // Unlimited seats, never "paid all"
+                    false
                 } else {
                     user.paid_seats.len() >= user.max_seats
                 };
                 
-                // Only allow toggle if user hasn't paid all seats
                 if !has_paid_all {
                     user.selected = !user.selected;
-                    let is_selected = user.selected; // Store the selection state
+                    let is_selected = user.selected;
                     
-                    // Drop the mutable borrow before calling other functions
                     drop(user);
                     
-                    // Update select_all_users based on selectable users only
                     let selectable_users: Vec<_> = self.users.iter()
                         .filter(|u| {
                             if u.max_seats == 0 {
-                                true // Unlimited seats, always selectable
+                                true
                             } else {
-                                u.paid_seats.len() < u.max_seats // Selectable if not paid all
+                                u.paid_seats.len() < u.max_seats
                             }
                         })
                         .collect();
@@ -3860,19 +4001,23 @@ impl WebbookBot {
                 }
             }
         }
-
+    
         if let Some(user_index) = pay2_button_clicked_for {
             self.handle_payment_click2(user_index);
         }
-        if let Some(user_index) = reload_button_clicked_for { // Changed from pay_button_clicked_for
-            self.handle_reload_click(user_index); // Changed function name
+        if let Some(user_index) = reload_button_clicked_for {
+            self.handle_reload_click(user_index);
         }
         if let Some(user_index) = logs_button_clicked_for {
             self.selected_user_index = Some(user_index);
             self.show_logs_modal = true;
         }
+        if let Some(user_index) = delete_button_clicked_for {
+            if user_index < self.users.len() {
+                self.users.remove(user_index);
+            }
+        }
     }
-
     fn handle_pay_selected_click(&mut self) {
         if self.bot_manager.is_none() {
             println!("Bot is not running or ready.");
@@ -4427,7 +4572,7 @@ fn handle_reload_click(&mut self, user_index: usize) {
                         telegram_sender_clone
                             .send(TelegramMessage {
                                 text: message,
-                                chat_id: 4785839500,
+                                chat_id: 4683666687,
                             })
                             .ok();
                     }
@@ -4581,13 +4726,14 @@ fn handle_reload_click(&mut self, user_index: usize) {
         let pending_scanner_seats_clone = self.pending_scanner_seats.clone();
         let selected_sections_shared_clone = self.selected_sections_shared.clone(); // ADD THIS
         let payment_in_progress_clone = self.payment_in_progress.clone(); // <-- ADD THIS
+        let next_user_index_clone = self.next_user_index.clone();
+        let cooldown_until_clone = self.cooldown_until.clone();
 
         if let Some(rt) = &self.rt {
             let shared_data = self.shared_data.clone().unwrap();
             let bot_manager = self.bot_manager.clone();
             let users_data_clone = self.users.clone();
             let ready_scanner_users_clone = self.ready_scanner_users.clone();
-            //let next_user_index_clone = self.next_user_index.clone();
 
             rt.spawn(async move {
                 if let Err(e) = Self::run_websocket_scanner(
@@ -4599,11 +4745,12 @@ fn handle_reload_click(&mut self, user_index: usize) {
                     log_sender,
                     &telegram_sender,
                     ready_scanner_users_clone,
-                    //next_user_index_clone,
+                    next_user_index_clone,
                     reserved_seats_map_clone,
                     transfer_ignore_list_clone,
                     pending_scanner_seats_clone,
                     payment_in_progress_clone,
+                    cooldown_until_clone,
                 )
                 .await
                 {
@@ -4623,11 +4770,12 @@ fn handle_reload_click(&mut self, user_index: usize) {
         log_sender: mpsc::UnboundedSender<(usize, String)>,
         telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
         ready_scanner_users: Arc<Mutex<Vec<usize>>>,
-        //next_user_index: Arc<AtomicUsize>,
+        next_user_index: Arc<AtomicUsize>,
         reserved_seats_map: Arc<Mutex<HashMap<String, Vec<String>>>>,
         transfer_ignore_list: Arc<Mutex<HashSet<String>>>,
         pending_scanner_seats: Arc<Mutex<HashMap<usize, usize>>>,
         payment_in_progress_clone: Arc<Mutex<HashSet<usize>>>,
+        cooldown_until: Arc<Mutex<HashMap<usize, std::time::Instant>>>, // <-- ADD THIS
     ) -> Result<()> {
         loop {
             // The reconnect loop
@@ -4640,11 +4788,12 @@ fn handle_reload_click(&mut self, user_index: usize) {
                 &log_sender,
                 &telegram_sender,
                 &ready_scanner_users,
-                //&next_user_index,
+                &next_user_index,
                 &reserved_seats_map,
                 &transfer_ignore_list,
                 &pending_scanner_seats,
                 &payment_in_progress_clone,
+                &cooldown_until, // <-- ADD THIS (as a reference)
             )
             .await
             {
@@ -4669,11 +4818,12 @@ fn handle_reload_click(&mut self, user_index: usize) {
         log_sender: &mpsc::UnboundedSender<(usize, String)>,
         telegram_sender: &mpsc::UnboundedSender<TelegramMessage>,
         ready_scanner_users: &Arc<Mutex<Vec<usize>>>,
-        //next_user_index: &Arc<AtomicUsize>,
+        next_user_index: &Arc<AtomicUsize>,
         reserved_seats_map: &Arc<Mutex<HashMap<String, Vec<String>>>>,
         transfer_ignore_list: &Arc<Mutex<HashSet<String>>>,
         pending_scanner_seats: &Arc<Mutex<HashMap<usize, usize>>>,
         payment_in_progress_clone: &Arc<Mutex<HashSet<usize>>>,
+        cooldown_until: &Arc<Mutex<HashMap<usize, std::time::Instant>>>, // <-- ADD THIS
     ) -> Result<()> {
         use futures_util::{SinkExt, StreamExt};
         use sha1::{Digest, Sha1};
@@ -4751,13 +4901,13 @@ fn handle_reload_click(&mut self, user_index: usize) {
                                         "SCANNER",
                                         bot_manager,
                                         ready_scanner_users,
-                                        //next_user_index,
                                         assigned_seats_sender,
                                         log_sender,
-                                        &telegram_sender,
+                                        telegram_sender,
                                         users_data,
-                                        pending_scanner_seats,
                                         payment_in_progress_clone,
+                                        next_user_index,
+                                        cooldown_until, // Ensure this matches the function signature
                                     )
                                     .await;
                                 } else if is_ignored {
@@ -4856,10 +5006,11 @@ fn handle_reload_click(&mut self, user_index: usize) {
                                                     ready_scanner_users,
                                                     assigned_seats_sender,
                                                     log_sender,
-                                                    &telegram_sender,
+                                                    telegram_sender,
                                                     users_data,
-                                                    pending_scanner_seats,
                                                     payment_in_progress_clone,
+                                                    next_user_index,
+                                                    cooldown_until, // Ensure this matches the function signature
                                                 )
                                                 .await;
                                             } else if is_ignored {
